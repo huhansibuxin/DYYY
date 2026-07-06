@@ -66,7 +66,7 @@ static NSDictionary<NSString *, NSString *> *DYYYTopTabTitleMapping(void) {
 
     if (!rawValueChanged) {
         return cachedMapping;
-    }
+    }  
 
     cachedRawValue = [currentValue copy];
 
