@@ -12653,9 +12653,6 @@ static Class TagViewClass = nil;
     %orig;
     if (DYYYGetBool(@"DYYYRemoveEntry")) {
         self.hidden = YES;
-        CGRect f = self.frame;
-        f.size.height = 0;
-        self.frame = f;
         return;
     }
     if (DYYYGetBool(@"DYYYHideEntry")) {
