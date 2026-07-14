@@ -9,34 +9,6 @@
 #import "DYYYToast.h"
 #import "DYYYUtils.h"
 
-static UIViewController *findLandscapeViewController(UIViewController *root) {
-    if (!root) return nil;
-    if ([root respondsToSelector:@selector(configBeforEnterLandscapeFeedWithShouldCheck:fromPinch:)]) {
-        return root;
-    }
-    if ([root respondsToSelector:@selector(configBeforEnterToLandscapeFeed:)]) {
-        return root;
-    }
-    for (UIViewController *child in root.childViewControllers) {
-        UIViewController *found = findLandscapeViewController(child);
-        if (found) return found;
-    }
-    return findLandscapeViewController(root.presentedViewController);
-}
-
-static void enterLandscapeFeed(UIViewController *vc) {
-    if (!vc) return;
-    if ([vc respondsToSelector:@selector(configBeforEnterLandscapeFeedWithShouldCheck:fromPinch:)]) {
-        void (*fn)(id, SEL, BOOL, BOOL) = (void (*)(id, SEL, BOOL, BOOL))objc_msgSend;
-        fn(vc, @selector(configBeforEnterLandscapeFeedWithShouldCheck:fromPinch:), YES, NO);
-        return;
-    }
-    if ([vc respondsToSelector:@selector(configBeforEnterToLandscapeFeed:)]) {
-        void (*fn)(id, SEL, BOOL) = (void (*)(id, SEL, BOOL))objc_msgSend;
-        fn(vc, @selector(configBeforEnterToLandscapeFeed:), YES);
-    }
-}
-
 static UIView *findLandscapeEntryViewInView(UIView *view) {
     if (!view) return nil;
     Class entryClass = NSClassFromString(@"AWELandscapeFeedEntryView");
@@ -69,20 +41,6 @@ static void simulateTapOnEntryView(UIView *entryView) {
             }
         }
     }
-}
-
-static void enterLandscape(void) {
-    // 方案A: 通过 presenting VC 找横屏入口方法
-    UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
-    UIViewController *rootVC = keyWindow.rootViewController;
-    UIViewController *landscapeVC = findLandscapeViewController(rootVC);
-    if (landscapeVC) {
-        enterLandscapeFeed(landscapeVC);
-        return;
-    }
-    // 方案B: 模拟点击横屏入口按钮
-    UIView *entryView = findLandscapeEntryViewInView(keyWindow);
-    simulateTapOnEntryView(entryView);
 }
 
 %hook AWELongPressPanelViewGroupModel
@@ -564,7 +522,9 @@ static void enterLandscape(void) {
         fullScreen.action = ^{
           AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
           [panelManager dismissWithAnimation:YES completion:^{
-            enterLandscape();
+            UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+            UIView *entryView = findLandscapeEntryViewInView(keyWindow);
+            simulateTapOnEntryView(entryView);
           }];
         };
         [viewModels addObject:fullScreen];
@@ -1333,7 +1293,9 @@ static void enterLandscape(void) {
         fullScreen.action = ^{
           AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
           [panelManager dismissWithAnimation:YES completion:^{
-            enterLandscape();
+            UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+            UIView *entryView = findLandscapeEntryViewInView(keyWindow);
+            simulateTapOnEntryView(entryView);
           }];
         };
         [viewModels addObject:fullScreen];

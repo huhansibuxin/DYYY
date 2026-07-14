@@ -12652,7 +12652,7 @@ static Class TagViewClass = nil;
 - (void)layoutSubviews {
     %orig;
     if (DYYYGetBool(@"DYYYRemoveEntry")) {
-        [self removeFromSuperview];
+        self.hidden = YES;
         return;
     }
     if (DYYYGetBool(@"DYYYHideEntry")) {
