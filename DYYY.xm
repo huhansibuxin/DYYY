@@ -12638,6 +12638,13 @@ static Class TagViewClass = nil;
     }
 }
 
+- (CGSize)sizeThatFits:(CGSize)size {
+    if (DYYYGetBool(@"DYYYRemoveEntry")) {
+        return CGSizeZero;
+    }
+    return %orig;
+}
+
 - (void)didMoveToWindow {
     %orig;
     if (DYYYGetBool(@"DYYYRemoveEntry")) {
