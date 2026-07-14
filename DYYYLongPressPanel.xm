@@ -1,4 +1,5 @@
 #import "AwemeHeaders.h"
+#import <objc/message.h>
 #import "DYYYBottomAlertView.h"
 #import "DYYYConfirmCloseView.h"
 #import "DYYYCustomInputView.h"
