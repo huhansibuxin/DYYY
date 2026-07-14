@@ -37,6 +37,54 @@ static void enterLandscapeFeed(UIViewController *vc) {
     }
 }
 
+static UIView *findLandscapeEntryViewInView(UIView *view) {
+    if (!view) return nil;
+    Class entryClass = NSClassFromString(@"AWELandscapeFeedEntryView");
+    if (entryClass && [view isKindOfClass:entryClass]) return view;
+    for (UIView *subview in view.subviews) {
+        UIView *found = findLandscapeEntryViewInView(subview);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static void simulateTapOnEntryView(UIView *entryView) {
+    if (!entryView) return;
+    if ([entryView respondsToSelector:@selector(sendActionsForControlEvents:)]) {
+        [(UIControl *)entryView sendActionsForControlEvents:UIControlEventTouchUpInside];
+        return;
+    }
+    for (UIGestureRecognizer *gr in entryView.gestureRecognizers) {
+        if ([gr isKindOfClass:[UITapGestureRecognizer class]]) {
+            id targets = [gr valueForKey:@"targets"];
+            if ([targets isKindOfClass:[NSArray class]]) {
+                for (id t in targets) {
+                    id target = [t valueForKey:@"target"];
+                    SEL action = (SEL)((void *(*)(id, SEL))objc_msgSend)(t, @selector(action));
+                    if (target && action && [target respondsToSelector:action]) {
+                        void (*fn)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
+                        fn(target, action, gr);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void enterLandscape(void) {
+    // 方案A: 通过 presenting VC 找横屏入口方法
+    UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+    UIViewController *rootVC = keyWindow.rootViewController;
+    UIViewController *landscapeVC = findLandscapeViewController(rootVC);
+    if (landscapeVC) {
+        enterLandscapeFeed(landscapeVC);
+        return;
+    }
+    // 方案B: 模拟点击横屏入口按钮
+    UIView *entryView = findLandscapeEntryViewInView(keyWindow);
+    simulateTapOnEntryView(entryView);
+}
+
 %hook AWELongPressPanelViewGroupModel
 %property(nonatomic, assign) BOOL isDYYYCustomGroup;
 %end
@@ -516,9 +564,7 @@ static void enterLandscapeFeed(UIViewController *vc) {
         fullScreen.action = ^{
           AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
           [panelManager dismissWithAnimation:YES completion:^{
-            UIViewController *topVC = [DYYYUtils topView];
-            UIViewController *landscapeVC = findLandscapeViewController(topVC);
-            enterLandscapeFeed(landscapeVC);
+            enterLandscape();
           }];
         };
         [viewModels addObject:fullScreen];
@@ -1287,9 +1333,7 @@ static void enterLandscapeFeed(UIViewController *vc) {
         fullScreen.action = ^{
           AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
           [panelManager dismissWithAnimation:YES completion:^{
-            UIViewController *topVC = [DYYYUtils topView];
-            UIViewController *landscapeVC = findLandscapeViewController(topVC);
-            enterLandscapeFeed(landscapeVC);
+            enterLandscape();
           }];
         };
         [viewModels addObject:fullScreen];
