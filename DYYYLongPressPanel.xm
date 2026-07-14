@@ -113,10 +113,11 @@
     BOOL enableFilterKeyword = DYYYGetBool(@"DYYYLongPressFilterTitle");
     BOOL enableTimerClose = DYYYGetBool(@"DYYYLongPressTimerClose");
     BOOL enableCreateVideo = DYYYGetBool(@"DYYYLongPressCreateVideo");
+    BOOL enableFullscreenFromPanel = DYYYGetBool(@"DYYYMoveFullscreenToPanel");
 
     // 检查是否有任何功能启用
     hasAnyFeatureEnabled = enableSaveVideo || enableSaveCover || enableSaveAudio || enableSaveCurrentImage || enableSaveAllImages || enableCopyText || enableCopyLink || enableApiDownload ||
-                           enableFilterUser || enableFilterKeyword || enableTimerClose || enableCreateVideo;
+                           enableFilterUser || enableFilterKeyword || enableTimerClose || enableCreateVideo || enableFullscreenFromPanel;
 
     // 如果没有任何功能启用，仅使用官方按钮
     if (!hasAnyFeatureEnabled) {
@@ -475,6 +476,21 @@
           [panelManager dismissWithAnimation:YES completion:nil];
         };
         [viewModels addObject:createVideoViewModel];
+    }
+
+    // 全屏观看功能
+    if (enableFullscreenFromPanel) {
+        AWELongPressPanelBaseViewModel *fullscreenViewModel = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
+        fullscreenViewModel.awemeModel = self.awemeModel;
+        fullscreenViewModel.actionType = 680;
+        fullscreenViewModel.duxIconName = @"ic_fullscreen_outlined_20";
+        fullscreenViewModel.describeString = @"全屏观看";
+        fullscreenViewModel.action = ^{
+            [[NSNotificationCenter defaultCenter] postNotificationName:@"DYYYTriggerFullscreenFromPanelNotification" object:nil];
+            AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
+            [panelManager dismissWithAnimation:YES completion:nil];
+        };
+        [viewModels addObject:fullscreenViewModel];
     }
 
     // 复制文案功能
@@ -880,10 +896,11 @@
     BOOL enableFilterKeyword = DYYYGetBool(@"DYYYLongPressFilterTitle");
     BOOL enableTimerClose = DYYYGetBool(@"DYYYLongPressTimerClose");
     BOOL enableCreateVideo = DYYYGetBool(@"DYYYLongPressCreateVideo");
+    BOOL enableFullscreenFromPanel = DYYYGetBool(@"DYYYMoveFullscreenToPanel");
 
     // 检查是否有任何功能启用
     hasAnyFeatureEnabled = enableSaveVideo || enableSaveCover || enableSaveAudio || enableSaveCurrentImage || enableSaveAllImages || enableCopyText || enableCopyLink || enableApiDownload ||
-                           enableFilterUser || enableFilterKeyword || enableTimerClose || enableCreateVideo;
+                           enableFilterUser || enableFilterKeyword || enableTimerClose || enableCreateVideo || enableFullscreenFromPanel;
 
     if (!hasAnyFeatureEnabled) {
         return originalArray;
@@ -1245,6 +1262,21 @@
           [panelManager dismissWithAnimation:YES completion:nil];
         };
         [viewModels addObject:createVideoViewModel];
+    }
+
+    // 全屏观看功能
+    if (enableFullscreenFromPanel) {
+        AWELongPressPanelBaseViewModel *fullscreenViewModel = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
+        fullscreenViewModel.awemeModel = self.awemeModel;
+        fullscreenViewModel.actionType = 680;
+        fullscreenViewModel.duxIconName = @"ic_fullscreen_outlined_20";
+        fullscreenViewModel.describeString = @"全屏观看";
+        fullscreenViewModel.action = ^{
+            [[NSNotificationCenter defaultCenter] postNotificationName:@"DYYYTriggerFullscreenFromPanelNotification" object:nil];
+            AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
+            [panelManager dismissWithAnimation:YES completion:nil];
+        };
+        [viewModels addObject:fullscreenViewModel];
     }
 
     // 复制文案功能

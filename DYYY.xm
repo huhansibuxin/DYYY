@@ -12639,8 +12639,12 @@ static Class TagViewClass = nil;
     if (self.window) {
         [self dyyy_applyGlobalTransparency];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(dyyy_applyGlobalTransparency) name:kDYYYGlobalTransparencyDidChangeNotification object:nil];
+        if (DYYYGetBool(@"DYYYMoveFullscreenToPanel")) {
+            [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(dyyy_triggerFullscreenFromPanel) name:@"DYYYTriggerFullscreenFromPanelNotification" object:nil];
+        }
     } else {
         [[NSNotificationCenter defaultCenter] removeObserver:self name:kDYYYGlobalTransparencyDidChangeNotification object:nil];
+        [[NSNotificationCenter defaultCenter] removeObserver:self name:@"DYYYTriggerFullscreenFromPanelNotification" object:nil];
     }
 }
 
@@ -12649,8 +12653,41 @@ static Class TagViewClass = nil;
     %orig;
 }
 
+%new
+- (void)dyyy_triggerFullscreenFromPanel {
+    BOOL wasHidden = self.hidden;
+    BOOL wasInteractionEnabled = self.userInteractionEnabled;
+    self.hidden = NO;
+    self.userInteractionEnabled = YES;
+
+    for (UIGestureRecognizer *gr in self.gestureRecognizers) {
+        if ([gr isKindOfClass:[UITapGestureRecognizer class]]) {
+            NSArray *targets = [gr valueForKey:@"targets"];
+            for (id targetInfo in targets) {
+                id target = [targetInfo valueForKey:@"target"];
+                SEL action = (SEL)((NSValue *)[targetInfo valueForKey:@"action"]).pointerValue;
+                if (target && action) {
+                    [gr setState:UIGestureRecognizerStateBegan];
+                    [gr setState:UIGestureRecognizerStateEnded];
+                    break;
+                }
+            }
+        }
+    }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        self.hidden = wasHidden;
+        self.userInteractionEnabled = wasInteractionEnabled;
+    });
+}
+
 - (void)layoutSubviews {
     %orig;
+    if (DYYYGetBool(@"DYYYMoveFullscreenToPanel")) {
+        self.hidden = YES;
+        self.userInteractionEnabled = NO;
+        return;
+    }
     if (DYYYGetBool(@"DYYYRemoveEntry")) {
         [self removeFromSuperview];
         return;
