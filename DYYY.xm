@@ -12637,7 +12637,7 @@ static Class TagViewClass = nil;
 - (void)didMoveToWindow {
     %orig;
     if (DYYYGetBool(@"DYYYRemoveEntry")) {
-        self.hidden = YES;
+        self.alpha = 0;
     }
     if (self.window) {
         [self dyyy_applyGlobalTransparency];
@@ -12655,7 +12655,7 @@ static Class TagViewClass = nil;
 - (void)layoutSubviews {
     %orig;
     if (DYYYGetBool(@"DYYYRemoveEntry")) {
-        self.hidden = YES;
+        self.alpha = 0;
         return;
     }
     if (DYYYGetBool(@"DYYYHideEntry")) {
