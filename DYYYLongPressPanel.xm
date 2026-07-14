@@ -43,6 +43,34 @@ static void simulateTapOnEntryView(UIView *entryView) {
     }
 }
 
+// 定时关闭：后台兜底检查定时器（解决 dispatch_after 在深度休眠时主队列不 drain 的问题）
+static NSTimer *dyyyTimerCloseCheckTimer = nil;
+
+static void DYYYStopTimerCloseCheck(void) {
+    if (dyyyTimerCloseCheckTimer) {
+        [dyyyTimerCloseCheckTimer invalidate];
+        dyyyTimerCloseCheckTimer = nil;
+    }
+}
+
+static void DYYYPerformTimerClose(void) {
+    DYYYStopTimerCloseCheck();
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"DYYYTimerShutdownTime"];
+    DYYYConfirmCloseView *confirmView = [[DYYYConfirmCloseView alloc] initWithTitle:@"定时关闭" message:@"定时关闭时间已到，是否关闭抖音？"];
+    [confirmView show];
+}
+
+static void DYYYStartTimerCloseCheck(void) {
+    DYYYStopTimerCloseCheck();
+    dyyyTimerCloseCheckTimer = [NSTimer timerWithTimeInterval:60.00 repeats:YES block:^(NSTimer *timer) {
+        NSNumber *shutdownTime = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYTimerShutdownTime"];
+        if (shutdownTime != nil && [shutdownTime doubleValue] <= [[NSDate date] timeIntervalSince1970]) {
+            DYYYPerformTimerClose();
+        }
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:dyyyTimerCloseCheckTimer forMode:NSRunLoopCommonModes];
+}
+
 %hook AWELongPressPanelViewGroupModel
 %property(nonatomic, assign) BOOL isDYYYCustomGroup;
 %end
@@ -690,6 +718,7 @@ static void simulateTapOnEntryView(UIView *entryView) {
           BOOL hasActiveTimer = shutdownTime != nil && [shutdownTime doubleValue] > [[NSDate date] timeIntervalSince1970];
           if (hasActiveTimer) {
               [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"DYYYTimerShutdownTime"];
+              DYYYStopTimerCloseCheck();
               [DYYYUtils showToast:@"已取消定时关闭任务"];
               return;
           }
@@ -711,13 +740,11 @@ static void simulateTapOnEntryView(UIView *entryView) {
             NSTimeInterval shutdownTimeValue = [[NSDate date] timeIntervalSince1970] + seconds;
             [[NSUserDefaults standardUserDefaults] setObject:@(shutdownTimeValue) forKey:@"DYYYTimerShutdownTime"];
             [DYYYUtils showToast:[NSString stringWithFormat:@"抖音将在%ld分钟后关闭...", (long)minutes]];
+            DYYYStartTimerCloseCheck();
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
               NSNumber *currentShutdownTime = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYTimerShutdownTime"];
               if (currentShutdownTime != nil && [currentShutdownTime doubleValue] <= [[NSDate date] timeIntervalSince1970]) {
-                  [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"DYYYTimerShutdownTime"];
-                  // 显示确认关闭弹窗，而不是直接退出
-                  DYYYConfirmCloseView *confirmView = [[DYYYConfirmCloseView alloc] initWithTitle:@"定时关闭" message:@"定时关闭时间已到，是否关闭抖音？"];
-                  [confirmView show];
+                  DYYYPerformTimerClose();
               }
             });
           };
@@ -1461,6 +1488,7 @@ static void simulateTapOnEntryView(UIView *entryView) {
           BOOL hasActiveTimer = shutdownTime != nil && [shutdownTime doubleValue] > [[NSDate date] timeIntervalSince1970];
           if (hasActiveTimer) {
               [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"DYYYTimerShutdownTime"];
+              DYYYStopTimerCloseCheck();
               [DYYYUtils showToast:@"已取消定时关闭任务"];
               return;
           }
@@ -1482,13 +1510,11 @@ static void simulateTapOnEntryView(UIView *entryView) {
             NSTimeInterval shutdownTimeValue = [[NSDate date] timeIntervalSince1970] + seconds;
             [[NSUserDefaults standardUserDefaults] setObject:@(shutdownTimeValue) forKey:@"DYYYTimerShutdownTime"];
             [DYYYUtils showToast:[NSString stringWithFormat:@"抖音将在%ld分钟后关闭...", (long)minutes]];
+            DYYYStartTimerCloseCheck();
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
               NSNumber *currentShutdownTime = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYTimerShutdownTime"];
               if (currentShutdownTime != nil && [currentShutdownTime doubleValue] <= [[NSDate date] timeIntervalSince1970]) {
-                  [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"DYYYTimerShutdownTime"];
-                  // 显示确认关闭弹窗，而不是直接退出
-                  DYYYConfirmCloseView *confirmView = [[DYYYConfirmCloseView alloc] initWithTitle:@"定时关闭" message:@"定时关闭时间已到，是否关闭抖音？"];
-                  [confirmView show];
+                  DYYYPerformTimerClose();
               }
             });
           };
