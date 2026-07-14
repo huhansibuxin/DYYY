@@ -8,6 +8,34 @@
 #import "DYYYToast.h"
 #import "DYYYUtils.h"
 
+static UIViewController *findLandscapeViewController(UIViewController *root) {
+    if (!root) return nil;
+    if ([root respondsToSelector:@selector(configBeforEnterLandscapeFeedWithShouldCheck:fromPinch:)]) {
+        return root;
+    }
+    if ([root respondsToSelector:@selector(configBeforEnterToLandscapeFeed:)]) {
+        return root;
+    }
+    for (UIViewController *child in root.childViewControllers) {
+        UIViewController *found = findLandscapeViewController(child);
+        if (found) return found;
+    }
+    return findLandscapeViewController(root.presentedViewController);
+}
+
+static void enterLandscapeFeed(UIViewController *vc) {
+    if (!vc) return;
+    if ([vc respondsToSelector:@selector(configBeforEnterLandscapeFeedWithShouldCheck:fromPinch:)]) {
+        void (*fn)(id, SEL, BOOL, BOOL) = (void (*)(id, SEL, BOOL, BOOL))objc_msgSend;
+        fn(vc, @selector(configBeforEnterLandscapeFeedWithShouldCheck:fromPinch:), YES, NO);
+        return;
+    }
+    if ([vc respondsToSelector:@selector(configBeforEnterToLandscapeFeed:)]) {
+        void (*fn)(id, SEL, BOOL) = (void (*)(id, SEL, BOOL))objc_msgSend;
+        fn(vc, @selector(configBeforEnterToLandscapeFeed:), YES);
+    }
+}
+
 %hook AWELongPressPanelViewGroupModel
 %property(nonatomic, assign) BOOL isDYYYCustomGroup;
 %end
@@ -477,21 +505,22 @@
         [viewModels addObject:createVideoViewModel];
     }
 
-    // 复制文案功能
+    // 全屏观看功能
     if (enableCopyText) {
-        AWELongPressPanelBaseViewModel *copyText = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
-        copyText.awemeModel = self.awemeModel;
-        copyText.actionType = 671;
-        copyText.duxIconName = @"ic_xiaoxihuazhonghua_outlined";
-        copyText.describeString = @"复制文案";
-        copyText.action = ^{
-          NSString *descText = [self.awemeModel valueForKey:@"descriptionString"];
-          [[UIPasteboard generalPasteboard] setString:descText];
-          [DYYYToast showSuccessToastWithMessage:@"文案已复制"];
+        AWELongPressPanelBaseViewModel *fullScreen = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
+        fullScreen.awemeModel = self.awemeModel;
+        fullScreen.actionType = 671;
+        fullScreen.duxIconName = @"ic_fullscreen_outlined";
+        fullScreen.describeString = @"全屏观看";
+        fullScreen.action = ^{
           AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
-          [panelManager dismissWithAnimation:YES completion:nil];
+          [panelManager dismissWithAnimation:YES completion:^{
+            UIViewController *topVC = [DYYYUtils topView];
+            UIViewController *landscapeVC = findLandscapeViewController(topVC);
+            enterLandscapeFeed(landscapeVC);
+          }];
         };
-        [viewModels addObject:copyText];
+        [viewModels addObject:fullScreen];
     }
 
     // 复制分享链接功能
@@ -1247,21 +1276,22 @@
         [viewModels addObject:createVideoViewModel];
     }
 
-    // 复制文案功能
+    // 全屏观看功能
     if (enableCopyText) {
-        AWELongPressPanelBaseViewModel *copyText = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
-        copyText.awemeModel = self.awemeModel;
-        copyText.actionType = 671;
-        copyText.duxIconName = @"ic_xiaoxihuazhonghua_outlined";
-        copyText.describeString = @"复制文案";
-        copyText.action = ^{
-          NSString *descText = [self.awemeModel valueForKey:@"descriptionString"];
-          [[UIPasteboard generalPasteboard] setString:descText];
-          [DYYYToast showSuccessToastWithMessage:@"文案已复制"];
+        AWELongPressPanelBaseViewModel *fullScreen = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
+        fullScreen.awemeModel = self.awemeModel;
+        fullScreen.actionType = 671;
+        fullScreen.duxIconName = @"ic_fullscreen_outlined";
+        fullScreen.describeString = @"全屏观看";
+        fullScreen.action = ^{
           AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
-          [panelManager dismissWithAnimation:YES completion:nil];
+          [panelManager dismissWithAnimation:YES completion:^{
+            UIViewController *topVC = [DYYYUtils topView];
+            UIViewController *landscapeVC = findLandscapeViewController(topVC);
+            enterLandscapeFeed(landscapeVC);
+          }];
         };
-        [viewModels addObject:copyText];
+        [viewModels addObject:fullScreen];
     }
 
     // 复制分享链接功能
