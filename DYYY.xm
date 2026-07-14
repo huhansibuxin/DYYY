@@ -12636,6 +12636,9 @@ static Class TagViewClass = nil;
 
 - (void)didMoveToWindow {
     %orig;
+    if (DYYYGetBool(@"DYYYRemoveEntry")) {
+        self.hidden = YES;
+    }
     if (self.window) {
         [self dyyy_applyGlobalTransparency];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(dyyy_applyGlobalTransparency) name:kDYYYGlobalTransparencyDidChangeNotification object:nil];
