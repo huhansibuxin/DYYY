@@ -421,6 +421,24 @@ static void simulateTapOnEntryView(UIView *entryView) {
         [viewModels addObject:coverViewModel];
     }
 
+    // 全屏观看功能
+    if (enableCopyText) {
+        AWELongPressPanelBaseViewModel *fullScreen = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
+        fullScreen.awemeModel = self.awemeModel;
+        fullScreen.actionType = 671;
+        fullScreen.duxIconName = @"ic_fullscreen_outlined";
+        fullScreen.describeString = @"全屏观看";
+        fullScreen.action = ^{
+          AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
+          [panelManager dismissWithAnimation:YES completion:^{
+            UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+            UIView *entryView = findLandscapeEntryViewInView(keyWindow);
+            simulateTapOnEntryView(entryView);
+          }];
+        };
+        [viewModels addObject:fullScreen];
+    }
+
     // 音频下载功能
     if (enableSaveAudio) {
         AWELongPressPanelBaseViewModel *audioViewModel = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
@@ -510,24 +528,6 @@ static void simulateTapOnEntryView(UIView *entryView) {
           [panelManager dismissWithAnimation:YES completion:nil];
         };
         [viewModels addObject:createVideoViewModel];
-    }
-
-    // 全屏观看功能
-    if (enableCopyText) {
-        AWELongPressPanelBaseViewModel *fullScreen = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
-        fullScreen.awemeModel = self.awemeModel;
-        fullScreen.actionType = 671;
-        fullScreen.duxIconName = @"ic_fullscreen_outlined";
-        fullScreen.describeString = @"全屏观看";
-        fullScreen.action = ^{
-          AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
-          [panelManager dismissWithAnimation:YES completion:^{
-            UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
-            UIView *entryView = findLandscapeEntryViewInView(keyWindow);
-            simulateTapOnEntryView(entryView);
-          }];
-        };
-        [viewModels addObject:fullScreen];
     }
 
     // 复制分享链接功能
@@ -1192,6 +1192,24 @@ static void simulateTapOnEntryView(UIView *entryView) {
         [viewModels addObject:coverViewModel];
     }
 
+    // 全屏观看功能
+    if (enableCopyText) {
+        AWELongPressPanelBaseViewModel *fullScreen = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
+        fullScreen.awemeModel = self.awemeModel;
+        fullScreen.actionType = 671;
+        fullScreen.duxIconName = @"ic_fullscreen_outlined";
+        fullScreen.describeString = @"全屏观看";
+        fullScreen.action = ^{
+          AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
+          [panelManager dismissWithAnimation:YES completion:^{
+            UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+            UIView *entryView = findLandscapeEntryViewInView(keyWindow);
+            simulateTapOnEntryView(entryView);
+          }];
+        };
+        [viewModels addObject:fullScreen];
+    }
+
     // 音频下载功能
     if (enableSaveAudio) {
         AWELongPressPanelBaseViewModel *audioViewModel = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
@@ -1281,24 +1299,6 @@ static void simulateTapOnEntryView(UIView *entryView) {
           [panelManager dismissWithAnimation:YES completion:nil];
         };
         [viewModels addObject:createVideoViewModel];
-    }
-
-    // 全屏观看功能
-    if (enableCopyText) {
-        AWELongPressPanelBaseViewModel *fullScreen = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
-        fullScreen.awemeModel = self.awemeModel;
-        fullScreen.actionType = 671;
-        fullScreen.duxIconName = @"ic_fullscreen_outlined";
-        fullScreen.describeString = @"全屏观看";
-        fullScreen.action = ^{
-          AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
-          [panelManager dismissWithAnimation:YES completion:^{
-            UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
-            UIView *entryView = findLandscapeEntryViewInView(keyWindow);
-            simulateTapOnEntryView(entryView);
-          }];
-        };
-        [viewModels addObject:fullScreen];
     }
 
     // 复制分享链接功能
