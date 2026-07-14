@@ -12618,6 +12618,10 @@ static Class TagViewClass = nil;
 %hook AWELandscapeFeedEntryView
 
 - (void)setAlpha:(CGFloat)alpha {
+    if (DYYYGetBool(@"DYYYRemoveEntry")) {
+        %orig(0);
+        return;
+    }
     BOOL isApplyingGlobal = (dyyyGlobalTransparencyMutationDepth > 0);
     if (!isApplyingGlobal) {
         objc_setAssociatedObject(self, &kDYYYGlobalTransparencyBaseAlphaKey, @(alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
