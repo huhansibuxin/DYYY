@@ -4838,17 +4838,31 @@ static BOOL isGestureActive = NO;
 
 %ctor {
     Class dpClass = NSClassFromString(@"AWEPlayInteractionDPlayerSpeedController");
+    NSMutableString *fileLog = [NSMutableString string];
+    [fileLog appendFormat:@"[DYYY] DPlayerSpeedController class exists: %@\n", dpClass ? @"YES" : @"NO"];
     if (dpClass) {
         unsigned int methodCount = 0;
         Method *methods = class_copyMethodList(dpClass, &methodCount);
-        NSMutableString *log = [NSMutableString stringWithFormat:@"[DYYY] DPlayerSpeedController methods (%u):", methodCount];
+        [fileLog appendFormat:@"[DYYY] DPlayerSpeedController methods (%u):", methodCount];
         for (unsigned int i = 0; i < methodCount; i++) {
             SEL sel = method_getName(methods[i]);
-            [log appendFormat:@" %s", sel_getName(sel)];
+            [fileLog appendFormat:@" %s", sel_getName(sel)];
         }
-        NSLog(@"%@", log);
+        [fileLog appendString:@"\n"];
         free(methods);
     }
+    // Also check if changeSpeed: exists
+    BOOL hasChangeSpeed = [dpClass instancesRespondToSelector:@selector(changeSpeed:)];
+    [fileLog appendFormat:@"[DYYY] DPlayerSpeedController responds to changeSpeed:: %@\n", hasChangeSpeed ? @"YES" : @"NO"];
+
+    // Check AWEPlayInteractionSpeedController too
+    Class scClass = NSClassFromString(@"AWEPlayInteractionSpeedController");
+    BOOL scHasChangeSpeed = [scClass instancesRespondToSelector:@selector(changeSpeed:)];
+    [fileLog appendFormat:@"[DYYY] SpeedController responds to changeSpeed:: %@\n", scHasChangeSpeed ? @"YES" : @"NO"];
+
+    [fileLog appendFormat:@"[DYYY] dyyyLongPressFastSpeedActive=%d dyyyLongPressLockedSpeedActive=%d\n", dyyyLongPressFastSpeedActive, dyyyLongPressLockedSpeedActive];
+    [fileLog writeToFile:@"/var/mobile/Documents/DYYY_debug.log" atomically:NO encoding:NSUTF8StringEncoding error:nil];
+    NSLog(@"%@", fileLog);
 }
 
 %hook UILabel
