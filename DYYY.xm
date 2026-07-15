@@ -594,6 +594,25 @@ static double DYYYPreparedPlaybackSpeedForPlayer(id playerViewController) {
     return DYYYConfiguredPlaybackSpeed();
 }
 
+static void DYYYForceSetPlaybackRateOnPlayer(id vc, double speed) {
+    @try {
+        id player = [vc valueForKey:@"player"];
+        if (player && [player respondsToSelector:@selector(setRate:)]) {
+            DYYYDebugLog(@"[ForceRate] KVC player setRate:%.2f", speed);
+            [player setRate:speed];
+            return;
+        }
+    } @catch (NSException *e) {}
+    @try {
+        id mediaPlayer = [vc valueForKey:@"mediaPlayer"];
+        if (mediaPlayer && [mediaPlayer respondsToSelector:@selector(setRate:)]) {
+            DYYYDebugLog(@"[ForceRate] KVC mediaPlayer setRate:%.2f", speed);
+            [mediaPlayer setRate:speed];
+            return;
+        }
+    } @catch (NSException *e) {}
+}
+
 static void DYYYApplyPreparedPlaybackSpeedToPlayer(id playerViewController) {
     if (!DYYYShouldHandleSpeedFeatures() || !playerViewController || dyyyLongPressFastSpeedActive || dyyyLongPressLockedSpeedActive) {
         return;
@@ -11886,6 +11905,7 @@ static Class tabBarButtonClass = nil;
         if (desiredSpeed != 1.0) {
             DYYYDebugLog(@"[AwemePlayVideoVC] -> override desiredSpeed:%.2f", desiredSpeed);
             %orig(desiredSpeed);
+            DYYYForceSetPlaybackRateOnPlayer(self, desiredSpeed);
             return;
         }
     }
@@ -11951,6 +11971,7 @@ static Class tabBarButtonClass = nil;
         if (desiredSpeed != 1.0) {
             DYYYDebugLog(@"[DPlayerFeedPlayerVC] -> override desiredSpeed:%.2f", desiredSpeed);
             %orig(desiredSpeed);
+            DYYYForceSetPlaybackRateOnPlayer(self, desiredSpeed);
             return;
         }
     }
@@ -12044,6 +12065,7 @@ static Class tabBarButtonClass = nil;
         if (desiredSpeed != 1.0) {
             DYYYDebugLog(@"[DPlayerVC_Merge] -> override desiredSpeed:%.2f", desiredSpeed);
             %orig(desiredSpeed);
+            DYYYForceSetPlaybackRateOnPlayer(self, desiredSpeed);
             return;
         }
     }
@@ -12090,17 +12112,27 @@ static Class tabBarButtonClass = nil;
         return;
     }
     DYYYApplyPreparedPlaybackSpeedToPlayer(self);
+    double desiredSpeed = DYYYPreparedPlaybackSpeedForPlayer(self);
     __weak __typeof__(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         __strong __typeof__(weakSelf) strongSelf = weakSelf;
         if (strongSelf) {
             DYYYApplyPreparedPlaybackSpeedToPlayer(strongSelf);
+            DYYYForceSetPlaybackRateOnPlayer(strongSelf, desiredSpeed);
         }
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         __strong __typeof__(weakSelf) strongSelf = weakSelf;
         if (strongSelf) {
             DYYYApplyPreparedPlaybackSpeedToPlayer(strongSelf);
+            DYYYForceSetPlaybackRateOnPlayer(strongSelf, desiredSpeed);
+        }
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong __typeof__(weakSelf) strongSelf = weakSelf;
+        if (strongSelf) {
+            DYYYApplyPreparedPlaybackSpeedToPlayer(strongSelf);
+            DYYYForceSetPlaybackRateOnPlayer(strongSelf, desiredSpeed);
         }
     });
     updateSpeedButtonUI();
@@ -12128,6 +12160,52 @@ static Class tabBarButtonClass = nil;
 %new
 - (void)adjustPlaybackSpeed:(float)speed {
     [self setVideoControllerPlaybackRate:speed];
+}
+
+%end
+
+%hook AWEBasicModePlayInteractionViewController
+
+- (void)setVideoControllerPlaybackRate:(double)rate {
+    DYYYDebugLog(@"[BasicModePlayInteractionVC] setRate:%.2f internal:%d shouldHandle:%d fastActive:%d lockedActive:%d",
+                 rate, dyyyInternalSpeedChange, DYYYShouldHandleSpeedFeatures(), dyyyLongPressFastSpeedActive, dyyyLongPressLockedSpeedActive);
+    if (!dyyyInternalSpeedChange && DYYYShouldHandleSpeedFeatures()
+        && !dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive
+        && rate == 1.0) {
+        double desiredSpeed = DYYYPreparedPlaybackSpeedForPlayer(self);
+        if (desiredSpeed != 1.0) {
+            DYYYDebugLog(@"[BasicModePlayInteractionVC] -> override desiredSpeed:%.2f", desiredSpeed);
+            %orig(desiredSpeed);
+            DYYYForceSetPlaybackRateOnPlayer(self, desiredSpeed);
+            return;
+        }
+    }
+    DYYYDebugLog(@"[BasicModePlayInteractionVC] -> pass-through %.2f", rate);
+    %orig;
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    DYYYDebugLog(@"[BasicModePlayInteractionVC] viewDidAppear shouldHandle:%d", DYYYShouldHandleSpeedFeatures());
+    %orig;
+    if (!DYYYShouldHandleSpeedFeatures()) {
+        return;
+    }
+    DYYYApplyPreparedPlaybackSpeedToPlayer(self);
+}
+
+- (void)prepareForDisplay {
+    DYYYDebugLog(@"[BasicModePlayInteractionVC] prepareForDisplay shouldHandle:%d", DYYYShouldHandleSpeedFeatures());
+    %orig;
+    if (!DYYYShouldHandleSpeedFeatures()) {
+        return;
+    }
+    DYYYApplyPreparedPlaybackSpeedToPlayer(self);
+}
+
+- (void)setIsAutoPlay:(BOOL)arg0 {
+    DYYYDebugLog(@"[BasicModePlayInteractionVC] setIsAutoPlay:%d shouldHandle:%d", arg0, DYYYShouldHandleSpeedFeatures());
+    %orig(arg0);
+    DYYYApplyPreparedPlaybackSpeedToPlayer(self);
 }
 
 %end
