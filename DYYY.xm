@@ -8867,11 +8867,11 @@ static NSHashTable *processedParentViews = nil;
 - (UIColor *)awe_smartBackgroundColor {
     NSString *colorHex = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYVideoBGColor"];
     if (colorHex && colorHex.length > 0) {
-        CGSize screenSize = [UIScreen mainScreen].bounds.size;
-        if (screenSize.width > screenSize.height) {
+        UIInterfaceOrientation orientation = [[UIApplication sharedApplication] statusBarOrientation];
+        if (UIInterfaceOrientationIsLandscape(orientation)) {
             return [UIColor blackColor];
         }
-        CGFloat screenWidth = screenSize.width;
+        CGFloat screenWidth = [UIScreen mainScreen].bounds.size.width;
         UIColor *customColor = [DYYYUtils colorFromSchemeHexString:colorHex targetWidth:screenWidth];
         if (customColor)
             return customColor;
@@ -11688,6 +11688,13 @@ static Class tabBarButtonClass = nil;
     }
 
     DYYYApplyPreparedPlaybackSpeedToPlayer(self);
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf) {
+            DYYYApplyPreparedPlaybackSpeedToPlayer(strongSelf);
+        }
+    });
     updateSpeedButtonUI();
 }
 
@@ -11737,6 +11744,13 @@ static Class tabBarButtonClass = nil;
         return;
     }
     DYYYApplyPreparedPlaybackSpeedToPlayer(self);
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf) {
+            DYYYApplyPreparedPlaybackSpeedToPlayer(strongSelf);
+        }
+    });
     updateSpeedButtonUI();
 }
 
@@ -11786,6 +11800,13 @@ static Class tabBarButtonClass = nil;
         return;
     }
     DYYYApplyPreparedPlaybackSpeedToPlayer(self);
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf) {
+            DYYYApplyPreparedPlaybackSpeedToPlayer(strongSelf);
+        }
+    });
     updateSpeedButtonUI();
 }
 
