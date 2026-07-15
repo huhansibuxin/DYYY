@@ -5007,6 +5007,35 @@ static BOOL isGestureActive = NO;
                  hasLongPressSpeed ? @"YES" : @"NO",
                  hasLandscapeNotif ? @"YES" : @"NO",
                  hasFastSpeed ? @"YES" : @"NO");
+
+    // Scan DPlayerVC_Merge ivars for rate/speed/playback properties
+    Class dplayerMergeClass = NSClassFromString(@"AWEDPlayerViewController_Merge");
+    if (dplayerMergeClass) {
+        Class cls = dplayerMergeClass;
+        while (cls && cls != [NSObject class]) {
+            unsigned int ivarCount = 0;
+            Ivar *ivars = class_copyIvarList(cls, &ivarCount);
+            for (unsigned int i = 0; i < ivarCount; i++) {
+                const char *name = ivar_getName(ivars[i]);
+                if (strstr(name, "rate") || strstr(name, "speed") || strstr(name, "playback") || strstr(name, "player") || strstr(name, "Speed")) {
+                    DYYYDebugLog(@"[IvarScan] DPlayerVC_Merge(%s) ivar: %s", class_getName(cls), name);
+                }
+            }
+            free(ivars);
+            cls = class_getSuperclass(cls);
+        }
+    }
+
+    // Scan DPlayerSpeedController ivars
+    if (dpClass) {
+        unsigned int ivarCount = 0;
+        Ivar *ivars = class_copyIvarList(dpClass, &ivarCount);
+        for (unsigned int i = 0; i < ivarCount; i++) {
+            const char *name = ivar_getName(ivars[i]);
+            DYYYDebugLog(@"[IvarScan] DPlayerSpeedController ivar: %s", name);
+        }
+        free(ivars);
+    }
 }
 
 %hook UILabel
@@ -12071,6 +12100,9 @@ static Class tabBarButtonClass = nil;
     }
     DYYYDebugLog(@"[DPlayerVC_Merge] -> pass-through %.2f", rate);
     %orig;
+    if (rate != 1.0 && DYYYShouldHandleSpeedFeatures()) {
+        DYYYForceSetPlaybackRateOnPlayer(self, rate);
+    }
 }
 
 - (BOOL)enableHDR {
