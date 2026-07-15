@@ -611,6 +611,59 @@ static void DYYYForceSetPlaybackRateOnPlayer(id vc, double speed) {
             return;
         }
     } @catch (NSException *e) {}
+
+    DYYYForcePlaybackRateIvar(vc, speed);
+}
+
+static void DYYYForcePlaybackRateIvar(id vc, double speed) {
+    if (!vc || !isfinite(speed)) return;
+
+    // Walk class hierarchy to find _playbackRate ivar
+    Class cls = [vc class];
+    Ivar ivar = NULL;
+    while (cls && cls != [NSObject class]) {
+        ivar = class_getInstanceVariable(cls, "_playbackRate");
+        if (ivar) break;
+        cls = class_getSuperclass(cls);
+    }
+    if (!ivar) {
+        DYYYDebugLog(@"[ForceIvar] _playbackRate ivar not found on %s", class_getName([vc class]));
+        return;
+    }
+
+    const char *type = ivar_getTypeEncoding(ivar);
+    const char *ivarname = ivar_getName(ivar);
+    DYYYDebugLog(@"[ForceIvar] found ivar %s type:%s offset:%td on class %s",
+                 ivarname, type ?: "(null)", ivar_getOffset(ivar), class_getName(cls));
+
+    @try {
+        if (type) {
+            if (strcmp(type, @encode(double)) == 0 || strcmp(type, @encode(CGFloat)) == 0) {
+                double *ptr = (double *)((char *)(__bridge void *)vc + ivar_getOffset(ivar));
+                double old = *ptr;
+                *ptr = speed;
+                DYYYDebugLog(@"[ForceIvar] _playbackRate double %.2f -> %.2f", old, speed);
+                return;
+            }
+            if (strcmp(type, @encode(float)) == 0) {
+                float *ptr = (float *)((char *)(__bridge void *)vc + ivar_getOffset(ivar));
+                float old = *ptr;
+                *ptr = (float)speed;
+                DYYYDebugLog(@"[ForceIvar] _playbackRate float %.2f -> %.2f", old, speed);
+                return;
+            }
+        }
+    } @catch (NSException *e) {
+        DYYYDebugLog(@"[ForceIvar] pointer set failed: %s", e.reason.UTF8String);
+    }
+
+    // Fallback: KVC on self
+    @try {
+        [vc setValue:@(speed) forKey:@"playbackRate"];
+        DYYYDebugLog(@"[ForceIvar] KVC setValue:@(%.2f) forKey:playbackRate", speed);
+    } @catch (NSException *e) {
+        DYYYDebugLog(@"[ForceIvar] KVC fallback failed: %s", e.reason.UTF8String);
+    }
 }
 
 static void DYYYApplyPreparedPlaybackSpeedToPlayer(id playerViewController) {
