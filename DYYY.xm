@@ -12034,6 +12034,9 @@ static Class tabBarButtonClass = nil;
 - (void)setVideoControllerPlaybackRate:(double)rate {
     DYYYDebugLog(@"[DPlayerVC_Merge] setRate:%.2f internal:%d shouldHandle:%d fastActive:%d lockedActive:%d",
                  rate, dyyyInternalSpeedChange, DYYYShouldHandleSpeedFeatures(), dyyyLongPressFastSpeedActive, dyyyLongPressLockedSpeedActive);
+    if (!dyyyInternalSpeedChange) {
+        DYYYDebugLog(@"[DPlayerVC_Merge] EXTERNAL call stack: %@", [NSThread callStackSymbols]);
+    }
     if (!dyyyInternalSpeedChange && DYYYShouldHandleSpeedFeatures()
         && !dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive
         && rate == 1.0) {
@@ -13450,6 +13453,24 @@ static void findTargetViewInView(UIView *view) {
     }];
 
     DYYYMigrateCombinedHDRModeIfNeeded();
+
+    // Runtime scan: hook setVideoControllerPlaybackRate: on ALL classes that implement it
+    {
+        int numClasses = objc_getClassList(NULL, 0);
+        Class *classes = (Class *)malloc(sizeof(Class) * numClasses);
+        objc_getClassList(classes, numClasses);
+        SEL sel = @selector(setVideoControllerPlaybackRate:);
+        for (int i = 0; i < numClasses; i++) {
+            Class cls = classes[i];
+            if (class_getInstanceMethod(cls, sel) && cls != objc_getClass("AWEDPlayerViewController_Merge")) {
+                Method m = class_getInstanceMethod(cls, sel);
+                IMP orig = method_getImplementation(m);
+                // We can't easily hook here without MSHookMessageEx, so just log
+                DYYYDebugLog(@"[RateHookScan] Found setVideoControllerPlaybackRate: on %s", class_getName(cls));
+            }
+        }
+        free(classes);
+    }
 
     Class interactionBaseLabelClass = objc_getClass("AWECommentSwiftBizUI.CommentInteractionBaseLabel");
     if (interactionBaseLabelClass) {
