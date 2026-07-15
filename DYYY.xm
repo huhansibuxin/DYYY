@@ -11688,9 +11688,9 @@ static Class tabBarButtonClass = nil;
     }
 
     DYYYApplyPreparedPlaybackSpeedToPlayer(self);
-    __weak typeof(self) weakSelf = self;
+    __weak __typeof__(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        __strong typeof(weakSelf) strongSelf = weakSelf;
+        __strong __typeof__(weakSelf) strongSelf = weakSelf;
         if (strongSelf) {
             DYYYApplyPreparedPlaybackSpeedToPlayer(strongSelf);
         }
@@ -11744,9 +11744,9 @@ static Class tabBarButtonClass = nil;
         return;
     }
     DYYYApplyPreparedPlaybackSpeedToPlayer(self);
-    __weak typeof(self) weakSelf = self;
+    __weak __typeof__(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        __strong typeof(weakSelf) strongSelf = weakSelf;
+        __strong __typeof__(weakSelf) strongSelf = weakSelf;
         if (strongSelf) {
             DYYYApplyPreparedPlaybackSpeedToPlayer(strongSelf);
         }
@@ -11800,9 +11800,9 @@ static Class tabBarButtonClass = nil;
         return;
     }
     DYYYApplyPreparedPlaybackSpeedToPlayer(self);
-    __weak typeof(self) weakSelf = self;
+    __weak __typeof__(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        __strong typeof(weakSelf) strongSelf = weakSelf;
+        __strong __typeof__(weakSelf) strongSelf = weakSelf;
         if (strongSelf) {
             DYYYApplyPreparedPlaybackSpeedToPlayer(strongSelf);
         }
