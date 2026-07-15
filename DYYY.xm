@@ -19,6 +19,55 @@
 #import "AwemeHeaders.h"
 #import "CityManager.h"
 #import "DYYYBottomAlertView.h"
+
+// ====== DYYYDebugLog (moved to top: must be visible to all hooks) ======
+static NSString *DYYYDebugLogPath(void) {
+    static NSString *path = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        path = [docPath stringByAppendingPathComponent:@"DYYY_debug.log"];
+    });
+    return path;
+}
+
+static void DYYYDebugLog(NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
+    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+
+    NSString *logPath = DYYYDebugLogPath();
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // Truncate to ~256KB if exceeds 512KB
+    if ([fm fileExistsAtPath:logPath]) {
+        unsigned long long fileSize = [[fm attributesOfItemAtPath:logPath error:nil] fileSize];
+        if (fileSize > 512 * 1024) {
+            NSData *existing = [NSData dataWithContentsOfFile:logPath];
+            NSUInteger keepStart = fileSize - 256 * 1024;
+            // Find next newline boundary
+            NSRange range = [existing rangeOfData:[NSData dataWithBytes:"\n" length:1] options:0 range:NSMakeRange(keepStart, existing.length - keepStart)];
+            if (range.location != NSNotFound) {
+                existing = [existing subdataWithRange:NSMakeRange(range.location + 1, existing.length - range.location - 1)];
+            }
+            [existing writeToFile:logPath atomically:NO];
+        }
+    }
+
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+    if (!fh) {
+        [data writeToFile:logPath atomically:NO];
+    } else {
+        [fh seekToEndOfFile];
+        [fh writeData:data];
+        [fh closeFile];
+    }
+}
+// ====== end DYYYDebugLog ======
 #import "DYYYManager.h"
 
 #import "AWMSafeDispatchTimer.h"
@@ -4824,53 +4873,6 @@ static BOOL isGestureActive = NO;
     }
 }
 %end
-
-static NSString *DYYYDebugLogPath(void) {
-    static NSString *path = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-        path = [docPath stringByAppendingPathComponent:@"DYYY_debug.log"];
-    });
-    return path;
-}
-
-static void DYYYDebugLog(NSString *format, ...) {
-    va_list args;
-    va_start(args, format);
-    NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
-    va_end(args);
-
-    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
-    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
-
-    NSString *logPath = DYYYDebugLogPath();
-    NSFileManager *fm = [NSFileManager defaultManager];
-
-    // Truncate to ~256KB if exceeds 512KB
-    if ([fm fileExistsAtPath:logPath]) {
-        unsigned long long fileSize = [[fm attributesOfItemAtPath:logPath error:nil] fileSize];
-        if (fileSize > 512 * 1024) {
-            NSData *existing = [NSData dataWithContentsOfFile:logPath];
-            NSUInteger keepStart = fileSize - 256 * 1024;
-            // Find next newline boundary
-            NSRange range = [existing rangeOfData:[NSData dataWithBytes:"\n" length:1] options:0 range:NSMakeRange(keepStart, existing.length - keepStart)];
-            if (range.location != NSNotFound) {
-                existing = [existing subdataWithRange:NSMakeRange(range.location + 1, existing.length - range.location - 1)];
-            }
-            [existing writeToFile:logPath atomically:NO];
-        }
-    }
-
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
-    if (!fh) {
-        [data writeToFile:logPath atomically:NO];
-    } else {
-        [fh seekToEndOfFile];
-        [fh writeData:data];
-        [fh closeFile];
-    }
-}
 
 %hook AWEPlayInteractionDPlayerSpeedController
 
