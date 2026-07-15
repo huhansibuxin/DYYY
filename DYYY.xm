@@ -1912,6 +1912,17 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
     %orig;
 }
 
+- (float)rate {
+    float r = %orig;
+    static NSTimeInterval lastLog = 0;
+    NSTimeInterval now = [[NSProcessInfo processInfo] systemUptime];
+    if (now - lastLog > 0.5) {
+        DYYYDebugLog(@"[AVPlayer] rate GET -> %.2f player:%p", r, (__bridge void *)self);
+        lastLog = now;
+    }
+    return r;
+}
+
 %end
 
 %hook AVPlayerItem
