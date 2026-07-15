@@ -1899,6 +1899,19 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
     %orig;
 }
 
+- (void)setRate:(float)rate time:(CMTime)time atHostTime:(CMTime)atHostTime {
+    DYYYDebugLog(@"[AVPlayer] setRate:%.2f time:%lld atHost:%lld player:%p",
+                 rate, time.value, atHostTime.value, (__bridge void *)self);
+    %orig;
+}
+
+- (void)playImmediatelyAtRate:(float)rate {
+    DYYYDebugLog(@"[AVPlayer] playImmediatelyAtRate:%.2f player:%p callstack:%@",
+                 rate, (__bridge void *)self,
+                 [NSThread callStackSymbols]);
+    %orig;
+}
+
 %end
 
 %hook AVPlayerItem
