@@ -2955,6 +2955,7 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
 }
 
 - (void)viewDidAppear:(BOOL)animated {
+    DYYYDebugLog(@"[LandscapeFeed] viewDidAppear shouldHandle:%d", DYYYShouldHandleSpeedFeatures());
     %orig;
     if (!DYYYShouldHandleSpeedFeatures()) {
         return;
@@ -4708,27 +4709,35 @@ static BOOL isGestureActive = NO;
 }
 
 - (void)changeSpeed:(double)speed {
+    DYYYDebugLog(@"[SpeedCtrl] changeSpeed:%.2f gestureActive:%d gestureSpeed:%.2f lockedActive:%d fastActive:%d longPressSpeed:%.2f",
+                 speed, isGestureActive, currentLongPressSpeed, dyyyLongPressLockedSpeedActive, dyyyLongPressFastSpeedActive,
+                 DYYYGetFloat(@"DYYYLongPressSpeed"));
     float longPressSpeed = DYYYGetFloat(@"DYYYLongPressSpeed");
 
     if (isGestureActive && currentLongPressSpeed > 0) {
+        DYYYDebugLog(@"[SpeedCtrl] -> override gestureSpeed:%.2f", currentLongPressSpeed);
         %orig(currentLongPressSpeed);
         return;
     }
 
     if (speed == 2.0 && longPressSpeed != 0 && longPressSpeed != 2.0) {
+        DYYYDebugLog(@"[SpeedCtrl] -> override longPressSpeed:%.2f", longPressSpeed);
         %orig(longPressSpeed);
         return;
     }
 
     if (speed <= 1.0 && dyyyLongPressLockedSpeedActive) {
+        DYYYDebugLog(@"[SpeedCtrl] -> speed<=1.0 with lock, ending lock");
         DYYYEndLockedLongPressSpeedAndRestoreIfNeeded();
     }
 
+    DYYYDebugLog(@"[SpeedCtrl] -> pass-through %.2f", speed);
     %orig(speed);
 }
 
 - (void)handleLongPressFastSpeed:(UILongPressGestureRecognizer *)gesture {
     BOOL enableSpeedGesture = DYYYGetBool(@"DYYYEnableLongPressSpeedGesture");
+    DYYYDebugLog(@"[SpeedCtrl] handleLongPressFastSpeed state:%ld enable:%d", (long)gesture.state, enableSpeedGesture);
     CGPoint location = [gesture locationInView:gesture.view];
     static CGFloat initialTouchY = 0;
     BOOL isBeginning = gesture.state == UIGestureRecognizerStateBegan;
@@ -4787,24 +4796,28 @@ static BOOL isGestureActive = NO;
 }
 
 - (void)handleLongPressLockedSpeedBegan {
+    DYYYDebugLog(@"[SpeedCtrl] handleLongPressLockedSpeedBegan");
     dyyyLongPressFastSpeedActive = YES;
     dyyyLongPressLockedSpeedActive = NO;
     %orig;
 }
 
 - (void)handleLongPressLockedDoubleSpeedChanged:(id)arg1 gesture:(UIGestureRecognizer *)gesture {
+    DYYYDebugLog(@"[SpeedCtrl] handleLongPressLockedDoubleSpeedChanged");
     dyyyLongPressFastSpeedActive = YES;
     dyyyLongPressLockedSpeedActive = NO;
     %orig(arg1, gesture);
 }
 
 - (void)handleLongPressLockedDoubleSpeedEnded:(id)arg1 gesture:(UIGestureRecognizer *)gesture {
+    DYYYDebugLog(@"[SpeedCtrl] handleLongPressLockedDoubleSpeedEnded");
     %orig(arg1, gesture);
     dyyyLongPressFastSpeedActive = NO;
     dyyyLongPressLockedSpeedActive = YES;
 }
 
 - (void)longPressSpeedControlDidChangeSpeed:(double)speed {
+    DYYYDebugLog(@"[SpeedCtrl] longPressSpeedControlDidChangeSpeed:%.2f lockedActive:%d", speed, dyyyLongPressLockedSpeedActive);
     %orig(speed);
     if (speed <= 1.0 && dyyyLongPressLockedSpeedActive) {
         DYYYEndLockedLongPressSpeedAndRestoreIfNeeded();
@@ -11831,24 +11844,30 @@ static Class tabBarButtonClass = nil;
 %hook AWEAwemePlayVideoViewController
 
 - (void)setVideoControllerPlaybackRate:(double)rate {
+    DYYYDebugLog(@"[AwemePlayVideoVC] setRate:%.2f internal:%d shouldHandle:%d fastActive:%d lockedActive:%d",
+                 rate, dyyyInternalSpeedChange, DYYYShouldHandleSpeedFeatures(), dyyyLongPressFastSpeedActive, dyyyLongPressLockedSpeedActive);
     if (!dyyyInternalSpeedChange && DYYYShouldHandleSpeedFeatures()
         && !dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive
         && rate == 1.0) {
         double desiredSpeed = DYYYPreparedPlaybackSpeedForPlayer(self);
         if (desiredSpeed != 1.0) {
+            DYYYDebugLog(@"[AwemePlayVideoVC] -> override desiredSpeed:%.2f", desiredSpeed);
             %orig(desiredSpeed);
             return;
         }
     }
+    DYYYDebugLog(@"[AwemePlayVideoVC] -> pass-through %.2f", rate);
     %orig;
 }
 
 - (void)setIsAutoPlay:(BOOL)arg0 {
+    DYYYDebugLog(@"[AwemePlayVideoVC] setIsAutoPlay:%d shouldHandle:%d", arg0, DYYYShouldHandleSpeedFeatures());
     %orig(arg0);
     DYYYApplyPreparedPlaybackSpeedToPlayer(self);
 }
 
 - (void)prepareForDisplay {
+    DYYYDebugLog(@"[AwemePlayVideoVC] prepareForDisplay shouldHandle:%d", DYYYShouldHandleSpeedFeatures());
     %orig;
     if (!DYYYShouldHandleSpeedFeatures()) {
         return;
@@ -11872,6 +11891,7 @@ static Class tabBarButtonClass = nil;
 }
 
 - (void)viewDidAppear:(BOOL)animated {
+    DYYYDebugLog(@"[AwemePlayVideoVC] viewDidAppear shouldHandle:%d", DYYYShouldHandleSpeedFeatures());
     %orig;
     if (!DYYYShouldHandleSpeedFeatures()) {
         return;
@@ -11889,15 +11909,19 @@ static Class tabBarButtonClass = nil;
 %hook AWEDPlayerFeedPlayerViewController
 
 - (void)setVideoControllerPlaybackRate:(double)rate {
+    DYYYDebugLog(@"[DPlayerFeedPlayerVC] setRate:%.2f internal:%d shouldHandle:%d fastActive:%d lockedActive:%d",
+                 rate, dyyyInternalSpeedChange, DYYYShouldHandleSpeedFeatures(), dyyyLongPressFastSpeedActive, dyyyLongPressLockedSpeedActive);
     if (!dyyyInternalSpeedChange && DYYYShouldHandleSpeedFeatures()
         && !dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive
         && rate == 1.0) {
         double desiredSpeed = DYYYPreparedPlaybackSpeedForPlayer(self);
         if (desiredSpeed != 1.0) {
+            DYYYDebugLog(@"[DPlayerFeedPlayerVC] -> override desiredSpeed:%.2f", desiredSpeed);
             %orig(desiredSpeed);
             return;
         }
     }
+    DYYYDebugLog(@"[DPlayerFeedPlayerVC] -> pass-through %.2f", rate);
     %orig;
 }
 
@@ -11928,11 +11952,13 @@ static Class tabBarButtonClass = nil;
 }
 
 - (void)setIsAutoPlay:(BOOL)arg0 {
+    DYYYDebugLog(@"[DPlayerFeedPlayerVC] setIsAutoPlay:%d shouldHandle:%d", arg0, DYYYShouldHandleSpeedFeatures());
     %orig(arg0);
     DYYYApplyPreparedPlaybackSpeedToPlayer(self);
 }
 
 - (void)prepareForDisplay {
+    DYYYDebugLog(@"[DPlayerFeedPlayerVC] prepareForDisplay shouldHandle:%d", DYYYShouldHandleSpeedFeatures());
     %orig;
     if (!DYYYShouldHandleSpeedFeatures()) {
         return;
@@ -11955,6 +11981,7 @@ static Class tabBarButtonClass = nil;
 }
 
 - (void)viewDidAppear:(BOOL)animated {
+    DYYYDebugLog(@"[DPlayerFeedPlayerVC] viewDidAppear shouldHandle:%d", DYYYShouldHandleSpeedFeatures());
     %orig;
     if (!DYYYShouldHandleSpeedFeatures()) {
         return;
@@ -11972,15 +11999,19 @@ static Class tabBarButtonClass = nil;
 %hook AWEDPlayerViewController_Merge
 
 - (void)setVideoControllerPlaybackRate:(double)rate {
+    DYYYDebugLog(@"[DPlayerVC_Merge] setRate:%.2f internal:%d shouldHandle:%d fastActive:%d lockedActive:%d",
+                 rate, dyyyInternalSpeedChange, DYYYShouldHandleSpeedFeatures(), dyyyLongPressFastSpeedActive, dyyyLongPressLockedSpeedActive);
     if (!dyyyInternalSpeedChange && DYYYShouldHandleSpeedFeatures()
         && !dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive
         && rate == 1.0) {
         double desiredSpeed = DYYYPreparedPlaybackSpeedForPlayer(self);
         if (desiredSpeed != 1.0) {
+            DYYYDebugLog(@"[DPlayerVC_Merge] -> override desiredSpeed:%.2f", desiredSpeed);
             %orig(desiredSpeed);
             return;
         }
     }
+    DYYYDebugLog(@"[DPlayerVC_Merge] -> pass-through %.2f", rate);
     %orig;
 }
 
@@ -12011,11 +12042,13 @@ static Class tabBarButtonClass = nil;
 }
 
 - (void)setIsAutoPlay:(BOOL)arg0 {
+    DYYYDebugLog(@"[DPlayerVC_Merge] setIsAutoPlay:%d shouldHandle:%d", arg0, DYYYShouldHandleSpeedFeatures());
     %orig(arg0);
     DYYYApplyPreparedPlaybackSpeedToPlayer(self);
 }
 
 - (void)prepareForDisplay {
+    DYYYDebugLog(@"[DPlayerVC_Merge] prepareForDisplay shouldHandle:%d", DYYYShouldHandleSpeedFeatures());
     %orig;
     if (!DYYYShouldHandleSpeedFeatures()) {
         return;
@@ -12038,6 +12071,7 @@ static Class tabBarButtonClass = nil;
 }
 
 - (void)viewDidAppear:(BOOL)animated {
+    DYYYDebugLog(@"[DPlayerVC_Merge] viewDidAppear shouldHandle:%d", DYYYShouldHandleSpeedFeatures());
     %orig;
     if (!DYYYShouldHandleSpeedFeatures()) {
         return;
