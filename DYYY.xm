@@ -4861,7 +4861,9 @@ static BOOL isGestureActive = NO;
     [fileLog appendFormat:@"[DYYY] SpeedController responds to changeSpeed:: %@\n", scHasChangeSpeed ? @"YES" : @"NO"];
 
     [fileLog appendFormat:@"[DYYY] dyyyLongPressFastSpeedActive=%d dyyyLongPressLockedSpeedActive=%d\n", dyyyLongPressFastSpeedActive, dyyyLongPressLockedSpeedActive];
-    [fileLog writeToFile:@"/var/mobile/Documents/DYYY_debug.log" atomically:NO encoding:NSUTF8StringEncoding error:nil];
+    NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *logPath = [docPath stringByAppendingPathComponent:@"DYYY_debug.log"];
+    [fileLog writeToFile:logPath atomically:NO encoding:NSUTF8StringEncoding error:nil];
     NSLog(@"%@", fileLog);
 }
 
