@@ -1892,6 +1892,13 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
     %orig;
 }
 
+- (void)setRate:(float)rate {
+    DYYYDebugLog(@"[AVPlayer] setRate:%.2f timeControl:%ld player:%p callstack:%@",
+                 rate, (long)self.timeControlStatus, (__bridge void *)self,
+                 [NSThread callStackSymbols]);
+    %orig;
+}
+
 %end
 
 %hook AVPlayerItem
@@ -12070,6 +12077,16 @@ static Class tabBarButtonClass = nil;
         }
     });
     updateSpeedButtonUI();
+}
+
+- (void)viewDidLoad {
+    DYYYDebugLog(@"[DPlayerVC_Merge] viewDidLoad");
+    %orig;
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    DYYYDebugLog(@"[DPlayerVC_Merge] viewWillAppear animated:%d", animated);
+    %orig;
 }
 
 - (void)viewDidAppear:(BOOL)animated {
