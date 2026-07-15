@@ -8885,11 +8885,11 @@ static NSHashTable *processedParentViews = nil;
 - (UIColor *)awe_smartBackgroundColor {
     NSString *colorHex = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYVideoBGColor"];
     if (colorHex && colorHex.length > 0) {
-        UIDeviceOrientation deviceOrientation = [[UIDevice currentDevice] orientation];
-        if (UIDeviceOrientationIsLandscape(deviceOrientation)) {
+        CGSize screenSize = [UIScreen mainScreen].bounds.size;
+        if (screenSize.width > screenSize.height) {
             return [UIColor blackColor];
         }
-        CGFloat screenWidth = [UIScreen mainScreen].bounds.size.width;
+        CGFloat screenWidth = screenSize.width;
         UIColor *customColor = [DYYYUtils colorFromSchemeHexString:colorHex targetWidth:screenWidth];
         if (customColor)
             return customColor;
