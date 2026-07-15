@@ -2949,6 +2949,24 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
         gFeedCV = [DYYYUtils findSubviewOfClass:[UICollectionView class] inContainer:self.view];
     }
 }
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    if (!DYYYShouldHandleSpeedFeatures()) {
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:self];
+        while (stack.count > 0) {
+            UIViewController *vc = [stack lastObject];
+            [stack removeLastObject];
+            if ([vc respondsToSelector:@selector(setVideoControllerPlaybackRate:)]) {
+                DYYYApplyPreparedPlaybackSpeedToPlayer(vc);
+            }
+            [stack addObjectsFromArray:vc.childViewControllers];
+        }
+    });
+}
 %end
 
 %hook UICollectionView
@@ -8867,8 +8885,8 @@ static NSHashTable *processedParentViews = nil;
 - (UIColor *)awe_smartBackgroundColor {
     NSString *colorHex = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYVideoBGColor"];
     if (colorHex && colorHex.length > 0) {
-        UIInterfaceOrientation orientation = [[UIApplication sharedApplication] statusBarOrientation];
-        if (UIInterfaceOrientationIsLandscape(orientation)) {
+        UIDeviceOrientation deviceOrientation = [[UIDevice currentDevice] orientation];
+        if (UIDeviceOrientationIsLandscape(deviceOrientation)) {
             return [UIColor blackColor];
         }
         CGFloat screenWidth = [UIScreen mainScreen].bounds.size.width;
@@ -11689,13 +11707,27 @@ static Class tabBarButtonClass = nil;
 
     DYYYApplyPreparedPlaybackSpeedToPlayer(self);
     __weak __typeof__(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong __typeof__(weakSelf) strongSelf = weakSelf;
+        if (strongSelf) {
+            DYYYApplyPreparedPlaybackSpeedToPlayer(strongSelf);
+        }
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         __strong __typeof__(weakSelf) strongSelf = weakSelf;
         if (strongSelf) {
             DYYYApplyPreparedPlaybackSpeedToPlayer(strongSelf);
         }
     });
     updateSpeedButtonUI();
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    if (!DYYYShouldHandleSpeedFeatures()) {
+        return;
+    }
+    DYYYApplyPreparedPlaybackSpeedToPlayer(self);
 }
 
 %new
@@ -11745,13 +11777,27 @@ static Class tabBarButtonClass = nil;
     }
     DYYYApplyPreparedPlaybackSpeedToPlayer(self);
     __weak __typeof__(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong __typeof__(weakSelf) strongSelf = weakSelf;
+        if (strongSelf) {
+            DYYYApplyPreparedPlaybackSpeedToPlayer(strongSelf);
+        }
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         __strong __typeof__(weakSelf) strongSelf = weakSelf;
         if (strongSelf) {
             DYYYApplyPreparedPlaybackSpeedToPlayer(strongSelf);
         }
     });
     updateSpeedButtonUI();
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    if (!DYYYShouldHandleSpeedFeatures()) {
+        return;
+    }
+    DYYYApplyPreparedPlaybackSpeedToPlayer(self);
 }
 
 %new
@@ -11801,13 +11847,27 @@ static Class tabBarButtonClass = nil;
     }
     DYYYApplyPreparedPlaybackSpeedToPlayer(self);
     __weak __typeof__(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong __typeof__(weakSelf) strongSelf = weakSelf;
+        if (strongSelf) {
+            DYYYApplyPreparedPlaybackSpeedToPlayer(strongSelf);
+        }
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         __strong __typeof__(weakSelf) strongSelf = weakSelf;
         if (strongSelf) {
             DYYYApplyPreparedPlaybackSpeedToPlayer(strongSelf);
         }
     });
     updateSpeedButtonUI();
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    if (!DYYYShouldHandleSpeedFeatures()) {
+        return;
+    }
+    DYYYApplyPreparedPlaybackSpeedToPlayer(self);
 }
 
 %new
