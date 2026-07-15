@@ -4812,6 +4812,45 @@ static BOOL isGestureActive = NO;
 }
 %end
 
+%hook AWEPlayInteractionDPlayerSpeedController
+
+- (void)changeSpeed:(double)speed {
+    float longPressSpeed = DYYYGetFloat(@"DYYYLongPressSpeed");
+
+    if (isGestureActive && currentLongPressSpeed > 0) {
+        %orig(currentLongPressSpeed);
+        return;
+    }
+
+    if (speed == 2.0 && longPressSpeed != 0 && longPressSpeed != 2.0) {
+        %orig(longPressSpeed);
+        return;
+    }
+
+    if (speed <= 1.0 && dyyyLongPressLockedSpeedActive) {
+        DYYYEndLockedLongPressSpeedAndRestoreIfNeeded();
+    }
+
+    %orig(speed);
+}
+
+%end
+
+%ctor {
+    Class dpClass = NSClassFromString(@"AWEPlayInteractionDPlayerSpeedController");
+    if (dpClass) {
+        unsigned int methodCount = 0;
+        Method *methods = class_copyMethodList(dpClass, &methodCount);
+        NSMutableString *log = [NSMutableString stringWithFormat:@"[DYYY] DPlayerSpeedController methods (%u):", methodCount];
+        for (unsigned int i = 0; i < methodCount; i++) {
+            SEL sel = method_getName(methods[i]);
+            [log appendFormat:@" %s", sel_getName(sel)];
+        }
+        NSLog(@"%@", log);
+        free(methods);
+    }
+}
+
 %hook UILabel
 
 - (void)setText:(NSString *)text {
