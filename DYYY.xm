@@ -4812,59 +4812,136 @@ static BOOL isGestureActive = NO;
 }
 %end
 
+static NSString *DYYYDebugLogPath(void) {
+    static NSString *path = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        path = [docPath stringByAppendingPathComponent:@"DYYY_debug.log"];
+    });
+    return path;
+}
+
+static void DYYYDebugLog(NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
+    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+
+    NSString *logPath = DYYYDebugLogPath();
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // Truncate to ~256KB if exceeds 512KB
+    if ([fm fileExistsAtPath:logPath]) {
+        unsigned long long fileSize = [[fm attributesOfItemAtPath:logPath error:nil] fileSize];
+        if (fileSize > 512 * 1024) {
+            NSData *existing = [NSData dataWithContentsOfFile:logPath];
+            NSUInteger keepStart = fileSize - 256 * 1024;
+            // Find next newline boundary
+            NSRange range = [existing rangeOfData:[NSData dataWithBytes:"\n" length:1] options:0 range:NSMakeRange(keepStart, existing.length - keepStart)];
+            if (range.location != NSNotFound) {
+                existing = [existing subdataWithRange:NSMakeRange(range.location + 1, existing.length - range.location - 1)];
+            }
+            [existing writeToFile:logPath atomically:NO];
+        }
+    }
+
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+    if (!fh) {
+        [data writeToFile:logPath atomically:NO];
+    } else {
+        [fh seekToEndOfFile];
+        [fh writeData:data];
+        [fh closeFile];
+    }
+}
+
 %hook AWEPlayInteractionDPlayerSpeedController
 
-- (void)changeSpeed:(double)speed {
+- (void)longPressSpeedControlDidChangeSpeed:(double)speed {
     float longPressSpeed = DYYYGetFloat(@"DYYYLongPressSpeed");
 
+    DYYYDebugLog(@"[DPlayerSpeed] longPressSpeedControlDidChangeSpeed:%.2f longPressSpeed:%.2f gestureActive:%d gestureSpeed:%.2f lockedActive:%d fastActive:%d",
+                 speed, longPressSpeed, isGestureActive, currentLongPressSpeed, dyyyLongPressLockedSpeedActive, dyyyLongPressFastSpeedActive);
+
     if (isGestureActive && currentLongPressSpeed > 0) {
+        DYYYDebugLog(@"[DPlayerSpeed] -> override with gesture speed: %.2f", currentLongPressSpeed);
         %orig(currentLongPressSpeed);
         return;
     }
 
     if (speed == 2.0 && longPressSpeed != 0 && longPressSpeed != 2.0) {
+        DYYYDebugLog(@"[DPlayerSpeed] -> override with longPressSpeed: %.2f", longPressSpeed);
         %orig(longPressSpeed);
         return;
     }
 
     if (speed <= 1.0 && dyyyLongPressLockedSpeedActive) {
+        DYYYDebugLog(@"[DPlayerSpeed] -> speed <= 1.0 with locked active, ending lock");
         DYYYEndLockedLongPressSpeedAndRestoreIfNeeded();
     }
 
     %orig(speed);
 }
 
+- (void)handleLandScapeSpeedChangeNotification:(NSNotification *)notification {
+    DYYYDebugLog(@"[DPlayerSpeed] handleLandScapeSpeedChangeNotification: %@", notification);
+    %orig(notification);
+}
+
+- (void)handleLongPressFastSpeed:(UILongPressGestureRecognizer *)gesture {
+    DYYYDebugLog(@"[DPlayerSpeed] handleLongPressFastSpeed state:%ld", (long)gesture.state);
+
+    BOOL isBeginning = gesture.state == UIGestureRecognizerStateBegan;
+    BOOL isEnding = gesture.state == UIGestureRecognizerStateEnded ||
+                    gesture.state == UIGestureRecognizerStateCancelled ||
+                    gesture.state == UIGestureRecognizerStateFailed;
+
+    if (isBeginning) {
+        dyyyLongPressFastSpeedActive = YES;
+        dyyyLongPressLockedSpeedActive = NO;
+    } else if (isEnding) {
+        isGestureActive = NO;
+        currentLongPressSpeed = 0;
+        dyyyLongPressFastSpeedActive = NO;
+    }
+
+    %orig(gesture);
+
+    if (isEnding) {
+        DYYYScheduleConfiguredPlaybackSpeedRestore();
+    }
+}
+
 %end
 
 %ctor {
     Class dpClass = NSClassFromString(@"AWEPlayInteractionDPlayerSpeedController");
-    NSMutableString *fileLog = [NSMutableString string];
-    [fileLog appendFormat:@"[DYYY] DPlayerSpeedController class exists: %@\n", dpClass ? @"YES" : @"NO"];
     if (dpClass) {
         unsigned int methodCount = 0;
         Method *methods = class_copyMethodList(dpClass, &methodCount);
-        [fileLog appendFormat:@"[DYYY] DPlayerSpeedController methods (%u):", methodCount];
+        DYYYDebugLog(@"[DYYY] DPlayerSpeedController methods (%u):", methodCount);
+        NSMutableString *list = [NSMutableString string];
         for (unsigned int i = 0; i < methodCount; i++) {
             SEL sel = method_getName(methods[i]);
-            [fileLog appendFormat:@" %s", sel_getName(sel)];
+            [list appendFormat:@" %s", sel_getName(sel)];
         }
-        [fileLog appendString:@"\n"];
+        DYYYDebugLog(@"[DYYY] DPlayerSpeedController methods:%@", list);
         free(methods);
     }
-    // Also check if changeSpeed: exists
+
     BOOL hasChangeSpeed = [dpClass instancesRespondToSelector:@selector(changeSpeed:)];
-    [fileLog appendFormat:@"[DYYY] DPlayerSpeedController responds to changeSpeed:: %@\n", hasChangeSpeed ? @"YES" : @"NO"];
-
-    // Check AWEPlayInteractionSpeedController too
-    Class scClass = NSClassFromString(@"AWEPlayInteractionSpeedController");
-    BOOL scHasChangeSpeed = [scClass instancesRespondToSelector:@selector(changeSpeed:)];
-    [fileLog appendFormat:@"[DYYY] SpeedController responds to changeSpeed:: %@\n", scHasChangeSpeed ? @"YES" : @"NO"];
-
-    [fileLog appendFormat:@"[DYYY] dyyyLongPressFastSpeedActive=%d dyyyLongPressLockedSpeedActive=%d\n", dyyyLongPressFastSpeedActive, dyyyLongPressLockedSpeedActive];
-    NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *logPath = [docPath stringByAppendingPathComponent:@"DYYY_debug.log"];
-    [fileLog writeToFile:logPath atomically:NO encoding:NSUTF8StringEncoding error:nil];
-    NSLog(@"%@", fileLog);
+    BOOL hasLongPressSpeed = [dpClass instancesRespondToSelector:@selector(longPressSpeedControlDidChangeSpeed:)];
+    BOOL hasLandscapeNotif = [dpClass instancesRespondToSelector:@selector(handleLandScapeSpeedChangeNotification:)];
+    BOOL hasFastSpeed = [dpClass instancesRespondToSelector:@selector(handleLongPressFastSpeed:)];
+    DYYYDebugLog(@"[DYYY] DPlayerSpeed hooks: changeSpeed:%@ longPressSpeed:%@ landscapeNotif:%@ fastSpeed:%@",
+                 hasChangeSpeed ? @"YES" : @"NO",
+                 hasLongPressSpeed ? @"YES" : @"NO",
+                 hasLandscapeNotif ? @"YES" : @"NO",
+                 hasFastSpeed ? @"YES" : @"NO");
 }
 
 %hook UILabel
