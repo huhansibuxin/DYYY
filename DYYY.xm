@@ -226,6 +226,7 @@ static __weak AWEAwemeModel *dyyyCurrentSpeedAweme = nil;
 static NSString *dyyyLastAutoRestoredSpeedAwemeIdentifier = nil;
 static BOOL dyyyLongPressFastSpeedActive = NO;
 static BOOL dyyyLongPressLockedSpeedActive = NO;
+static BOOL dyyyInternalSpeedChange = NO;
 
 static void DYYYClearLongPressSpeedState(void) {
     dyyyLongPressFastSpeedActive = NO;
@@ -456,9 +457,12 @@ static BOOL DYYYSetPlaybackRateOnTarget(id target, double speed) {
     }
 
     @try {
+        dyyyInternalSpeedChange = YES;
         [(AWEAwemePlayVideoViewController *)target setVideoControllerPlaybackRate:speed];
+        dyyyInternalSpeedChange = NO;
         return YES;
     } @catch (NSException *exception) {
+        dyyyInternalSpeedChange = NO;
         return NO;
     }
 }
@@ -11694,6 +11698,19 @@ static Class tabBarButtonClass = nil;
 
 %hook AWEAwemePlayVideoViewController
 
+- (void)setVideoControllerPlaybackRate:(double)rate {
+    if (!dyyyInternalSpeedChange && DYYYShouldHandleSpeedFeatures()
+        && !dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive
+        && rate == 1.0) {
+        double desiredSpeed = DYYYPreparedPlaybackSpeedForPlayer(self);
+        if (desiredSpeed != 1.0) {
+            %orig(desiredSpeed);
+            return;
+        }
+    }
+    %orig;
+}
+
 - (void)setIsAutoPlay:(BOOL)arg0 {
     %orig(arg0);
     DYYYApplyPreparedPlaybackSpeedToPlayer(self);
@@ -11738,6 +11755,19 @@ static Class tabBarButtonClass = nil;
 %end
 
 %hook AWEDPlayerFeedPlayerViewController
+
+- (void)setVideoControllerPlaybackRate:(double)rate {
+    if (!dyyyInternalSpeedChange && DYYYShouldHandleSpeedFeatures()
+        && !dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive
+        && rate == 1.0) {
+        double desiredSpeed = DYYYPreparedPlaybackSpeedForPlayer(self);
+        if (desiredSpeed != 1.0) {
+            %orig(desiredSpeed);
+            return;
+        }
+    }
+    %orig;
+}
 
 - (BOOL)enableHDR {
     if (DYYYShouldDisableAllHDR()) {
@@ -11808,6 +11838,19 @@ static Class tabBarButtonClass = nil;
 %end
 
 %hook AWEDPlayerViewController_Merge
+
+- (void)setVideoControllerPlaybackRate:(double)rate {
+    if (!dyyyInternalSpeedChange && DYYYShouldHandleSpeedFeatures()
+        && !dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive
+        && rate == 1.0) {
+        double desiredSpeed = DYYYPreparedPlaybackSpeedForPlayer(self);
+        if (desiredSpeed != 1.0) {
+            %orig(desiredSpeed);
+            return;
+        }
+    }
+    %orig;
+}
 
 - (BOOL)enableHDR {
     if (DYYYShouldDisableAllHDR()) {
