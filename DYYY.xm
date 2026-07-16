@@ -2937,6 +2937,79 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
 
 %end
 
+// ── 横屏倍速：查找横屏播放器实例 ──
+static id DYYYFindLandscapePlayerViewController(void) {
+    UIWindow *window = [DYYYUtils getActiveWindow];
+    if (!window) return nil;
+
+    UIViewController *root = window.rootViewController;
+    while (root.presentedViewController) {
+        root = root.presentedViewController;
+    }
+
+    NSArray *landscapeClasses = @[
+        @"AWEDPlayerFeedPlayerViewController",
+        @"AWEDPlayerViewController_Merge",
+        @"AWEAwemePlayVideoViewController"
+    ];
+
+    for (UIViewController *vc in findViewControllersInHierarchy(root)) {
+        for (NSString *className in landscapeClasses) {
+            Class cls = NSClassFromString(className);
+            if (cls && [vc isKindOfClass:cls]) {
+                return vc;
+            }
+        }
+    }
+    return nil;
+}
+
+// ── 横屏倍速：通过 updatePlayerRate: 设置倍速 ──
+static BOOL DYYYSetLandscapePlaybackRate(id playerVC, double speed) {
+    if (!playerVC || !isfinite(speed) || speed <= 0.0) return NO;
+
+    // 优先：updatePlayerRate: (横屏播放器协议方法)
+    if ([playerVC respondsToSelector:@selector(updatePlayerRate:)]) {
+        @try {
+            ((void (*)(id, SEL, double))objc_msgSend)(playerVC, @selector(updatePlayerRate:), speed);
+            return YES;
+        } @catch (NSException *e) {}
+    }
+
+    // 其次：setVideoControllerPlaybackRate:
+    if ([playerVC respondsToSelector:@selector(setVideoControllerPlaybackRate:)]) {
+        @try {
+            ((void (*)(id, SEL, double))objc_msgSend)(playerVC, @selector(setVideoControllerPlaybackRate:), speed);
+            return YES;
+        } @catch (NSException *e) {}
+    }
+
+    // 最后：通过 playVideoViewController 链
+    if ([playerVC respondsToSelector:@selector(playVideoViewController)]) {
+        id innerVC = [playerVC performSelector:@selector(playVideoViewController)];
+        if (innerVC && [innerVC respondsToSelector:@selector(updatePlayerRate:)]) {
+            @try {
+                ((void (*)(id, SEL, double))objc_msgSend)(innerVC, @selector(updatePlayerRate:), speed);
+                return YES;
+            } @catch (NSException *e) {}
+        }
+    }
+
+    return NO;
+}
+
+// ── 横屏倍速：应用当前配置的倍速到横屏播放器 ──
+static void DYYYApplyLandscapePlaybackSpeed(void) {
+    if (!DYYYShouldHandleSpeedFeatures()) return;
+    if (dyyyLongPressFastSpeedActive || dyyyLongPressLockedSpeedActive) return;
+
+    id landscapePlayer = DYYYFindLandscapePlayerViewController();
+    if (!landscapePlayer) return;
+
+    double speed = DYYYConfiguredPlaybackSpeed();
+    DYYYSetLandscapePlaybackRate(landscapePlayer, speed);
+}
+
 %hook AWELandscapeFeedViewController
 - (void)viewDidLoad {
     %orig;
@@ -2947,6 +3020,30 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
     // 保险起见再fallback,遍历 subviews
     if (!gFeedCV) {
         gFeedCV = [DYYYUtils findSubviewOfClass:[UICollectionView class] inContainer:self.view];
+    }
+
+    // 横屏打开后延迟应用倍速（等待播放器初始化）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DYYYApplyLandscapePlaybackSpeed();
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DYYYApplyLandscapePlaybackSpeed();
+    });
+}
+%end
+
+// ── 横屏播放器倍速变化回调：强制覆盖为用户配置倍速 ──
+%hook AWEDPlayerViewController_Merge
+- (void)didChangePlaybackRate:(double)rate {
+    %orig;
+    if (!DYYYShouldHandleSpeedFeatures()) return;
+    if (dyyyyLongPressFastSpeedActive || dyyyLongPressLockedSpeedActive) return;
+
+    double configured = DYYYConfiguredPlaybackSpeed();
+    if (fabs(rate - configured) > 0.001) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            DYYYSetLandscapePlaybackRate(self, configured);
+        });
     }
 }
 %end
