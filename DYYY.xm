@@ -594,7 +594,30 @@ static double DYYYPreparedPlaybackSpeedForPlayer(id playerViewController) {
     return DYYYConfiguredPlaybackSpeed();
 }
 
+static BOOL DYYYIsLandscape(void) {
+    CGSize sz = [UIScreen mainScreen].bounds.size;
+    return sz.width > sz.height;
+}
+
 static void DYYYForceSetPlaybackRateOnPlayer(id vc, double speed) {
+    // Try playerController (IESVideoPlayerProtocol) — header analysis confirms it exists
+    @try {
+        id pc = [vc valueForKey:@"playerController"];
+        if (pc && [pc respondsToSelector:@selector(setPlaybackRate:)]) {
+            DYYYDebugLog(@"[ForceRate] playerController setPlaybackRate:%.2f", speed);
+            [pc setPlaybackRate:speed];
+            return;
+        }
+    } @catch (NSException *e) {}
+    @try {
+        id pc = [vc valueForKeyPath:@"playerViewController.playerController"];
+        if (pc && [pc respondsToSelector:@selector(setPlaybackRate:)]) {
+            DYYYDebugLog(@"[ForceRate] playerVC.playerController setPlaybackRate:%.2f", speed);
+            [pc setPlaybackRate:speed];
+            return;
+        }
+    } @catch (NSException *e) {}
+
     @try {
         id player = [vc valueForKey:@"player"];
         if (player && [player respondsToSelector:@selector(setRate:)]) {
@@ -11993,6 +12016,9 @@ static Class tabBarButtonClass = nil;
     }
     DYYYDebugLog(@"[AwemePlayVideoVC] -> pass-through %.2f", rate);
     %orig;
+    if (rate != 1.0 && DYYYShouldHandleSpeedFeatures()) {
+        DYYYForceSetPlaybackRateOnPlayer(self, rate);
+    }
 }
 
 - (void)setIsAutoPlay:(BOOL)arg0 {
@@ -12059,6 +12085,9 @@ static Class tabBarButtonClass = nil;
     }
     DYYYDebugLog(@"[DPlayerFeedPlayerVC] -> pass-through %.2f", rate);
     %orig;
+    if (rate != 1.0 && DYYYShouldHandleSpeedFeatures()) {
+        DYYYForceSetPlaybackRateOnPlayer(self, rate);
+    }
 }
 
 - (BOOL)enableHDR {
@@ -12151,7 +12180,7 @@ static Class tabBarButtonClass = nil;
             return;
         }
     }
-    DYYYDebugLog(@"[DPlayerVC_Merge] -> pass-through %.2f", rate);
+    DYYYDebugLog(@"[DPlayerVC_Merge] -> pass-through %.2f landscape:%d", rate, DYYYIsLandscape());
     %orig;
     if (rate != 1.0 && DYYYShouldHandleSpeedFeatures()) {
         DYYYForceSetPlaybackRateOnPlayer(self, rate);
@@ -12267,6 +12296,9 @@ static Class tabBarButtonClass = nil;
     }
     DYYYDebugLog(@"[BasicModePlayInteractionVC] -> pass-through %.2f", rate);
     %orig;
+    if (rate != 1.0 && DYYYShouldHandleSpeedFeatures()) {
+        DYYYForceSetPlaybackRateOnPlayer(self, rate);
+    }
 }
 
 - (void)viewDidAppear:(BOOL)animated {
