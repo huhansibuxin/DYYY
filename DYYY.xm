@@ -599,21 +599,25 @@ static BOOL DYYYIsLandscape(void) {
     return sz.width > sz.height;
 }
 
+static void DYYYForcePlaybackRateIvar(id vc, double speed);
+
 static void DYYYForceSetPlaybackRateOnPlayer(id vc, double speed) {
-    // Try playerController (IESVideoPlayerProtocol) — header analysis confirms it exists
+    SEL setPlaybackRateSel = @selector(setPlaybackRate:);
+    void (*setPR)(id, SEL, double) = (void (*)(id, SEL, double))objc_msgSend;
+
     @try {
         id pc = [vc valueForKey:@"playerController"];
-        if (pc && [pc respondsToSelector:@selector(setPlaybackRate:)]) {
+        if (pc && [pc respondsToSelector:setPlaybackRateSel]) {
             DYYYDebugLog(@"[ForceRate] playerController setPlaybackRate:%.2f", speed);
-            [pc setPlaybackRate:speed];
+            setPR(pc, setPlaybackRateSel, speed);
             return;
         }
     } @catch (NSException *e) {}
     @try {
         id pc = [vc valueForKeyPath:@"playerViewController.playerController"];
-        if (pc && [pc respondsToSelector:@selector(setPlaybackRate:)]) {
+        if (pc && [pc respondsToSelector:setPlaybackRateSel]) {
             DYYYDebugLog(@"[ForceRate] playerVC.playerController setPlaybackRate:%.2f", speed);
-            [pc setPlaybackRate:speed];
+            setPR(pc, setPlaybackRateSel, speed);
             return;
         }
     } @catch (NSException *e) {}
