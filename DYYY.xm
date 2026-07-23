@@ -1839,6 +1839,18 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
     %orig;
 }
 
+// === 倍速探针 #1: 最底层 setRate:time:atHostTime: ===
+- (void)setRate:(float)rate time:(CMTime)itemTime atHostTime:(CMTime)hostClockTime {
+    NSLog(@"[DYYY] AVPlayer setRate:time:atHostTime: rate=%.2f", rate);
+    %orig;
+}
+
+// === 倍速探针 #2: rate setter ===
+- (void)setRate:(float)rate {
+    NSLog(@"[DYYY] AVPlayer setRate: rate=%.2f", rate);
+    %orig;
+}
+
 %end
 
 %hook AVPlayerItem
@@ -2140,12 +2152,22 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
     %orig(lutFilter, DYYYShouldDisableAllHDR() ? nil : HDRLutImage);
 }
 
+- (void)setRate:(float)rate {
+    NSLog(@"[DYYY] ALMOwnPlayerWrapper setRate: rate=%.2f", rate);
+    %orig;
+}
+
 %end
 
 %hook ALMSysPlayerWrapper
 
 - (void)setLutFilter:(id)lutFilter HDRLutImage:(id)HDRLutImage {
     %orig(lutFilter, DYYYShouldDisableAllHDR() ? nil : HDRLutImage);
+}
+
+- (void)setRate:(float)rate {
+    NSLog(@"[DYYY] ALMSysPlayerWrapper setRate: rate=%.2f", rate);
+    %orig;
 }
 
 %end
@@ -2181,6 +2203,18 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
 
 - (void)setupHDREnable:(BOOL)enable {
     %orig(DYYYShouldDisableAllHDR() ? NO : enable);
+}
+
+// === 倍速探针 #3: wrapper 层 setRate: ===
+- (void)setRate:(float)rate {
+    NSLog(@"[DYYY] IESIMVideoPlayerWrapper setRate: rate=%.2f", rate);
+    %orig;
+}
+
+// === 倍速探针 #3b: wrapper 层 setPlaybackRate: ===
+- (void)setPlaybackRate:(float)playbackRate {
+    NSLog(@"[DYYY] IESIMVideoPlayerWrapper setPlaybackRate: rate=%.2f", playbackRate);
+    %orig;
 }
 
 %end
