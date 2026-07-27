@@ -8,6 +8,7 @@
 #import "DYYYToast.h"
 #import "DYYYUtils.h"
 #import <objc/message.h>
+// VexCove移植版: DYYYRemoveEntry完善/NSTimer兜底/横屏纯黑/全屏观看/排序优化
 
 static UIViewController *findLandscapeViewController(UIViewController *root) {
     if (!root) return nil;
