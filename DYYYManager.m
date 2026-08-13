@@ -2082,7 +2082,9 @@
                     progress:(void (^)(NSInteger current, NSInteger total, NSString *status))progressBlock
                   completion:(void (^)(BOOL success, NSString *message))completion {
 
+
     if ((imageURLs.count == 0 && livePhotos.count == 0) || (imageURLs == nil && livePhotos == nil)) {
+
         if (completion) {
             completion(NO, @"没有提供媒体资源");
         }
@@ -2095,6 +2097,7 @@
       [progressView show];
 
       progressView.cancelBlock = ^{
+
         [self cancelAllDownloads];
         if (completion) {
             completion(NO, @"用户取消了操作");
@@ -2105,17 +2108,20 @@
       NSString *mediaPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"VideoComposition"];
       NSFileManager *fileManager = [NSFileManager defaultManager];
       if ([fileManager fileExistsAtPath:mediaPath]) {
+
           [fileManager removeItemAtPath:mediaPath error:nil];
       }
 
       NSError *dirError = nil;
       [fileManager createDirectoryAtPath:mediaPath withIntermediateDirectories:YES attributes:nil error:&dirError];
       if (dirError) {
+
           if (completion) {
               completion(NO, @"创建临时文件夹失败");
           }
           return;
       }
+
 
       // 计算总共需要下载的文件数和合成步骤
       NSInteger totalImages = imageURLs.count;
@@ -2135,6 +2141,7 @@
         float progress = (float)completedSteps / totalSteps;
         dispatch_async(dispatch_get_main_queue(), ^{
           [progressView setProgress:progress];
+
           if (progressBlock) {
               progressBlock(completedSteps, totalSteps, status);
           }
@@ -2150,6 +2157,7 @@
           NSURL *imageURL = [NSURL URLWithString:imageURLString];
 
           if (!imageURL) {
+
               completedSteps++;
               updateProgress(@"图片URL无效");
               continue;
@@ -2161,6 +2169,7 @@
           NSString *uniqueID = [NSUUID UUID].UUIDString;
           NSString *imagePath = [mediaPath stringByAppendingPathComponent:[NSString stringWithFormat:@"image_%@.jpg", uniqueID]];
 
+
           // 配置下载会话
           NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration defaultSessionConfiguration];
           NSURLSession *session = [NSURLSession sessionWithConfiguration:configuration];
@@ -2168,12 +2177,16 @@
           NSURLSessionDataTask *imageTask = [session dataTaskWithURL:imageURL
                                                    completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
                                                      if (error) {
+
                                                      } else if (!data) {
+
                                                      } else {
                                                          NSInteger dataSize = data.length;
                                                          if ([data writeToFile:imagePath atomically:YES]) {
+
                                                              [imageFilePaths addObject:imagePath];
                                                          } else {
+
                                                          }
                                                      }
 
@@ -2189,7 +2202,9 @@
       dispatch_group_t livePhotoDownloadGroup = dispatch_group_create();
 
       dispatch_group_notify(imageDownloadGroup, dispatch_get_main_queue(), ^{
+
         updateProgress(@"正在下载实况照片...");
+
 
         for (NSInteger i = 0; i < livePhotos.count; i++) {
             NSDictionary *livePhoto = livePhotos[i];
@@ -2199,6 +2214,7 @@
             NSURL *videoURL = [NSURL URLWithString:videoURLString];
 
             if (!imageURL || !videoURL) {
+
                 completedSteps += 2;
                 updateProgress(@"实况照片URL无效");
                 continue;
@@ -2213,13 +2229,18 @@
             NSURLSessionConfiguration *imgConfig = [NSURLSessionConfiguration defaultSessionConfiguration];
             NSURLSession *imgSession = [NSURLSession sessionWithConfiguration:imgConfig];
 
+
             NSURLSessionDataTask *imageTask =
                 [imgSession dataTaskWithURL:imageURL
                           completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
                             if (error) {
+
                             } else if (!data) {
+
                             } else if ([data writeToFile:imagePath atomically:YES]) {
+
                             } else {
+
                             }
 
                             completedSteps++;
@@ -2232,16 +2253,22 @@
             NSURLSessionConfiguration *vidConfig = [NSURLSessionConfiguration defaultSessionConfiguration];
             NSURLSession *vidSession = [NSURLSession sessionWithConfiguration:vidConfig];
 
+
             NSURLSessionDataTask *videoTask =
                 [vidSession dataTaskWithURL:videoURL
                           completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
                             if (error) {
+
                             } else if (!data) {
+
                             } else if ([data writeToFile:videoPath atomically:YES]) {
+
                                 @synchronized(livePhotoFilePaths) {
                                     [livePhotoFilePaths addObject:@{@"image" : imagePath, @"video" : videoPath}];
+
                                 }
                             } else {
+
                             }
 
                             completedSteps++;
@@ -2258,11 +2285,14 @@
 
         dispatch_group_notify(livePhotoDownloadGroup, dispatch_get_main_queue(), ^{
 
+
           if (bgmURL.length > 0) {
+
               updateProgress(@"正在下载背景音乐...");
               NSURL *bgmURL_obj = [NSURL URLWithString:bgmURL];
 
               if (!bgmURL_obj) {
+
                   completedSteps++;
                   updateProgress(@"背景音乐URL无效");
               } else {
@@ -2279,10 +2309,14 @@
                   NSURLSessionDataTask *audioTask = [session dataTaskWithURL:bgmURL_obj
                                                            completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
                                                              if (error) {
+
                                                              } else if (!data) {
+
                                                              } else if ([data writeToFile:audioPath atomically:YES]) {
+
                                                                  bgmFilePath = audioPath;
                                                              } else {
+
                                                              }
 
                                                              completedSteps++;
@@ -2296,10 +2330,13 @@
 
           // 第四阶段：合成视频
           dispatch_group_notify(bgmDownloadGroup, dispatch_get_main_queue(), ^{
+
+
             updateProgress(@"正在合成视频...");
 
             // 如果没有成功下载任何媒体，则退出
             if (imageFilePaths.count == 0 && livePhotoFilePaths.count == 0) {
+
                 progressView.allowSuccessAnimation = NO;
                 [progressView dismiss];
                 if (completion) {
@@ -2310,7 +2347,9 @@
             }
 
 
+
             NSString *outputPath = [mediaPath stringByAppendingPathComponent:[NSString stringWithFormat:@"final_%@.mp4", [NSUUID UUID].UUIDString]];
+
 
             // 使用AVFoundation合成视频
             [self composeVideo:imageFilePaths
@@ -2320,11 +2359,14 @@
                     completion:^(BOOL success) {
                       completedSteps++;
                       if (success) {
+
                       } else {
+
                       }
                       updateProgress(@"视频合成完成");
 
                       if (success) {
+
                           [[PHPhotoLibrary sharedPhotoLibrary]
                               performChanges:^{
                                 [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:[NSURL fileURLWithPath:outputPath]];
@@ -2337,14 +2379,17 @@
                                   [progressView dismiss];
 
                                   if (success) {
+
                                       if (completion) {
                                           completion(YES, @"视频已成功保存到相册");
                                       }
                                   } else {
+
                                       if (completion) {
                                           completion(NO, [NSString stringWithFormat:@"保存视频到相册失败: %@", error.localizedDescription]);
                                       }
                                   }
+
 
                                   [fileManager removeItemAtPath:mediaPath error:nil];
                                 });
@@ -2356,6 +2401,7 @@
                             if (completion) {
                                 completion(NO, @"视频合成失败");
                             }
+
 
                             [fileManager removeItemAtPath:mediaPath error:nil];
                           });
@@ -2376,6 +2422,8 @@
     // 视频尺寸（标准1080p）
     CGSize videoSize = CGSizeMake(1080, 1920);
 
+
+
     dispatch_group_t processingGroup = dispatch_group_create();
 
     // 存储所有媒体片段信息
@@ -2385,13 +2433,16 @@
     for (NSInteger i = 0; i < imageFiles.count; i++) {
         NSString *imagePath = imageFiles[i];
         if (![[NSFileManager defaultManager] fileExistsAtPath:imagePath]) {
+
             continue;
         }
 
         UIImage *image = [UIImage imageWithContentsOfFile:imagePath];
         if (!image) {
+
             continue;
         }
+
 
         // 创建临时视频文件路径
         NSString *tempVideoPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"temp_img_%@.mp4", [NSUUID UUID].UUIDString]];
@@ -2406,8 +2457,10 @@
                           if (success) {
                               @synchronized(mediaSegments) {
                                   [mediaSegments addObject:@{@"type" : @"image", @"path" : tempVideoPath, @"duration" : @5.0}];
+
                               }
                           } else {
+
                           }
                           dispatch_group_leave(processingGroup);
                         }];
@@ -2420,17 +2473,22 @@
         NSString *videoPath = livePhoto[@"video"];
 
 
+
         if (![[NSFileManager defaultManager] fileExistsAtPath:videoPath]) {
+
             continue;
         }
 
         [mediaSegments addObject:@{@"type" : @"video", @"path" : videoPath}];
+
     }
 
     // 等待所有临时视频处理完成
     dispatch_group_notify(processingGroup, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
 
+
       if (mediaSegments.count == 0) {
+
           if (completion) {
               dispatch_async(dispatch_get_main_queue(), ^{
                 completion(NO);
@@ -2440,6 +2498,7 @@
       }
 
       // 创建AVMutableComposition作为容器
+
       AVMutableComposition *composition = [AVMutableComposition composition];
       AVMutableVideoComposition *videoComposition = [AVMutableVideoComposition videoComposition];
       videoComposition.frameDuration = CMTimeMake(1, 30);  // 30fps
@@ -2448,6 +2507,7 @@
       // 创建视频轨道
       AVMutableCompositionTrack *videoTrack = [composition addMutableTrackWithMediaType:AVMediaTypeVideo preferredTrackID:kCMPersistentTrackID_Invalid];
       if (!videoTrack) {
+
           if (completion) {
               dispatch_async(dispatch_get_main_queue(), ^{
                 completion(NO);
@@ -2459,6 +2519,7 @@
       // 创建音频轨道
       AVMutableCompositionTrack *audioTrack = [composition addMutableTrackWithMediaType:AVMediaTypeAudio preferredTrackID:kCMPersistentTrackID_Invalid];
       if (!audioTrack) {
+
           if (completion) {
               dispatch_async(dispatch_get_main_queue(), ^{
                 completion(NO);
@@ -2470,6 +2531,7 @@
       // 添加背景音乐
       __block CMTime currentTime = kCMTimeZero;
       if (bgmPath && [[NSFileManager defaultManager] fileExistsAtPath:bgmPath]) {
+
           AVAsset *audioAsset = [AVAsset assetWithURL:[NSURL fileURLWithPath:bgmPath]];
           AVAssetTrack *audioAssetTrack = [[audioAsset tracksWithMediaType:AVMediaTypeAudio] firstObject];
 
@@ -2488,6 +2550,7 @@
 
               if (CMTimeCompare(audioDuration, totalDuration) < 0) {
 
+
                   while (CMTimeCompare(currentAudioTime, totalDuration) < 0) {
                       // 确定当前片段的时长（如果到达视频末尾则截断）
                       CMTime remainingTime = CMTimeSubtract(totalDuration, currentAudioTime);
@@ -2502,13 +2565,16 @@
                       [audioTrack insertTimeRange:CMTimeRangeMake(kCMTimeZero, segmentDuration) ofTrack:audioAssetTrack atTime:currentAudioTime error:&audioError];
 
                       if (audioError) {
+
                           break;
                       }
+
 
 
                       // 更新当前音频时间点
                       currentAudioTime = CMTimeAdd(currentAudioTime, segmentDuration);
                   }
+
 
               } else {
                   // 音乐长度足够，直接添加
@@ -2516,40 +2582,48 @@
                   [audioTrack insertTimeRange:CMTimeRangeMake(kCMTimeZero, totalDuration) ofTrack:audioAssetTrack atTime:kCMTimeZero error:&audioError];
 
                   if (audioError) {
+
                   } else {
+
                   }
               }
           } else {
+
           }
       }
 
       NSMutableArray *instructions = [NSMutableArray array];
 
       // 处理所有媒体片段（按顺序）
+
       for (NSInteger i = 0; i < mediaSegments.count; i++) {
           NSDictionary *segment = mediaSegments[i];
           NSString *segmentType = segment[@"type"];
           NSString *segmentPath = segment[@"path"];
 
 
+
           AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:segmentPath]];
           NSArray<AVAssetTrack *> *videoTracks = [asset tracksWithMediaType:AVMediaTypeVideo];
 
           if (videoTracks.count == 0) {
+
               continue;
           }
 
           AVAssetTrack *assetVideoTrack = videoTracks.firstObject;
           CMTime assetDuration = asset.duration;
-                       assetVideoTrack.naturalSize.height);
+
 
           // 插入视频片段
           NSError *insertError = nil;
           [videoTrack insertTimeRange:CMTimeRangeMake(kCMTimeZero, assetDuration) ofTrack:assetVideoTrack atTime:currentTime error:&insertError];
 
           if (insertError) {
+
               continue;
           } else {
+
           }
 
           // 创建视频合成指令
@@ -2565,6 +2639,7 @@
           instruction.layerInstructions = @[ layerInstruction ];
           [instructions addObject:instruction];
 
+
           // 更新时间点
           currentTime = CMTimeAdd(currentTime, assetDuration);
       }
@@ -2572,8 +2647,10 @@
       // 设置合成指令
       videoComposition.instructions = instructions;
 
+
       // 检查是否有内容需要导出
       if (instructions.count == 0 || CMTimeGetSeconds(currentTime) < 0.1) {
+
           if (completion) {
               dispatch_async(dispatch_get_main_queue(), ^{
                 completion(NO);
@@ -2583,14 +2660,17 @@
           for (NSDictionary *segment in mediaSegments) {
               if ([segment[@"type"] isEqualToString:@"image"]) {
                   [[NSFileManager defaultManager] removeItemAtPath:segment[@"path"] error:nil];
+
               }
           }
           return;
       }
 
       // 设置导出会话
+
       AVAssetExportSession *exportSession = [[AVAssetExportSession alloc] initWithAsset:composition presetName:AVAssetExportPresetHighestQuality];
       if (!exportSession) {
+
           if (completion) {
               dispatch_async(dispatch_get_main_queue(), ^{
                 completion(NO);
@@ -2605,22 +2685,27 @@
       exportSession.shouldOptimizeForNetworkUse = YES;
 
       // 导出视频
+
       [exportSession exportAsynchronouslyWithCompletionHandler:^{
         for (NSDictionary *segment in mediaSegments) {
             if ([segment[@"type"] isEqualToString:@"image"]) {
                 NSError *removeError = nil;
                 [[NSFileManager defaultManager] removeItemAtPath:segment[@"path"] error:&removeError];
                 if (removeError) {
+
                 } else {
+
                 }
             }
         }
         switch (exportSession.status) {
             case AVAssetExportSessionStatusCompleted: {
 
+
                 NSDictionary *fileAttrs = [[NSFileManager defaultManager] attributesOfItemAtPath:outputPath error:nil];
                 if (fileAttrs) {
                     unsigned long long fileSize = [fileAttrs fileSize];
+
                 }
 
                 if (completion) {
@@ -2632,6 +2717,7 @@
             }
 
             case AVAssetExportSessionStatusFailed: {
+
                 if (completion) {
                     dispatch_async(dispatch_get_main_queue(), ^{
                       completion(NO);
@@ -2641,6 +2727,7 @@
             }
 
             case AVAssetExportSessionStatusCancelled: {
+
                 if (completion) {
                     dispatch_async(dispatch_get_main_queue(), ^{
                       completion(NO);
@@ -2650,6 +2737,7 @@
             }
 
             default: {
+
                 if (completion) {
                     dispatch_async(dispatch_get_main_queue(), ^{
                       completion(NO);

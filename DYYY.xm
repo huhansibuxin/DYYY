@@ -2960,11 +2960,6 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
 // 把配置倍速焊死，覆盖横屏/全屏播放，避免自写 selector 不生效与切视频竞态。
 // 通过方法编码校验确认是正确类，长按时不强行覆盖。
 
-static float DYYYConfiguredDefaultPlaybackSpeed(void) {
-    float speed = [[NSUserDefaults standardUserDefaults] floatForKey:@"DYYYDefaultSpeed"];
-    return isfinite(speed) && speed > 0.0f ? speed : 1.0f;
-}
-
 static float DYYYUnlockedNormalPlaybackSpeed(void) {
     if (isFloatSpeedButtonEnabled) {
         float speed = getCurrentSpeed();
@@ -2972,7 +2967,7 @@ static float DYYYUnlockedNormalPlaybackSpeed(void) {
             return speed;
         }
     }
-    return DYYYConfiguredDefaultPlaybackSpeed();
+    return (float)DYYYDefaultPlaybackSpeed();
 }
 
 static float DYYYNormalPlaybackSpeed(void) {
