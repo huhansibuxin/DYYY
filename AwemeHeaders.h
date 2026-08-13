@@ -1396,16 +1396,6 @@ typedef NS_ENUM(NSUInteger, DYEdgeMode) {
 @property(nonatomic, assign, readwrite) NSUInteger type;
 @end
 
-@interface AWEDPlayerSpeedController : NSObject
-- (void)viewDidLoad;
-- (void)setData:(id)data;
-- (void)viewWillAppear;
-- (void)onPlayerPlay:(id)player ifPlay:(BOOL)isPlaying;
-- (float)playbackRate;
-- (void)setPlaybackRate:(float)playbackRate;
-- (BOOL)isInLongPressSpeed;
-@end
-
 @interface AWEPlayInteractionSpeedController : NSObject
 @property(nonatomic, strong) id progressSliderDelegate;
 - (id)playVideoViewController;
@@ -1419,7 +1409,6 @@ typedef NS_ENUM(NSUInteger, DYEdgeMode) {
 
 @interface AWEPlayInteractionDPlayerSpeedController : NSObject
 - (id)playVideoViewController;
-- (AWEDPlayerSpeedController *)dPlayerSpeed;
 @end
 
 @interface AWEPlayInteractionUserAvatarView : UIView
@@ -1964,4 +1953,14 @@ typedef NS_ENUM(NSUInteger, DYEdgeMode) {
 
 // 顶栏选中指示线
 @interface AWEFeedMultiTabSelectedContainerView : UIView
+@end
+
+@interface AWEDPlayerSpeedController : NSObject
+- (void)viewDidLoad;
+- (void)setData:(id)data;
+- (void)viewWillAppear;
+- (void)onPlayerPlay:(id)player ifPlay:(BOOL)isPlaying;
+- (float)playbackRate;
+- (void)setPlaybackRate:(float)playbackRate;
+- (BOOL)isInLongPressSpeed;
 @end
