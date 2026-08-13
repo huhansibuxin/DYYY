@@ -2,14 +2,6 @@
 #import <QuartzCore/QuartzCore.h>
 #import <UIKit/UIKit.h>
 
-FOUNDATION_EXPORT void DYYYNSLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
-
-#ifndef DYYY_KEEP_SYSTEM_NSLOG
-#ifdef NSLog
-#undef NSLog
-#endif
-#define NSLog(...) DYYYNSLog(__VA_ARGS__)
-#endif
 
 // 获取指定类型设置
 #define DYYYGetBool(key) [[NSUserDefaults standardUserDefaults] boolForKey:key]

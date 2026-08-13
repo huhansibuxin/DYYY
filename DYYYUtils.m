@@ -5,10 +5,7 @@
 #import <UIKit/UIKit.h>
 #import <math.h>
 #import <os/lock.h>
-#import <os/log.h>
 #import <stdatomic.h>
-#import <stdarg.h>
-#import <unistd.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import "AwemeHeaders.h"
@@ -31,81 +28,6 @@
 
 static const void *kLabelColorStateKey = &kLabelColorStateKey;
 static const NSTimeInterval kDYYYUtilsDefaultFrameDelay = 0.1f;
-
-static NSString *DYYYRuntimeLogFilePath(void) {
-    static NSString *logPath = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-      NSString *logsDirectory = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DYYYLogs"];
-      [[NSFileManager defaultManager] createDirectoryAtPath:logsDirectory
-                                withIntermediateDirectories:YES
-                                                 attributes:nil
-                                                      error:nil];
-      logPath = [logsDirectory stringByAppendingPathComponent:@"runtime.log"];
-    });
-    return logPath;
-}
-
-void DYYYNSLog(NSString *format, ...) {
-    if (format.length == 0) {
-        return;
-    }
-
-    va_list args;
-    va_start(args, format);
-    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
-    va_end(args);
-
-    if (message.length == 0) {
-        return;
-    }
-
-    static os_log_t dyyyLogger = nil;
-    static dispatch_once_t loggerOnceToken;
-    dispatch_once(&loggerOnceToken, ^{
-      dyyyLogger = os_log_create("com.dyyy.tweak", "runtime");
-    });
-    os_log_with_type(dyyyLogger, OS_LOG_TYPE_DEFAULT, "%{public}@", message);
-
-    const char *stderrMessage = message.UTF8String;
-    if (stderrMessage) {
-        fprintf(stderr, "%s\n", stderrMessage);
-        fflush(stderr);
-    }
-
-    static dispatch_queue_t logQueue = nil;
-    static dispatch_once_t queueOnceToken;
-    dispatch_once(&queueOnceToken, ^{
-      logQueue = dispatch_queue_create("com.dyyy.runtime-log.queue", DISPATCH_QUEUE_SERIAL);
-    });
-
-    dispatch_async(logQueue, ^{
-      @autoreleasepool {
-          NSString *line = [NSString stringWithFormat:@"[%@][pid:%d] %@\n", [NSDate date], getpid(), message];
-          NSData *lineData = [line dataUsingEncoding:NSUTF8StringEncoding];
-          if (lineData.length == 0) {
-              return;
-          }
-
-          NSString *logPath = DYYYRuntimeLogFilePath();
-          NSFileManager *fileManager = [NSFileManager defaultManager];
-          if (![fileManager fileExistsAtPath:logPath]) {
-              [fileManager createFileAtPath:logPath contents:nil attributes:nil];
-          }
-
-          NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:logPath];
-          if (!fileHandle) {
-              return;
-          }
-          @try {
-              [fileHandle seekToEndOfFile];
-              [fileHandle writeData:lineData];
-          } @catch (NSException *exception) {
-          }
-          [fileHandle closeFile];
-      }
-    });
-}
 
 static inline CGFloat DYYYUtilsNormalizedDelay(CGFloat delay) {
     if (!isfinite(delay) || delay < 0.01f) {
