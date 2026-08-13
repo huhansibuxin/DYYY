@@ -227,6 +227,10 @@ static NSString *dyyyLastAutoRestoredSpeedAwemeIdentifier = nil;
 static BOOL dyyyLongPressFastSpeedActive = NO;
 static BOOL dyyyLongPressLockedSpeedActive = NO;
 
+// VexCove: 抖音原生倍速控制器引用（用于全屏/横屏倍速稳定）
+static __weak AWEDPlayerSpeedController *dyyyActiveDPlayerSpeedController = nil;
+static __weak AWEDPlayerSpeedController *dyyyLongPressDPlayerSpeedController = nil;
+
 static void DYYYClearLongPressSpeedState(void) {
     dyyyLongPressFastSpeedActive = NO;
     dyyyLongPressLockedSpeedActive = NO;
@@ -2937,79 +2941,6 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
 
 %end
 
-// ── 横屏倍速：查找横屏播放器实例 ──
-static id DYYYFindLandscapePlayerViewController(void) {
-    UIWindow *window = [DYYYUtils getActiveWindow];
-    if (!window) return nil;
-
-    UIViewController *root = window.rootViewController;
-    while (root.presentedViewController) {
-        root = root.presentedViewController;
-    }
-
-    NSArray *landscapeClasses = @[
-        @"AWEDPlayerFeedPlayerViewController",
-        @"AWEDPlayerViewController_Merge",
-        @"AWEAwemePlayVideoViewController"
-    ];
-
-    for (UIViewController *vc in findViewControllersInHierarchy(root)) {
-        for (NSString *className in landscapeClasses) {
-            Class cls = NSClassFromString(className);
-            if (cls && [vc isKindOfClass:cls]) {
-                return vc;
-            }
-        }
-    }
-    return nil;
-}
-
-// ── 横屏倍速：通过 updatePlayerRate: 设置倍速 ──
-static BOOL DYYYSetLandscapePlaybackRate(id playerVC, double speed) {
-    if (!playerVC || !isfinite(speed) || speed <= 0.0) return NO;
-
-    // 优先：updatePlayerRate: (横屏播放器协议方法)
-    if ([playerVC respondsToSelector:@selector(updatePlayerRate:)]) {
-        @try {
-            ((void (*)(id, SEL, double))objc_msgSend)(playerVC, @selector(updatePlayerRate:), speed);
-            return YES;
-        } @catch (NSException *e) {}
-    }
-
-    // 其次：setVideoControllerPlaybackRate:
-    if ([playerVC respondsToSelector:@selector(setVideoControllerPlaybackRate:)]) {
-        @try {
-            ((void (*)(id, SEL, double))objc_msgSend)(playerVC, @selector(setVideoControllerPlaybackRate:), speed);
-            return YES;
-        } @catch (NSException *e) {}
-    }
-
-    // 最后：通过 playVideoViewController 链
-    if ([playerVC respondsToSelector:@selector(playVideoViewController)]) {
-        id innerVC = [playerVC performSelector:@selector(playVideoViewController)];
-        if (innerVC && [innerVC respondsToSelector:@selector(updatePlayerRate:)]) {
-            @try {
-                ((void (*)(id, SEL, double))objc_msgSend)(innerVC, @selector(updatePlayerRate:), speed);
-                return YES;
-            } @catch (NSException *e) {}
-        }
-    }
-
-    return NO;
-}
-
-// ── 横屏倍速：应用当前配置的倍速到横屏播放器 ──
-static void DYYYApplyLandscapePlaybackSpeed(void) {
-    if (!DYYYShouldHandleSpeedFeatures()) return;
-    if (dyyyLongPressFastSpeedActive || dyyyLongPressLockedSpeedActive) return;
-
-    id landscapePlayer = DYYYFindLandscapePlayerViewController();
-    if (!landscapePlayer) return;
-
-    double speed = DYYYConfiguredPlaybackSpeed();
-    DYYYSetLandscapePlaybackRate(landscapePlayer, speed);
-}
-
 %hook AWELandscapeFeedViewController
 - (void)viewDidLoad {
     %orig;
@@ -3021,31 +2952,130 @@ static void DYYYApplyLandscapePlaybackSpeed(void) {
     if (!gFeedCV) {
         gFeedCV = [DYYYUtils findSubviewOfClass:[UICollectionView class] inContainer:self.view];
     }
-
-    // 横屏打开后延迟应用倍速（等待播放器初始化）
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        DYYYApplyLandscapePlaybackSpeed();
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        DYYYApplyLandscapePlaybackSpeed();
-    });
 }
 %end
 
-// ── 横屏播放器倍速变化回调：强制覆盖为用户配置倍速 ──
-%hook AWEDPlayerViewController_Merge
-- (void)didChangePlaybackRate:(double)rate {
-    %orig;
-    if (!DYYYShouldHandleSpeedFeatures()) return;
-    if (dyyyyLongPressFastSpeedActive || dyyyLongPressLockedSpeedActive) return;
+// === VexCove speed controller hook (ported from main for fullscreen/landscape speed stability) ===
+// 直接用抖音原生 AWEDPlayerSpeedController 的 setPlaybackRate:，在每次 setData:/onPlayerPlay:/viewDidLoad/viewWillAppear
+// 把配置倍速焊死，覆盖横屏/全屏播放，避免自写 selector 不生效与切视频竞态。
+// 通过方法编码校验确认是正确类，长按时不强行覆盖。
 
-    double configured = DYYYConfiguredPlaybackSpeed();
-    if (fabs(rate - configured) > 0.001) {
+static float DYYYConfiguredDefaultPlaybackSpeed(void) {
+    float speed = [[NSUserDefaults standardUserDefaults] floatForKey:@"DYYYDefaultSpeed"];
+    return isfinite(speed) && speed > 0.0f ? speed : 1.0f;
+}
+
+static float DYYYUnlockedNormalPlaybackSpeed(void) {
+    if (isFloatSpeedButtonEnabled) {
+        float speed = getCurrentSpeed();
+        if (isfinite(speed) && speed > 0.0f && fabsf(speed - 1.0f) > FLT_EPSILON) {
+            return speed;
+        }
+    }
+    return DYYYConfiguredDefaultPlaybackSpeed();
+}
+
+static float DYYYNormalPlaybackSpeed(void) {
+    return DYYYUnlockedNormalPlaybackSpeed();
+}
+
+static BOOL DYYYSpeedMethodMatchesEncoding(id object, SEL selector, const char *expectedEncoding) {
+    if (!object || !selector || !expectedEncoding) {
+        return NO;
+    }
+    Method method = class_getInstanceMethod(object_getClass(object), selector);
+    const char *actualEncoding = method ? method_getTypeEncoding(method) : NULL;
+    return actualEncoding && strcmp(actualEncoding, expectedEncoding) == 0;
+}
+
+static BOOL DYYYIsVerifiedNativeDPlayerSpeedController(id object) {
+    return object &&
+           DYYYSpeedMethodMatchesEncoding(object, @selector(playbackRate), "f16@0:8") &&
+           DYYYSpeedMethodMatchesEncoding(object, @selector(setPlaybackRate:), "v20@0:8f16") &&
+           DYYYSpeedMethodMatchesEncoding(object, @selector(isInLongPressSpeed), "B16@0:8");
+}
+
+static BOOL DYYYNativeDPlayerLongPressIsActive(AWEDPlayerSpeedController *speedController) {
+    if (!DYYYIsVerifiedNativeDPlayerSpeedController(speedController)) {
+        return NO;
+    }
+    @try {
+        return [speedController isInLongPressSpeed];
+    } @catch (__unused NSException *exception) {
+        return NO;
+    }
+}
+
+static BOOL DYYYAnyNativeDPlayerLongPressIsActive(void) {
+    return DYYYNativeDPlayerLongPressIsActive(dyyyLongPressDPlayerSpeedController) ||
+           DYYYNativeDPlayerLongPressIsActive(dyyyActiveDPlayerSpeedController);
+}
+
+static BOOL DYYYApplyPlaybackRateToNativeDPlayer(AWEDPlayerSpeedController *speedController, double speed) {
+    if (!DYYYIsVerifiedNativeDPlayerSpeedController(speedController) ||
+        !isfinite(speed) ||
+        speed <= 0.0 ||
+        DYYYAnyNativeDPlayerLongPressIsActive() ||
+        DYYYNativeDPlayerLongPressIsActive(speedController)) {
+        return NO;
+    }
+    @try {
+        dyyyActiveDPlayerSpeedController = speedController;
+        [speedController setPlaybackRate:(float)speed];
+        return YES;
+    } @catch (NSException *exception) {
+        NSLog(@"[DYYY][Speed397] native setPlaybackRate failed on %@: %@",
+              NSStringFromClass([speedController class]),
+              exception.reason);
+        return NO;
+    }
+}
+
+static void DYYYApplyNormalPlaybackSpeedToNativeDPlayer(AWEDPlayerSpeedController *speedController) {
+    if (!DYYYShouldHandleSpeedFeatures() || !speedController) {
+        return;
+    }
+    void (^applyBlock)(void) = ^{
+        DYYYApplyPlaybackRateToNativeDPlayer(speedController, DYYYNormalPlaybackSpeed());
+    };
+    if ([NSThread isMainThread]) {
+        applyBlock();
+    } else {
+        __weak AWEDPlayerSpeedController *weakSpeedController = speedController;
         dispatch_async(dispatch_get_main_queue(), ^{
-            DYYYSetLandscapePlaybackRate(self, configured);
+            DYYYApplyPlaybackRateToNativeDPlayer(weakSpeedController, DYYYNormalPlaybackSpeed());
         });
     }
 }
+
+%hook AWEDPlayerSpeedController
+
+- (void)viewDidLoad {
+    %orig;
+    dyyyActiveDPlayerSpeedController = self;
+    DYYYApplyNormalPlaybackSpeedToNativeDPlayer(self);
+}
+
+- (void)setData:(id)data {
+    %orig(data);
+    dyyyActiveDPlayerSpeedController = self;
+    DYYYApplyNormalPlaybackSpeedToNativeDPlayer(self);
+}
+
+- (void)viewWillAppear {
+    %orig;
+    dyyyActiveDPlayerSpeedController = self;
+    DYYYApplyNormalPlaybackSpeedToNativeDPlayer(self);
+}
+
+- (void)onPlayerPlay:(id)player ifPlay:(BOOL)isPlaying {
+    %orig(player, isPlaying);
+    if (isPlaying) {
+        dyyyActiveDPlayerSpeedController = self;
+        DYYYApplyNormalPlaybackSpeedToNativeDPlayer(self);
+    }
+}
+
 %end
 
 %hook UICollectionView

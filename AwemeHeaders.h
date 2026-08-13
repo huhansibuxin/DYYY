@@ -1954,3 +1954,13 @@ typedef NS_ENUM(NSUInteger, DYEdgeMode) {
 // 顶栏选中指示线
 @interface AWEFeedMultiTabSelectedContainerView : UIView
 @end
+
+@interface AWEDPlayerSpeedController : NSObject
+- (void)viewDidLoad;
+- (void)setData:(id)data;
+- (void)viewWillAppear;
+- (void)onPlayerPlay:(id)player ifPlay:(BOOL)isPlaying;
+- (float)playbackRate;
+- (void)setPlaybackRate:(float)playbackRate;
+- (BOOL)isInLongPressSpeed;
+@end
