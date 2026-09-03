@@ -573,6 +573,12 @@ static void DYYYReapplySpeedToCurrentPlayer(NSString *context) {
     if (!DYYYShouldHandleSpeedFeatures()) {
         return;
     }
+    // 重入守卫：setVideoControllerPlaybackRate: 若间接触发 viewDidAppear 重入本函数会死循环
+    static BOOL dyyyReapplyingSpeed = NO;
+    if (dyyyReapplyingSpeed) {
+        return;
+    }
+    dyyyReapplyingSpeed = YES;
     UIWindow *win = [DYYYUtils getActiveWindow];
     UIViewController *root = win.rootViewController;
     while (root && root.presentedViewController) {
@@ -588,6 +594,7 @@ static void DYYYReapplySpeedToCurrentPlayer(NSString *context) {
         }
     }
     DYYYSpeedDiag([NSString stringWithFormat:@"[reapply:%@] players=%@ handle=%d", context, found, (int)found.count]);
+    dyyyReapplyingSpeed = NO;
 }
 
 static void DYYYApplyPreparedPlaybackSpeedToPlayer(id playerViewController) {
@@ -3058,19 +3065,27 @@ static BOOL DYYYAnyNativeDPlayerLongPressIsActive(void) {
            DYYYNativeDPlayerLongPressIsActive(dyyyActiveDPlayerSpeedController);
 }
 
+// 重入守卫：37.5 下 setPlaybackRate: 会同步回触发 onPlayerPlay: → 再次 setPlaybackRate:，
+// 没有这层守卫就会在主线程死循环，表现就是「打开直接卡死动不了」。
+static BOOL dyyyApplyingNativeDPlayerSpeed = NO;
+
 static BOOL DYYYApplyPlaybackRateToNativeDPlayer(AWEDPlayerSpeedController *speedController, double speed) {
     if (!DYYYIsVerifiedNativeDPlayerSpeedController(speedController) ||
         !isfinite(speed) ||
         speed <= 0.0 ||
         DYYYAnyNativeDPlayerLongPressIsActive() ||
-        DYYYNativeDPlayerLongPressIsActive(speedController)) {
+        DYYYNativeDPlayerLongPressIsActive(speedController) ||
+        dyyyApplyingNativeDPlayerSpeed) {
         return NO;
     }
     @try {
+        dyyyApplyingNativeDPlayerSpeed = YES;
         dyyyActiveDPlayerSpeedController = speedController;
         [speedController setPlaybackRate:(float)speed];
+        dyyyApplyingNativeDPlayerSpeed = NO;
         return YES;
     } @catch (NSException *exception) {
+        dyyyApplyingNativeDPlayerSpeed = NO;
         NSLog(@"[DYYY][Speed397] native setPlaybackRate failed on %@: %@",
               NSStringFromClass([speedController class]),
               exception.reason);
