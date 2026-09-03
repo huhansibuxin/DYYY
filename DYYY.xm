@@ -547,24 +547,35 @@ static double DYYYPreparedPlaybackSpeedForPlayer(id playerViewController) {
 
 // 最小范围倍速诊断：仅记录 speed-apply / 全屏横屏进入时的播放器类名，写文件供真机读取
 // （frida 不可用、dylib NSLog 不被 oslog 捕获，只能写文件拿证据）
+// 性能：文件打开/写入/关闭全部丢到后台串行队列，主线程只做一次字符串拼接；
+// 串行队列保证日志顺序与调用顺序一致，时间戳在调用时刻取。
 static void DYYYSpeedDiag(NSString *msg) {
     @try {
-        NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DYYY"];
-        NSFileManager *fm = [NSFileManager defaultManager];
-        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-        NSString *path = [dir stringByAppendingPathComponent:@"speed_diag.log"];
         NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-        if (fh) {
-            [fh seekToEndOfFile];
-            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-            [fh closeFile];
-        } else {
-            // 文件句柄打开失败时用整文件重写兜底——必须先读旧内容拼接，否则会覆盖掉之前的诊断行
-            NSString *existing = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
-            NSString *combined = existing ? [existing stringByAppendingString:line] : line;
-            [combined writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        }
+        static dispatch_queue_t dyyyDiagWriteQueue;
+        static dispatch_once_t dyyyDiagOnce;
+        dispatch_once(&dyyyDiagOnce, ^{
+            dyyyDiagWriteQueue = dispatch_queue_create("com.dyyy.speeddiag", DISPATCH_QUEUE_SERIAL);
+        });
+        dispatch_async(dyyyDiagWriteQueue, ^{
+            @try {
+                NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DYYY"];
+                NSFileManager *fm = [NSFileManager defaultManager];
+                [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+                NSString *path = [dir stringByAppendingPathComponent:@"speed_diag.log"];
+                NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+                if (fh) {
+                    [fh seekToEndOfFile];
+                    [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+                    [fh closeFile];
+                } else {
+                    // 文件句柄打开失败时用整文件重写兜底——必须先读旧内容拼接，否则会覆盖掉之前的诊断行
+                    NSString *existing = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+                    NSString *combined = existing ? [existing stringByAppendingString:line] : line;
+                    [combined writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                }
+            } @catch (__unused NSException *e) {}
+        });
     } @catch (__unused NSException *e) {}
 }
 
@@ -629,26 +640,29 @@ static void dyyyEngineSetSpeedThunkD(id self, SEL _cmd, double speed) {
     }
 }
 
-// getter 只做状态记录（值变化才写），用于判断引擎真实速率何时回退
-static void DYYYReportEngineSpeedRead(NSString *selName, double value) {
+// getter 只做状态记录（值变化才写），用于判断引擎真实速率何时回退。
+// 性能：getter 会被 UI/播放器高频轮询——热路径只做一次 double 比较，
+// 值没变直接返回，一个字符串都不建（旧版每次读都拼 3 个 NSString，白白烧 CPU）。
+static void DYYYReportEngineSpeedRead(id self, SEL _cmd, double value) {
     static double dyyyLastEngineSpeedSeen = -999.0;
-    if (fabs(value - dyyyLastEngineSpeedSeen) > 0.001) {
-        dyyyLastEngineSpeedSeen = value;
-        DYYYSpeedDiag([NSString stringWithFormat:@"[engine-state] %@=%.3f", selName, value]);
+    if (fabs(value - dyyyLastEngineSpeedSeen) <= 0.001) {
+        return;
     }
+    dyyyLastEngineSpeedSeen = value;
+    DYYYSpeedDiag([NSString stringWithFormat:@"[engine-state] <%p> %@.%@=%.3f", self, NSStringFromClass([self class]), NSStringFromSelector(_cmd), value]);
 }
 
 static float dyyyEngineGetSpeedThunkF(id self, SEL _cmd) {
     IMP orig = DYYYEngineHookOrigFor(dyyyEngineSpeedGetHooks, dyyyEngineSpeedGetHookCount, _cmd, NO);
     float v = orig ? ((float (*)(id, SEL))orig)(self, _cmd) : 0.0f;
-    DYYYReportEngineSpeedRead([NSString stringWithFormat:@"<%p> %@.%@", self, NSStringFromClass([self class]), NSStringFromSelector(_cmd)], (double)v);
+    DYYYReportEngineSpeedRead(self, _cmd, (double)v);
     return v;
 }
 
 static double dyyyEngineGetSpeedThunkD(id self, SEL _cmd) {
     IMP orig = DYYYEngineHookOrigFor(dyyyEngineSpeedGetHooks, dyyyEngineSpeedGetHookCount, _cmd, YES);
     double v = orig ? ((double (*)(id, SEL))orig)(self, _cmd) : 0.0;
-    DYYYReportEngineSpeedRead([NSString stringWithFormat:@"<%p> %@.%@", self, NSStringFromClass([self class]), NSStringFromSelector(_cmd)], v);
+    DYYYReportEngineSpeedRead(self, _cmd, v);
     return v;
 }
 
@@ -3290,6 +3304,89 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
 
 %end
 
+// === 新功能：横屏全屏禁用竖滑调音量/亮度（锁屏按钮保留不动） ===
+// 老板需求：全屏左右两侧上下滑动分别调音量/亮度，全部禁掉；锁屏按钮点击要一直生效。
+// 方案（效果层拦截，不猜手势类名）：在 UIScreen.setBrightness: / AVSystemController
+// setVolumeTo:forCategory: 这两个最终入口上拦——不管原生手势挂在哪个 view/recognizer，
+// 调节最终都会走这两个调用，拦效果 100% 覆盖；锁屏按钮不碰这两个调用，不受影响。
+// 只在横屏（宽>高）时拦截，竖屏完全不碰。DYYY 自己的横屏边缘手势（DYYYVideoGesture）
+// 通过打标放行，不受影响。附带一次性取证：
+// ① [gscan] 进横屏前 2 次扫手势树（谁挂了 pan、delegate 是谁）；
+// ② [volscan] 扫一次抖音二进制里 Volume/Brightness/Light/Slider 相关类名；
+// ③ [bright-set]/[vol-set] 每次真实调节记一笔（0.5s 节流），标明 DYYY 自己 or 原生。
+// 所有探针都是一次性或事件触发，无常驻轮询开销。
+static BOOL dyyyTagBrightFromDYYYGesture = NO;
+static BOOL dyyyTagVolumeFromDYYYGesture = NO;
+
+// 横屏判定：当前活跃窗口宽>高即视为全屏/横屏（竖屏返回 NO，完全不拦）
+static BOOL DYYYIsLandscapeFullscreenNow(void) {
+    UIWindow *win = [DYYYUtils getActiveWindow];
+    return win != nil && win.bounds.size.width > win.bounds.size.height;
+}
+
+static void DYYYScanLandscapeGesturesOnce(UIViewController *vc) {
+    static int dyyyGestureScanCount = 0;
+    if (vc.view == nil || dyyyGestureScanCount >= 2) {
+        return;
+    }
+    dyyyGestureScanCount++;
+    NSMutableArray *lines = [NSMutableArray array];
+    // BFS 遍历手势树：只记挂了手势的节点（上限 400 个节点、防御性截断）
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:vc.view];
+    int visited = 0;
+    while (stack.count > 0 && visited < 400) {
+        UIView *v = stack.firstObject;
+        [stack removeObjectAtIndex:0];
+        visited++;
+        NSArray *grs = v.gestureRecognizers;
+        if (grs.count > 0) {
+            for (UIGestureRecognizer *gr in grs) {
+                if (lines.count < 60) {
+                    [lines addObject:[NSString stringWithFormat:@"view=%@ frame=%@ gr=%@ delegate=%@",
+                        NSStringFromClass([v class]), NSStringFromCGRect(v.frame),
+                        NSStringFromClass([gr class]),
+                        gr.delegate ? NSStringFromClass([gr.delegate class]) : @"-"]];
+                }
+            }
+        }
+        [stack addObjectsFromArray:v.subviews];
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[gscan#%d] scanned=%d %@", dyyyGestureScanCount, visited, lines]);
+}
+
+static void DYYYScanVolBrightClassesOnce(void) {
+    static BOOL dyyyVolClassScanned = NO;
+    if (dyyyVolClassScanned) {
+        return;
+    }
+    dyyyVolClassScanned = YES;
+    Class anchor = NSClassFromString(@"AWELandscapeFeedViewController");
+    if (!anchor) {
+        return;
+    }
+    const char *img = class_getImageName(anchor);
+    if (!img) {
+        return;
+    }
+    unsigned int count = 0;
+    const char **names = objc_copyClassNamesForImage(img, &count);
+    NSMutableArray *hits = [NSMutableArray array];
+    for (unsigned int i = 0; i < count; i++) {
+        NSString *n = [NSString stringWithUTF8String:names[i]];
+        NSString *l = n.lowercaseString;
+        BOOL isVol = [l containsString:@"volume"] || [l containsString:@"vol"];
+        BOOL isBright = [l containsString:@"brightness"] ||
+                        ([l containsString:@"light"] && ![l containsString:@"highlight"]);
+        BOOL isSlider = [l containsString:@"slider"];
+        if ((isVol || isBright || isSlider) && hits.count < 120) {
+            [hits addObject:n];
+        }
+    }
+    free(names);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[volscan] hits=%lu 总类=%u %@", (unsigned long)hits.count, count, hits]);
+}
+
+
 // === 全屏大返回键：原生返回按钮热区扩大 ===
 // 返回按钮 = AWENoxusHighlightButton（日志实锤：重写 touches 自行处理点击，
 // 无 target-action、无 tap 手势，sendActions/直调/手势直调全部无效——
@@ -3335,6 +3432,49 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     DYYYReapplySpeedToCurrentPlayer(@"landscape");
+    // 新功能取证：扫手势树 + 类名（各限 2 次/1 次，一次性开销）
+    DYYYScanLandscapeGesturesOnce(self);
+    DYYYScanVolBrightClassesOnce();
+}
+%end
+
+// 效果层拦截 ①：横屏时吞掉原生竖滑调亮度（竖屏不碰；DYYY 自己的边缘手势打标放行）
+%hook UIScreen
+- (void)setBrightness:(CGFloat)brightness {
+    static NSTimeInterval dyyyLastBrightLog = 0;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - dyyyLastBrightLog > 0.5) {
+        dyyyLastBrightLog = now;
+        DYYYSpeedDiag([NSString stringWithFormat:@"[bright-set] src=%@ val=%.3f landscape=%d",
+            dyyyTagBrightFromDYYYGesture ? @"DYYY边缘手势" : @"抖音原生/其他",
+            brightness, DYYYIsLandscapeFullscreenNow()]);
+    }
+    if (!dyyyTagBrightFromDYYYGesture && DYYYIsLandscapeFullscreenNow()) {
+        dyyyTagBrightFromDYYYGesture = NO;
+        return; // 原生竖滑调亮度：吞掉，不执行 %orig
+    }
+    dyyyTagBrightFromDYYYGesture = NO;
+    %orig;
+}
+%end
+
+// 效果层拦截 ②：横屏时吞掉原生竖滑调音量（硬件音量键走 mediaserverd，不经过本进程此调用，不受影响）
+%hook AVSystemController
+- (BOOL)setVolumeTo:(float)value forCategory:(NSString *)category {
+    static NSTimeInterval dyyyLastVolLog = 0;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - dyyyLastVolLog > 0.5) {
+        dyyyLastVolLog = now;
+        DYYYSpeedDiag([NSString stringWithFormat:@"[vol-set] src=%@ val=%.3f cat=%@ landscape=%d",
+            dyyyTagVolumeFromDYYYGesture ? @"DYYY边缘手势" : @"抖音原生/其他",
+            value, category, DYYYIsLandscapeFullscreenNow()]);
+    }
+    if (!dyyyTagVolumeFromDYYYGesture && DYYYIsLandscapeFullscreenNow()) {
+        dyyyTagVolumeFromDYYYGesture = NO;
+        return YES; // 原生竖滑调音量：吞掉，假装设置成功
+    }
+    dyyyTagVolumeFromDYYYGesture = NO;
+    return %orig;
 }
 %end
 
@@ -3550,12 +3690,14 @@ static void DYYYApplyNormalPlaybackSpeedToNativeDPlayer(AWEDPlayerSpeedControlle
             newVal = fminf(fmaxf(newVal, 0.0), 1.0); // Clamp 0~1
 
             if (gMode == DYEdgeModeBrightness) {
+                dyyyTagBrightFromDYYYGesture = YES; // 打标：这是 DYYY 自己的边缘手势，拦截 hook 要放行
                 [UIScreen mainScreen].brightness = newVal;
                 // 弹系统亮度 HUD
                 [[%c(SBHUDController) sharedInstance] presentHUDWithIcon:@"Brightness" level:newVal];
 
             } else { // DYEdgeModeVolume
                 // iOS 18 音量控制 + 系统音量 HUD
+                dyyyTagVolumeFromDYYYGesture = YES; // 打标：DYYY 自己的边缘手势
                 [[objc_getClass("AVSystemController") sharedAVSystemController] setVolumeTo:newVal forCategory:@"Audio/Video"];
             }
 
