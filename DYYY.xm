@@ -3360,30 +3360,44 @@ static void DYYYScanVolBrightClassesOnce(void) {
         return;
     }
     dyyyVolClassScanned = YES;
-    Class anchor = NSClassFromString(@"AWELandscapeFeedViewController");
-    if (!anchor) {
-        return;
-    }
-    const char *img = class_getImageName(anchor);
-    if (!img) {
-        return;
-    }
-    unsigned int count = 0;
-    const char **names = objc_copyClassNamesForImage(img, &count);
-    NSMutableArray *hits = [NSMutableArray array];
-    for (unsigned int i = 0; i < count; i++) {
-        NSString *n = [NSString stringWithUTF8String:names[i]];
-        NSString *l = n.lowercaseString;
-        BOOL isVol = [l containsString:@"volume"] || [l containsString:@"vol"];
-        BOOL isBright = [l containsString:@"brightness"] ||
-                        ([l containsString:@"light"] && ![l containsString:@"highlight"]);
-        BOOL isSlider = [l containsString:@"slider"];
-        if ((isVol || isBright || isSlider) && hits.count < 120) {
-            [hits addObject:n];
+    // 嫌疑类方法清单一次性 dump（供下一轮精准补刀用）：
+    // 日志实锤原生音量不走 AVSystemController（[vol-set] 只有 DYYY 边缘手势记录），
+    // 疑走 MPVolumeView 私有滑杆（AWESystemVolumnManager / MPVolumeViewAspectInjector）
+    NSArray *suspects = @[
+        @"AWEDPlayerInteractionView",
+        @"AWESystemVolumnManager",
+        @"AWELandscapeVolumeBrightnessContainer",
+        @"MPVolumeSlider",
+        @"MPVolumeView",
+        @"AWEPlayerVolumeAdjustSmartService",
+        @"AWEPlayerBrightnessAdjustSmartService"
+    ];
+    for (NSString *clsName in suspects) {
+        Class cls = NSClassFromString(clsName);
+        if (!cls) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[vscan] %@ class=nil", clsName]);
+            continue;
         }
+        unsigned int count = 0;
+        Method *methods = class_copyMethodList(cls, &count);
+        NSMutableArray *hits = [NSMutableArray array];
+        for (unsigned int i = 0; i < count; i++) {
+            NSString *sel = NSStringFromSelector(method_getName(methods[i]));
+            NSString *l = sel.lowercaseString;
+            if ([l containsString:@"vol"] || [l containsString:@"bright"] ||
+                [l containsString:@"light"] || [l containsString:@"pan"] ||
+                [l containsString:@"gesture"] || [l containsString:@"swipe"] ||
+                [l containsString:@"slide"]) {
+                if (hits.count < 60) {
+                    [hits addObject:sel];
+                }
+            }
+        }
+        if (methods) {
+            free(methods);
+        }
+        DYYYSpeedDiag([NSString stringWithFormat:@"[vscan] %@ hits(%lu/%u)=%@", clsName, (unsigned long)hits.count, count, hits]);
     }
-    free(names);
-    DYYYSpeedDiag([NSString stringWithFormat:@"[volscan] hits=%lu 总类=%u %@", (unsigned long)hits.count, count, hits]);
 }
 
 
@@ -3474,6 +3488,31 @@ static void DYYYScanVolBrightClassesOnce(void) {
         return YES; // 原生竖滑调音量：吞掉，假装设置成功
     }
     dyyyTagVolumeFromDYYYGesture = NO;
+    return %orig;
+}
+%end
+
+// 斩草除根：原生竖滑调音量/亮度的手势源头 = AWEDPlayerInteractionView 上的 UIPanGestureRecognizer
+// （[gscan] 实锤：delegate=AWEDPlayerInteractionView，左侧亮度/右侧音量两个胶囊滑块都由它驱动；
+//   原生音量不走 AVSystemController，[vol-set] 只有 DYYY 边缘手势的记录——效果层拦它拦不到）。
+// 竖直分量>水平分量直接不让手势开始：滑块根本不弹出，音量/亮度纹丝不动；
+// 水平滑动（翻页/进度）放行，锁屏按钮是 tap 手势不经过这里，照常生效。
+%hook AWEDPlayerInteractionView
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
+    if (DYYYIsLandscapeFullscreenNow() && [gestureRecognizer isKindOfClass:[UIPanGestureRecognizer class]]) {
+        UIPanGestureRecognizer *pan = (UIPanGestureRecognizer *)gestureRecognizer;
+        CGPoint vel = [pan velocityInView:self];
+        if (fabs(vel.y) > fabs(vel.x)) {
+            static NSTimeInterval dyyyLastPanBlockLog = 0;
+            NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+            if (now - dyyyLastPanBlockLog > 1.0) {
+                dyyyLastPanBlockLog = now;
+                DYYYSpeedDiag([NSString stringWithFormat:@"[pan-block] 竖滑已拦 vel=(%.0f,%.0f) gr=%@",
+                    vel.x, vel.y, NSStringFromClass([gestureRecognizer class])]);
+            }
+            return NO;
+        }
+    }
     return %orig;
 }
 %end
@@ -3651,6 +3690,15 @@ static void DYYYApplyNormalPlaybackSpeedToNativeDPlayer(AWEDPlayerSpeedControlle
 
     /* 仅处理横屏Feed列表。其余collectionView直接走系统逻辑 */
     if (self != gFeedCV || !DYYYGetBool(@"DYYYVideoGesture")) {
+        %orig;
+        return;
+    }
+
+    /* 横屏全屏下禁用 DYYY 自己的边缘亮度/音量手势（老板要求滑动调节全部禁掉；
+       原生手势由 AWEDPlayerInteractionView hook 拦源头，DYYY 这条也关掉，
+       否则日志实锤它一直在调亮度/音量——上一版"有时候拦不住"就是它放行造成的） */
+    if (DYYYIsLandscapeFullscreenNow()) {
+        gMode = DYEdgeModeNone;
         %orig;
         return;
     }
