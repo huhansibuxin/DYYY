@@ -602,6 +602,16 @@ static void DYYYApplyPreparedPlaybackSpeedToPlayer(id playerViewController) {
         return;
     }
 
+    static BOOL dyyySpeedDiagOnce = NO;
+    if (!dyyySpeedDiagOnce) {
+        dyyySpeedDiagOnce = YES;
+        DYYYSpeedDiag([NSString stringWithFormat:@"[diag] nativeSpeedClass=%d merge=%d avplayer=%d target=%.3f",
+            NSClassFromString(@"AWEDPlayerSpeedController") != nil,
+            NSClassFromString(@"AWEDPlayerViewController_Merge") != nil,
+            NSClassFromString(@"AVPlayer") != nil,
+            DYYYConfiguredPlaybackSpeed()]);
+    }
+
     double speed = DYYYPreparedPlaybackSpeedForPlayer(playerViewController);
     DYYYSpeedDiag([NSString stringWithFormat:@"[speed-apply] %@ speed=%.3f lp=%d lock=%d", NSStringFromClass([playerViewController class]), speed, dyyyLongPressFastSpeedActive, dyyyLongPressLockedSpeedActive]);
     void (^applyBlock)(void) = ^{
@@ -3138,6 +3148,22 @@ static void DYYYApplyNormalPlaybackSpeedToNativeDPlayer(AWEDPlayerSpeedControlle
     }
 }
 
+%end
+
+// 通用兜底：直接钳制 AVPlayer 的真实播放速率。37.5 下 setVideoControllerPlaybackRate: 已是空操作
+// （huami 同款在你这版本也无效），原生播放器会在播放/seek/缓冲各种时机把 rate 重置回 1.0，
+// 必须在最底层按住。仅对 rate>0（正在播放）生效，暂停(rate=0)与长按倍速都不动。
+%hook AVPlayer
+- (void)setRate:(float)rate {
+    if (DYYYShouldHandleSpeedFeatures() && !dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive && rate > 0.01f) {
+        double target = DYYYConfiguredPlaybackSpeed();
+        if (target > 0.0 && fabs((double)rate - target) > 0.001) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[avplayer-rate] orig=%.3f -> %.3f", rate, target]);
+            rate = (float)target;
+        }
+    }
+    %orig(rate);
+}
 %end
 
 %hook UICollectionView

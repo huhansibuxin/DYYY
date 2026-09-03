@@ -108,21 +108,6 @@ jobs:
       - name: Clean packages dir
         run: rm -rf packages && mkdir -p packages
         
-      - name: Build Rootful
-        run: |
-          make package FINALPACKAGE=1 -j$(sysctl -n hw.ncpu)
-          for f in packages/*.deb; do
-            [ -f "$f" ] && [[ "$f" != *"-root"*".deb" ]] && mv "$f" "${f%.deb}-rootful.deb"
-          done
-             
-      - name: Build Rootless
-        run: |
-          #make package FINALPACKAGE=1 -j$(sysctl -n hw.ncpu)
-          make package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1 -j$(sysctl -n hw.ncpu)
-          for f in packages/*.deb; do
-            [ -f "$f" ] && [[ "$f" != *"-root"*".deb" ]] && mv "$f" "${f%.deb}-rootless.deb"
-          done
-          
       - name: Build Roothide
         run: |
           make package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1 -j$(sysctl -n hw.ncpu)
@@ -149,13 +134,13 @@ jobs:
           shopt -s nullglob
 
           deb_files=(packages/*.deb)
-          if [ "${#deb_files[@]}" -ne 3 ]; then
-            echo "Expected 3 Deb packages, found ${#deb_files[@]}:" >&2
+          if [ "${#deb_files[@]}" -ne 1 ]; then
+            echo "Expected 1 Deb package (roothide only), found ${#deb_files[@]}:" >&2
             printf '  %s\n' "${deb_files[@]}" >&2
             exit 1
           fi
 
-          for scheme in rootful rootless roothide; do
+          for scheme in roothide; do
             scheme_files=(packages/*-"${scheme}".deb)
             if [ "${#scheme_files[@]}" -ne 1 ]; then
               echo "Expected exactly one ${scheme} package, found ${#scheme_files[@]}" >&2
