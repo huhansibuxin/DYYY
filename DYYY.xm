@@ -3291,10 +3291,10 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
 %end
 
 // === 全屏大返回键：左上半区任意点按 = 返回 ===
-// 原理：在横屏/全屏容器视图上盖一块透明 UIControl（左半宽 × 上半高），
-// 点按结束时直接触发左上角返回按钮的 touchUpInside（覆盖该区域内其他按钮，老板已确认无所谓）。
-// 返回按钮识别：视图层级里最靠左上的可见 UIButton（minX/minY < 130，尺寸 >= 15）。
-// 开关：DYYYFullScreenBigBack（设置页"全屏大返回键"）。
+// 原理：在横屏/全屏播放器容器视图上盖一块透明 UIControl（左半宽 × 上半高，
+// autoresizing 跟随旋转），点按结束时直接触发左上角返回按钮的 touchUpInside
+// （覆盖该区域内其他按钮，老板已确认无所谓）。返回按钮不依赖具体类名，
+// 运行时按"最靠左上的可见 UIButton"自动识别。开关：DYYYFullScreenBigBack。
 @interface DYYYBigBackOverlay : UIControl
 @property (nonatomic, weak) UIButton *backButton;
 @end
@@ -3327,13 +3327,14 @@ static UIButton *DYYYFindTopLeftBackButton(UIView *root) {
             continue;
         }
         CGRect frame = [button convertRect:button.bounds toView:root];
-        if (frame.minX < -5 || frame.minY < -5 || frame.minX > 130 || frame.minY > 130) {
+        if (CGRectGetMinX(frame) < -5 || CGRectGetMinY(frame) < -5 ||
+            CGRectGetMinX(frame) > 130 || CGRectGetMinY(frame) > 130) {
             continue;
         }
-        if (frame.size.width < 15 || frame.size.height < 15) {
+        if (CGRectGetWidth(frame) < 15 || CGRectGetHeight(frame) < 15) {
             continue;
         }
-        CGFloat score = frame.minX + frame.minY;
+        CGFloat score = CGRectGetMinX(frame) + CGRectGetMinY(frame);
         if (score < bestScore) {
             bestScore = score;
             best = button;
@@ -3367,7 +3368,7 @@ static void DYYYInstallBigBackOverlay(UIViewController *viewController) {
         container,
         NSStringFromClass([viewController class]),
         overlay.backButton ? NSStringFromClass([overlay.backButton class]) : @"nil",
-        NSStringFromRect(overlay.backButton ? overlay.backButton.frame : CGRectZero)]);
+        NSStringFromCGRect(overlay.backButton ? overlay.backButton.frame : CGRectZero)]);
 }
 
 %hook AWELandscapeFeedViewController
@@ -7870,7 +7871,6 @@ static void DYYYLiveDurationInstallFromInnerFeedCell(id cell) {
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     DYYYReapplySpeedToCurrentPlayer(@"fullscreen");
-    DYYYInstallBigBackOverlay(self);
 }
 %end
 
