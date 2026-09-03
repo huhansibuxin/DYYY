@@ -3290,202 +3290,34 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
 
 %end
 
-// === 全屏大返回键：左上半区任意点按 = 返回 ===
-// 原理：在横屏/全屏播放器容器视图上盖一块透明 UIControl（左半宽 × 上半高，
-// autoresizing 跟随旋转），点按结束时直接触发左上角返回按钮的 touchUpInside
-// （覆盖该区域内其他按钮，老板已确认无所谓）。返回按钮不依赖具体类名，
-// 运行时按"最靠左上的可见 UIButton"自动识别。老板个人刚需，默认直接生效（无开关）。
-@interface DYYYBigBackOverlay : UIControl
-@property (nonatomic, weak) UIButton *backButton;
-@end
-
-// 前向声明（定义在 @implementation 之后）
-static UIButton *DYYYFindTopLeftBackButton(UIView *root);
-static void DYYYDumpTopLeftButtons(UIView *root);
-static void DYYYTriggerBackButton(UIButton *back);
-
-@implementation DYYYBigBackOverlay
-// 命中测试：触点落在原生返回按钮（外扩 30pt）内 → 返回 nil 穿透，
-// 让原生按钮自己处理触摸。铁律：绝不挡原生按钮——保底退出路径永远可用。
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *root = self.window ?: self;
-    UIButton *back = DYYYFindTopLeftBackButton(root);
-    if (back && back.window && !back.hidden && back.alpha > 0.05) {
-        CGRect frame = [back convertRect:back.bounds toView:self];
-        if (CGRectContainsPoint(CGRectInset(frame, -30, -30), point)) {
-            return nil;
-        }
+// === 全屏大返回键：原生返回按钮热区扩大 ===
+// 返回按钮 = AWENoxusHighlightButton（日志实锤：重写 touches 自行处理点击，
+// 无 target-action、无 tap 手势，sendActions/直调/手势直调全部无效——
+// 模拟事件这条路整个封死）。最终方案：hook pointInside: 把热区外扩 60pt
+// （约 24pt 按钮 -> 144pt 见方），触摸链路 100% 原生，不存在挡按钮/转发问题。
+// 热区抢到相邻按钮点击无所谓（老板确认）。默认直接生效，无开关。
+%hook AWENoxusHighlightButton
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    if (%orig) {
+        return YES;
     }
-    return [super hitTest:point withEvent:event];
-}
-
-- (void)endTrackingWithTouch:(UITouch *)touch withEvent:(UIEvent *)event {
-    [super endTrackingWithTouch:touch withEvent:event];
-    // 点击时实时找（viewDidAppear 快照可能太早，返回按钮那时还没加载）
-    UIView *root = self.window ?: self;
-    UIButton *back = DYYYFindTopLeftBackButton(root);
-    if (back && !back.hidden && back.window && back.alpha > 0.05) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[big-back] 命中 %@", NSStringFromClass([back class])]);
-        DYYYTriggerBackButton(back);
-    } else {
-        DYYYSpeedDiag(@"[big-back] 未命中，dump 左上候选");
-        DYYYDumpTopLeftButtons(root);
+    const CGFloat expand = 60.0;
+    CGRect big = CGRectMake(-expand, -expand,
+                            self.bounds.size.width + expand * 2,
+                            self.bounds.size.height + expand * 2);
+    if (!CGRectContainsPoint(big, point)) {
+        return NO;
     }
-}
-@end
-
-static UIButton *DYYYFindTopLeftBackButton(UIView *root) {
-    UIButton *best = nil;
-    CGFloat bestScore = CGFLOAT_MAX;
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
-    while (stack.count > 0) {
-        UIView *view = stack.lastObject;
-        [stack removeLastObject];
-        for (UIView *sub in view.subviews) {
-            [stack addObject:sub];
-        }
-        if (![view isKindOfClass:[UIButton class]]) {
-            continue;
-        }
-        UIButton *button = (UIButton *)view;
-        if (button.hidden || button.alpha < 0.05 || !button.userInteractionEnabled || button.tag == 0xD9BB) {
-            continue;
-        }
-        CGRect frame = [button convertRect:button.bounds toView:root];
-        // 放宽：横屏全屏下返回按钮可能带 safe area 偏移，minX/minY 上限 200
-        if (CGRectGetMinX(frame) < -5 || CGRectGetMinY(frame) < -5 ||
-            CGRectGetMinX(frame) > 200 || CGRectGetMinY(frame) > 200) {
-            continue;
-        }
-        if (CGRectGetWidth(frame) < 10 || CGRectGetHeight(frame) < 10) {
-            continue;
-        }
-        CGFloat score = CGRectGetMinX(frame) + CGRectGetMinY(frame);
-        if (score < bestScore) {
-            bestScore = score;
-            best = button;
-        }
+    static NSTimeInterval dyyyLastBigBackLog = 0;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - dyyyLastBigBackLog > 1.0) {
+        dyyyLastBigBackLog = now;
+        DYYYSpeedDiag([NSString stringWithFormat:@"[big-back] 热区命中 %@ bounds=%@",
+            NSStringFromClass([self class]), NSStringFromCGRect(self.bounds)]);
     }
-    return best;
+    return YES;
 }
-
-// 诊断：dump 左上角 260x260 区域内所有可见 UIControl/UIButton 候选，定位返回按钮真实类名与坐标
-static void DYYYDumpTopLeftButtons(UIView *root) {
-    @try {
-        NSMutableArray<NSString *> *lines = [NSMutableArray array];
-        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
-        while (stack.count > 0) {
-            UIView *view = stack.lastObject;
-            [stack removeLastObject];
-            for (UIView *sub in view.subviews) {
-                [stack addObject:sub];
-            }
-            if (![view isKindOfClass:[UIControl class]]) {
-                continue;
-            }
-            if (view.hidden || view.alpha < 0.05 || view.tag == 0xD9BB) {
-                continue;
-            }
-            CGRect frame = [view convertRect:view.bounds toView:root];
-            if (CGRectGetMinX(frame) > 260 || CGRectGetMinY(frame) > 260) {
-                continue;
-            }
-            [lines addObject:[NSString stringWithFormat:@"%@%@ f=%@ en=%d",
-                NSStringFromClass([view class]),
-                [view isKindOfClass:[UIButton class]] ? [NSString stringWithFormat:@"(title=%@)", [(UIButton *)view currentTitle] ?: @""] : @"",
-                NSStringFromCGRect(frame),
-                (int)view.userInteractionEnabled]];
-        }
-        DYYYSpeedDiag([NSString stringWithFormat:@"[big-back-candidates] %lu 个: %@", (unsigned long)lines.count, lines]);
-    } @catch (__unused NSException *e) {}
-}
-
-// 触发返回：Noxus 系按钮实测不吃 sendActionsForControlEvents（标准事件分发无效），
-// 按优先级依次尝试：① 直调 target-action（objc_msgSend）② 按钮/父视图上的 tap 手势
-// ③ 兜底 sendActions。拿到一条即返回，避免多重触发连退两层。
-static void DYYYTriggerBackButton(UIButton *back) {
-    @try {
-        // ① 直调 target-action
-        for (id target in [back allTargets]) {
-            NSArray *actions = [back actionsForTarget:target forControlEvent:UIControlEventTouchUpInside];
-            if (actions.count == 0) {
-                actions = [back actionsForTarget:target forControlEvent:UIControlEventValueChanged];
-            }
-            for (NSString *name in actions) {
-                SEL sel = NSSelectorFromString(name);
-                if (sel && [target respondsToSelector:sel]) {
-                    ((void (*)(id, SEL, id))objc_msgSend)(target, sel, back);
-                    DYYYSpeedDiag([NSString stringWithFormat:@"[big-back] 直调 %@.%@",
-                        NSStringFromClass([target class]), name]);
-                    return;
-                }
-            }
-        }
-        // ② tap 手势（KVC 私有 targets）
-        NSArray *gestures = back.gestureRecognizers;
-        UIView *parent = back.superview;
-        if (gestures.count == 0 && parent) {
-            gestures = parent.gestureRecognizers;
-        }
-        for (UIGestureRecognizer *g in gestures ?: @[]) {
-            if (![g isKindOfClass:[UITapGestureRecognizer class]] || !g.enabled) {
-                continue;
-            }
-            @try {
-                NSArray *gTargets = [g valueForKey:@"targets"] ?: @[];
-                for (id info in gTargets) {
-                    id target = [info valueForKey:@"target"];
-                    // KVC 拿到的是 objc_selector*（id 装载），ARC 下必须 __bridge 转 SEL
-                    id actionVal = [info valueForKey:@"action"];
-                    SEL sel = NULL;
-                    if ([actionVal isKindOfClass:[NSString class]]) {
-                        sel = NSSelectorFromString(actionVal);
-                    } else if (actionVal) {
-                        sel = (SEL)(__bridge void *)actionVal;
-                    }
-                    if (target && sel && [target respondsToSelector:sel]) {
-                        ((void (*)(id, SEL, id))objc_msgSend)(target, sel, g);
-                        DYYYSpeedDiag([NSString stringWithFormat:@"[big-back] 手势直调 %@",
-                            NSStringFromClass([target class])]);
-                        return;
-                    }
-                }
-            } @catch (__unused NSException *e) {
-                continue;
-            }
-        }
-        // ③ 兜底模拟事件（前两步都没拿到 target 时）
-        [back sendActionsForControlEvents:UIControlEventTouchUpInside];
-        DYYYSpeedDiag(@"[big-back] fallback sendActions");
-    } @catch (__unused NSException *e) {
-        DYYYSpeedDiag(@"[big-back] 触发异常");
-    }
-}
-
-static void DYYYInstallBigBackOverlay(UIViewController *viewController) {
-    if (!viewController || !viewController.view) {
-        return;
-    }
-
-    UIView *container = viewController.view;
-    DYYYBigBackOverlay *overlay = (DYYYBigBackOverlay *)[container viewWithTag:0xD9BB];
-    if (!overlay || ![overlay isKindOfClass:[DYYYBigBackOverlay class]]) {
-        overlay = [[DYYYBigBackOverlay alloc] initWithFrame:CGRectMake(0, 0, container.bounds.size.width * 0.5, container.bounds.size.height * 0.5)];
-        overlay.tag = 0xD9BB;
-        overlay.backgroundColor = [UIColor clearColor];
-        overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        overlay.userInteractionEnabled = YES;
-        [container addSubview:overlay];
-    }
-    overlay.frame = CGRectMake(0, 0, container.bounds.size.width * 0.5, container.bounds.size.height * 0.5);
-    [container bringSubviewToFront:overlay];
-    overlay.backButton = DYYYFindTopLeftBackButton(container);
-    DYYYSpeedDiag([NSString stringWithFormat:@"[big-back] <%p> %@ back=%@ frame=%@",
-        container,
-        NSStringFromClass([viewController class]),
-        overlay.backButton ? NSStringFromClass([overlay.backButton class]) : @"nil",
-        NSStringFromCGRect(overlay.backButton ? overlay.backButton.frame : CGRectZero)]);
-}
+%end
 
 %hook AWELandscapeFeedViewController
 - (void)viewDidLoad {
@@ -3503,7 +3335,6 @@ static void DYYYInstallBigBackOverlay(UIViewController *viewController) {
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     DYYYReapplySpeedToCurrentPlayer(@"landscape");
-    DYYYInstallBigBackOverlay(self);
 }
 %end
 
