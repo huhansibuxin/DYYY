@@ -565,6 +565,9 @@ static void DYYYSpeedDiag(NSString *msg) {
     } @catch (__unused NSException *e) {}
 }
 
+// 前向声明（定义在下方）：避免全屏/横屏重焊函数反向引用未声明
+static void DYYYApplyPreparedPlaybackSpeedToPlayer(id playerViewController);
+
 // 进全屏/横屏时，按已知三个播放器类在视图层级里找当前播放器并把默认倍速重新焊上（幂等）
 static void DYYYReapplySpeedToCurrentPlayer(NSString *context) {
     if (!DYYYShouldHandleSpeedFeatures()) {
