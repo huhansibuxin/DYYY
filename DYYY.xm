@@ -3299,12 +3299,22 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
 @property (nonatomic, weak) UIButton *backButton;
 @end
 
+// 前向声明（定义在 @implementation 之后）
+static UIButton *DYYYFindTopLeftBackButton(UIView *root);
+static void DYYYDumpTopLeftButtons(UIView *root);
+
 @implementation DYYYBigBackOverlay
 - (void)endTrackingWithTouch:(UITouch *)touch withEvent:(UIEvent *)event {
     [super endTrackingWithTouch:touch withEvent:event];
-    UIButton *back = self.backButton;
+    // 点击时实时找（viewDidAppear 快照可能太早，返回按钮那时还没加载）
+    UIView *root = self.window ?: self;
+    UIButton *back = DYYYFindTopLeftBackButton(root);
     if (back && !back.hidden && back.window && back.alpha > 0.05) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[big-back] 命中 %@", NSStringFromClass([back class])]);
         [back sendActionsForControlEvents:UIControlEventTouchUpInside];
+    } else {
+        DYYYSpeedDiag(@"[big-back] 未命中，dump 左上候选");
+        DYYYDumpTopLeftButtons(root);
     }
 }
 @end
@@ -3327,11 +3337,12 @@ static UIButton *DYYYFindTopLeftBackButton(UIView *root) {
             continue;
         }
         CGRect frame = [button convertRect:button.bounds toView:root];
+        // 放宽：横屏全屏下返回按钮可能带 safe area 偏移，minX/minY 上限 200
         if (CGRectGetMinX(frame) < -5 || CGRectGetMinY(frame) < -5 ||
-            CGRectGetMinX(frame) > 130 || CGRectGetMinY(frame) > 130) {
+            CGRectGetMinX(frame) > 200 || CGRectGetMinY(frame) > 200) {
             continue;
         }
-        if (CGRectGetWidth(frame) < 15 || CGRectGetHeight(frame) < 15) {
+        if (CGRectGetWidth(frame) < 10 || CGRectGetHeight(frame) < 10) {
             continue;
         }
         CGFloat score = CGRectGetMinX(frame) + CGRectGetMinY(frame);
@@ -3341,6 +3352,37 @@ static UIButton *DYYYFindTopLeftBackButton(UIView *root) {
         }
     }
     return best;
+}
+
+// 诊断：dump 左上角 260x260 区域内所有可见 UIControl/UIButton 候选，定位返回按钮真实类名与坐标
+static void DYYYDumpTopLeftButtons(UIView *root) {
+    @try {
+        NSMutableArray<NSString *> *lines = [NSMutableArray array];
+        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+        while (stack.count > 0) {
+            UIView *view = stack.lastObject;
+            [stack removeLastObject];
+            for (UIView *sub in view.subviews) {
+                [stack addObject:sub];
+            }
+            if (![view isKindOfClass:[UIControl class]]) {
+                continue;
+            }
+            if (view.hidden || view.alpha < 0.05 || view.tag == 0xD9BB) {
+                continue;
+            }
+            CGRect frame = [view convertRect:view.bounds toView:root];
+            if (CGRectGetMinX(frame) > 260 || CGRectGetMinY(frame) > 260) {
+                continue;
+            }
+            [lines addObject:[NSString stringWithFormat:@"%@%@ f=%@ en=%d",
+                NSStringFromClass([view class]),
+                [view isKindOfClass:[UIButton class]] ? [NSString stringWithFormat:@"(title=%@)", [(UIButton *)view currentTitle] ?: @""] : @"",
+                NSStringFromCGRect(frame),
+                (int)view.userInteractionEnabled]];
+        }
+        DYYYSpeedDiag([NSString stringWithFormat:@"[big-back-candidates] %lu 个: %@", (unsigned long)lines.count, lines]);
+    } @catch (__unused NSException *e) {}
 }
 
 static void DYYYInstallBigBackOverlay(UIViewController *viewController) {
