@@ -262,18 +262,25 @@ void updateSpeedButtonUI() {
 FloatingSpeedButton *getSpeedButton(void) { return speedButton; }
 
 NSArray *findViewControllersInHierarchy(UIViewController *rootViewController) {
+    NSMutableArray *result = [NSMutableArray array];
     if (!rootViewController) {
-        return @[];
+        return result;
     }
-
-    NSMutableArray *viewControllers = [NSMutableArray array];
-    [viewControllers addObject:rootViewController];
-
-    for (UIViewController *childVC in rootViewController.childViewControllers) {
-        [viewControllers addObjectsFromArray:findViewControllersInHierarchy(childVC)];
-    }
-
-    return viewControllers;
+    // 指针级 visited 去重：childViewControllers 一旦成环（37.5 全屏 feed 切第二条视频时
+    // 层级变化出现环）会无限递归把主线程卡死（表现「只能播一条视频就不动」）。去重后必然终止。
+    NSMutableSet *visited = [NSMutableSet set];
+    void (^__block traverse)(UIViewController *) = ^(UIViewController *vc) {
+        if (!vc || [visited containsObject:vc]) {
+            return;
+        }
+        [visited addObject:vc];
+        [result addObject:vc];
+        for (UIViewController *child in vc.childViewControllers) {
+            traverse(child);
+        }
+    };
+    traverse(rootViewController);
+    return result;
 }
 
 void showSpeedButton(void) {
