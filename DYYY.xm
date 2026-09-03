@@ -3294,7 +3294,7 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
 // 原理：在横屏/全屏播放器容器视图上盖一块透明 UIControl（左半宽 × 上半高，
 // autoresizing 跟随旋转），点按结束时直接触发左上角返回按钮的 touchUpInside
 // （覆盖该区域内其他按钮，老板已确认无所谓）。返回按钮不依赖具体类名，
-// 运行时按"最靠左上的可见 UIButton"自动识别。开关：DYYYFullScreenBigBack。
+// 运行时按"最靠左上的可见 UIButton"自动识别。老板个人刚需，默认直接生效（无开关）。
 @interface DYYYBigBackOverlay : UIControl
 @property (nonatomic, weak) UIButton *backButton;
 @end
@@ -3345,9 +3345,6 @@ static UIButton *DYYYFindTopLeftBackButton(UIView *root) {
 
 static void DYYYInstallBigBackOverlay(UIViewController *viewController) {
     if (!viewController || !viewController.view) {
-        return;
-    }
-    if (!DYYYGetBool(@"DYYYFullScreenBigBack")) {
         return;
     }
 
