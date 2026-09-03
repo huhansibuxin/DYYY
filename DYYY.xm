@@ -3122,6 +3122,21 @@ static void DYYYApplyNormalPlaybackSpeedToNativeDPlayer(AWEDPlayerSpeedControlle
 
 %hook AWEDPlayerSpeedController
 
+// 拦截原生倍速控制器的 setPlaybackRate: —— 这才是 37.5 真正驱动播放速率的入口
+// （日志证实 AVPlayer.setRate: 在 37.5 根本不被调用，avplayer-setRate=0）。
+// 抖音进全屏/切视频时会用 setPlaybackRate:1.0 把速率重置，必须在这里钳回目标倍速，
+// 否则“全屏滑动就变”。仅对非长按、非自身施加(防递归)时钳制。
+- (void)setPlaybackRate:(float)rate {
+    if (DYYYShouldHandleSpeedFeatures() && !dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive && !dyyyApplyingNativeDPlayerSpeed) {
+        double target = DYYYConfiguredPlaybackSpeed();
+        if (target > 0.0 && fabs((double)rate - target) > 0.001) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[native-setPlaybackRate] req=%.3f -> %.3f", rate, target]);
+            rate = (float)target;
+        }
+    }
+    %orig(rate);
+}
+
 - (void)viewDidLoad {
     %orig;
     dyyyActiveDPlayerSpeedController = self;
@@ -3153,12 +3168,21 @@ static void DYYYApplyNormalPlaybackSpeedToNativeDPlayer(AWEDPlayerSpeedControlle
 // 通用兜底：直接钳制 AVPlayer 的真实播放速率。37.5 下 setVideoControllerPlaybackRate: 已是空操作
 // （huami 同款在你这版本也无效），原生播放器会在播放/seek/缓冲各种时机把 rate 重置回 1.0，
 // 必须在最底层按住。仅对 rate>0（正在播放）生效，暂停(rate=0)与长按倍速都不动。
+// 诊断：记录每一次 setRate: 请求的速率（按取整去重，避免刷屏），并显式标出被钳制的那次，
+// 用来确认原生到底有没有把 rate 重置回 1.0、钳制是否生效。
 %hook AVPlayer
 - (void)setRate:(float)rate {
-    if (DYYYShouldHandleSpeedFeatures() && !dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive && rate > 0.01f) {
+    if (DYYYShouldHandleSpeedFeatures()) {
         double target = DYYYConfiguredPlaybackSpeed();
-        if (target > 0.0 && fabs((double)rate - target) > 0.001) {
-            DYYYSpeedDiag([NSString stringWithFormat:@"[avplayer-rate] orig=%.3f -> %.3f", rate, target]);
+        static float dyyyLastLoggedRate = -1.0f;
+        float rounded = roundf(rate * 100.0f) / 100.0f;
+        if (fabs(rounded - dyyyLastLoggedRate) > 0.001f) {
+            dyyyLastLoggedRate = rounded;
+            DYYYSpeedDiag([NSString stringWithFormat:@"[avplayer-setRate] req=%.3f target=%.3f lp=%d",
+                rate, target, (dyyyLongPressFastSpeedActive || dyyyLongPressLockedSpeedActive)]);
+        }
+        if (!dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive && rate > 0.01f && target > 0.0 && fabs((double)rate - target) > 0.001) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[avplayer-clamp] %.3f -> %.3f", rate, target]);
             rate = (float)target;
         }
     }

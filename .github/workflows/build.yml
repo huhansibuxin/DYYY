@@ -1,4 +1,4 @@
-name: build deb
+name: build dylib
 
 on:
   push:
@@ -21,17 +21,6 @@ on:
       - 'Resources/**'
       - 'layout/**'
   workflow_dispatch:
-    inputs:
-      scheme:
-        description: '打包方案（留空则全打）'
-        required: false
-        default: 'all'
-        type: choice
-        options:
-          - all
-          - rootful
-          - rootless
-          - roothide
 
 permissions:
   actions: read
@@ -59,7 +48,7 @@ jobs:
             echo "Build-relevant plugin, package, or Makefile changes detected."
           else
             echo "should_build=false" >> "$GITHUB_OUTPUT"
-            echo "Only non-build Makefile settings changed; skipping Deb build."
+            echo "Only non-build Makefile settings changed; skipping dylib build."
           fi
 
   build:
@@ -105,60 +94,20 @@ jobs:
         run: |
           echo "$(brew --prefix)/opt/make/libexec/gnubin" >> $GITHUB_PATH
 
-      - name: Clean packages dir
-        run: rm -rf packages && mkdir -p packages
-        
-      - name: Build Roothide
+      - name: Build dylib (rootless, for TrollFools injection)
         run: |
-          make package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1 -j$(sysctl -n hw.ncpu)
-          for f in packages/*.deb; do
-            [ -f "$f" ] && [[ "$f" != *"-root"*".deb" ]] && mv "$f" "${f%.deb}-roothide.deb"
-          done
-          
-      - name: Prepare package metadata
-        id: package
-        run: |
-          timestamp=$(TZ=Asia/Shanghai date +%Y%m%d%H%M%S)
-          version=$(awk -F': ' '$1 == "Version" { print $2; exit }' control)
-          if [ -z "$version" ]; then
-            echo "Unable to read package version from control" >&2
-            exit 1
-          fi
-          echo "timestamp=$timestamp" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          make package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1 -j$(sysctl -n hw.ncpu)
+          mkdir -p packages
+          DEB=$(ls -t packages/*.deb | head -1)
+          rm -rf /tmp/dyyy_ext && mkdir -p /tmp/dyyy_ext
+          ( cd /tmp/dyyy_ext && ar -x "$PWD/$DEB" && tar -xf data.tar.* )
+          DYLIB=$(find /tmp/dyyy_ext -type f -name 'DYYY.dylib' | head -1)
+          cp "$DYLIB" packages/DYYY.dylib
+          lipo -info packages/DYYY.dylib
+          echo "Built: $(ls -la packages/DYYY.dylib)"
 
-      - name: Verify Deb packages
-        shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-
-          deb_files=(packages/*.deb)
-          if [ "${#deb_files[@]}" -ne 1 ]; then
-            echo "Expected 1 Deb package (roothide only), found ${#deb_files[@]}:" >&2
-            printf '  %s\n' "${deb_files[@]}" >&2
-            exit 1
-          fi
-
-          for scheme in roothide; do
-            scheme_files=(packages/*-"${scheme}".deb)
-            if [ "${#scheme_files[@]}" -ne 1 ]; then
-              echo "Expected exactly one ${scheme} package, found ${#scheme_files[@]}" >&2
-              exit 1
-            fi
-          done
-
-          printf 'Package artifact: %s\n' "${deb_files[@]}"
-
-      - name: Extract arm64e dylib
-        env:
-          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
-        run: .github/scripts/extract-release-dylib.sh
-
-      - name: Upload package artifacts
+      - name: Upload dylib artifact
         uses: actions/upload-artifact@v7
         with:
-          name: DYYY-${{ steps.package.outputs.timestamp }}
-          path: |
-            ${{ github.workspace }}/packages/*.deb
-            ${{ github.workspace }}/packages/*.dylib
+          name: DYYY-dylib
+          path: packages/DYYY.dylib
