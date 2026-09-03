@@ -545,14 +545,58 @@ static double DYYYPreparedPlaybackSpeedForPlayer(id playerViewController) {
     return DYYYConfiguredPlaybackSpeed();
 }
 
+// 最小范围倍速诊断：仅记录 speed-apply / 全屏横屏进入时的播放器类名，写文件供真机读取
+// （frida 不可用、dylib NSLog 不被 oslog 捕获，只能写文件拿证据）
+static void DYYYSpeedDiag(NSString *msg) {
+    @try {
+        NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DYYY"];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *path = [dir stringByAppendingPathComponent:@"speed_diag.log"];
+        NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (fh) {
+            [fh seekToEndOfFile];
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        } else {
+            [msg writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+    } @catch (__unused NSException *e) {}
+}
+
+// 进全屏/横屏时，按已知三个播放器类在视图层级里找当前播放器并把默认倍速重新焊上（幂等）
+static void DYYYReapplySpeedToCurrentPlayer(NSString *context) {
+    if (!DYYYShouldHandleSpeedFeatures()) {
+        return;
+    }
+    UIWindow *win = [DYYYUtils getActiveWindow];
+    UIViewController *root = win.rootViewController;
+    while (root && root.presentedViewController) {
+        root = root.presentedViewController;
+    }
+    NSMutableArray *found = [NSMutableArray array];
+    for (UIViewController *vc in (root ? findViewControllersInHierarchy(root) : @[])) {
+        if ([vc isKindOfClass:NSClassFromString(@"AWEAwemePlayVideoViewController")] ||
+            [vc isKindOfClass:NSClassFromString(@"AWEDPlayerFeedPlayerViewController")] ||
+            [vc isKindOfClass:NSClassFromString(@"AWEDPlayerViewController_Merge")]) {
+            [found addObject:NSStringFromClass([vc class])];
+            DYYYApplyPreparedPlaybackSpeedToPlayer(vc);
+        }
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[reapply:%@] players=%@ handle=%d", context, found, (int)found.count]);
+}
+
 static void DYYYApplyPreparedPlaybackSpeedToPlayer(id playerViewController) {
     if (!DYYYShouldHandleSpeedFeatures() || !playerViewController || dyyyLongPressFastSpeedActive || dyyyLongPressLockedSpeedActive) {
         return;
     }
 
     double speed = DYYYPreparedPlaybackSpeedForPlayer(playerViewController);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[speed-apply] %@ speed=%.3f lp=%d lock=%d", NSStringFromClass([playerViewController class]), speed, dyyyLongPressFastSpeedActive, dyyyLongPressLockedSpeedActive]);
     void (^applyBlock)(void) = ^{
-      DYYYSetPlaybackRateOnTarget(playerViewController, speed);
+      BOOL ok = DYYYSetPlaybackRateOnTarget(playerViewController, speed);
+      DYYYSpeedDiag([NSString stringWithFormat:@"[speed-done] %@ rate=%.3f applied=%d", NSStringFromClass([playerViewController class]), speed, ok]);
     };
     if ([NSThread isMainThread]) {
         applyBlock();
@@ -2952,6 +2996,11 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
     if (!gFeedCV) {
         gFeedCV = [DYYYUtils findSubviewOfClass:[UICollectionView class] inContainer:self.view];
     }
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    DYYYReapplySpeedToCurrentPlayer(@"landscape");
 }
 %end
 
@@ -7382,6 +7431,11 @@ static void DYYYLiveDurationInstallFromInnerFeedCell(id cell) {
         return %orig;
     }
     return NO;
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    DYYYReapplySpeedToCurrentPlayer(@"fullscreen");
 }
 %end
 
