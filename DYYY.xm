@@ -3441,7 +3441,7 @@ static void DYYYTriggerBackButton(UIButton *back) {
                     if ([actionVal isKindOfClass:[NSString class]]) {
                         sel = NSSelectorFromString(actionVal);
                     } else if (actionVal) {
-                        sel = (__bridge SEL)actionVal;
+                        sel = (SEL)(__bridge void *)actionVal;
                     }
                     if (target && sel && [target respondsToSelector:sel]) {
                         ((void (*)(id, SEL, id))objc_msgSend)(target, sel, g);
