@@ -759,11 +759,15 @@ static void DYYYProbeEngineSpeedEntry(void) {
             }
             DYYYSpeedDiag([NSString stringWithFormat:@"[probe] %@ methods=%@ (total %u)", clsName, hits, count]);
 
-            // 自动钩取作用类：两个引擎类 + Merge VC；控制器类由 Logos hook 负责
-            BOOL isHookable = [clsName isEqualToString:@"TTVideoEngine"] ||
-                              [clsName isEqualToString:@"TTVideoEngineOwnPlayer"] ||
-                              [clsName isEqualToString:@"AWEDPlayerViewController_Merge"];
-            if (!isHookable || !methods) {
+            // 自动钩取只保留实证命中的入口（多轮真机日志核对，老板指示：没命中的全删）：
+            //   ✅ TTVideoEngineOwnPlayer.setPlayerPlaybackSpeed: —— 唯一被证实真正驱动内核速率的 setter
+            //   ✅ Merge 的 didChangePlaybackRate: 回调 —— 事件驱动重焊兜底（对回调 player 参数直接重焊）
+            //   ❌ 已删：TTVideoEngine.setPlaybackSpeed:（死方法，钳了内核照样 1.0）、
+            //           Merge.setPlaybackRate:（全程零命中）、AVPlayer.setRate:（零调用）、
+            //           setSpeedModeStartNewTimestamp:/setSpeedStartTimestamp:（时间戳误伤）
+            BOOL isOwnPlayer = [clsName isEqualToString:@"TTVideoEngineOwnPlayer"];
+            BOOL isMerge = [clsName isEqualToString:@"AWEDPlayerViewController_Merge"];
+            if ((!isOwnPlayer && !isMerge) || !methods) {
                 if (methods) {
                     free(methods);
                 }
@@ -776,14 +780,9 @@ static void DYYYProbeEngineSpeedEntry(void) {
                 NSString *lower = name.lowercaseString;
                 unsigned int nargs = method_getNumberOfArguments(m);
 
-                // ① 速率 setter 白名单：只钳这三个真实速率入口（探针实证），
-                //    严禁用 containsString("speed") 泛匹配——setSpeedModeStartNewTimestamp:
-                //    / setSpeedStartTimestamp: 这类时间戳 setter 会被误钳成 1.5 破坏抖音计时。
-                //    ⚠️ setter 返回 void('v')，不能用返回值过滤——上上版就是这里写错导致全部漏钩。
-                if (nargs == 3 && dyyyEngineSpeedSetHookCount < 16 &&
-                    ([lower isEqualToString:@"setplaybackspeed:"] ||
-                     [lower isEqualToString:@"setplayerplaybackspeed:"] ||
-                     [lower isEqualToString:@"setplaybackrate:"])) {
+                // ① 命中 setter：仅 OwnPlayer 的 setPlayerPlaybackSpeed:
+                if (isOwnPlayer && nargs == 3 && dyyyEngineSpeedSetHookCount < 16 &&
+                    [lower isEqualToString:@"setplayerplaybackspeed:"]) {
                     char *argType = method_copyArgumentType(m, 2);
                     char arg0 = argType ? argType[0] : 0;
                     if (argType) {
@@ -802,8 +801,8 @@ static void DYYYProbeEngineSpeedEntry(void) {
                     dyyyEngineSpeedSetHooks[dyyyEngineSpeedSetHookCount++] = entry;
                     DYYYSpeedDiag([NSString stringWithFormat:@"[probe] 钳 %@ %@ (%s)", clsName, name, isFloat ? "float" : "double"]);
                 }
-                // ② 速率变化回调：事件驱动兜底（参数含 f/d 才钩）
-                else if ([lower containsString:@"didchangeplaybackrate"] && nargs == 4 && dyyyEngineRateChangedHookCount < 4) {
+                // ② 速率变化回调（仅 Merge）：事件驱动兜底（参数含 f/d 才钩）
+                else if (isMerge && [lower containsString:@"didchangeplaybackrate"] && nargs == 4 && dyyyEngineRateChangedHookCount < 4) {
                     char *argType = method_copyArgumentType(m, 3); // 0=self 1=_cmd 2=player 3=rate
                     BOOL isFloat = argType && argType[0] == 'f';
                     BOOL isDouble = argType && argType[0] == 'd';
@@ -822,10 +821,9 @@ static void DYYYProbeEngineSpeedEntry(void) {
                     dyyyEngineRateChangedHooks[dyyyEngineRateChangedHookCount++] = entry;
                     DYYYSpeedDiag([NSString stringWithFormat:@"[probe] 监变化 %@ %@", clsName, name]);
                 }
-                // ③ 速率 getter 白名单：只看真实播放速率，避免网络速率等统计量刷屏
-                else if (nargs == 2 && dyyyEngineSpeedGetHookCount < 8 &&
-                         ([lower isEqualToString:@"playbackspeed"] || [lower isEqualToString:@"getplayspeed"] ||
-                          [lower isEqualToString:@"currentrate"] || [lower isEqualToString:@"playbackrate"])) {
+                // ③ 内核速率 getter（仅 OwnPlayer.playbackSpeed）：验证内核真实速率是否稳在目标值
+                else if (isOwnPlayer && nargs == 2 && dyyyEngineSpeedGetHookCount < 8 &&
+                         [lower isEqualToString:@"playbackspeed"]) {
                     char *retType = method_copyReturnType(m);
                     char ret0 = retType ? retType[0] : 0;
                     if (retType) {
@@ -3407,20 +3405,8 @@ static void DYYYApplyNormalPlaybackSpeedToNativeDPlayer(AWEDPlayerSpeedControlle
 
 %hook AWEDPlayerSpeedController
 
-// 拦截原生倍速控制器的 setPlaybackRate: —— 这才是 37.5 真正驱动播放速率的入口
-// （日志证实 AVPlayer.setRate: 在 37.5 根本不被调用，avplayer-setRate=0）。
-// 抖音进全屏/切视频时会用 setPlaybackRate:1.0 把速率重置，必须在这里钳回目标倍速，
-// 否则“全屏滑动就变”。仅对非长按、非自身施加(防递归)时钳制。
-- (void)setPlaybackRate:(float)rate {
-    if (DYYYShouldHandleSpeedFeatures() && !dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive && !dyyyApplyingNativeDPlayerSpeed) {
-        double target = DYYYConfiguredPlaybackSpeed();
-        if (target > 0.0 && fabs((double)rate - target) > 0.001) {
-            DYYYSpeedDiag([NSString stringWithFormat:@"[native-setPlaybackRate] req=%.3f -> %.3f", rate, target]);
-            rate = (float)target;
-        }
-    }
-    %orig(rate);
-}
+// setPlaybackRate: 钳制已删除：全程 [native-setPlaybackRate]=0，抖音从不经此方法重置速率
+// （真入口是 TTVideoEngineOwnPlayer.setPlayerPlaybackSpeed:，由引擎层探针钳制负责）。
 
 - (void)viewDidLoad {
     %orig;
@@ -3455,25 +3441,8 @@ static void DYYYApplyNormalPlaybackSpeedToNativeDPlayer(AWEDPlayerSpeedControlle
 // 必须在最底层按住。仅对 rate>0（正在播放）生效，暂停(rate=0)与长按倍速都不动。
 // 诊断：记录每一次 setRate: 请求的速率（按取整去重，避免刷屏），并显式标出被钳制的那次，
 // 用来确认原生到底有没有把 rate 重置回 1.0、钳制是否生效。
-%hook AVPlayer
-- (void)setRate:(float)rate {
-    if (DYYYShouldHandleSpeedFeatures()) {
-        double target = DYYYConfiguredPlaybackSpeed();
-        static float dyyyLastLoggedRate = -1.0f;
-        float rounded = roundf(rate * 100.0f) / 100.0f;
-        if (fabs(rounded - dyyyLastLoggedRate) > 0.001f) {
-            dyyyLastLoggedRate = rounded;
-            DYYYSpeedDiag([NSString stringWithFormat:@"[avplayer-setRate] req=%.3f target=%.3f lp=%d",
-                rate, target, (dyyyLongPressFastSpeedActive || dyyyLongPressLockedSpeedActive)]);
-        }
-        if (!dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive && rate > 0.01f && target > 0.0 && fabs((double)rate - target) > 0.001) {
-            DYYYSpeedDiag([NSString stringWithFormat:@"[avplayer-clamp] %.3f -> %.3f", rate, target]);
-            rate = (float)target;
-        }
-    }
-    %orig(rate);
-}
-%end
+// AVPlayer setRate: 钳制已删除：多轮实测日志 avplayer-setRate=0，37.5 播放速率
+// 完全不经过 AVPlayer（真入口是 TTVideoEngineOwnPlayer.setPlayerPlaybackSpeed:）。
 
 %hook UICollectionView
 
