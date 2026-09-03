@@ -3309,173 +3309,22 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
 %end
 
 // === 新功能：横屏全屏禁用竖滑调音量/亮度（锁屏按钮保留不动） ===
-// 老板需求：全屏左右两侧上下滑动分别调音量/亮度，全部禁掉；锁屏按钮点击要一直生效。
-// 方案（效果层拦截，不猜手势类名）：在 UIScreen.setBrightness: / AVSystemController
-// setVolumeTo:forCategory: 这两个最终入口上拦——不管原生手势挂在哪个 view/recognizer，
-// 调节最终都会走这两个调用，拦效果 100% 覆盖；锁屏按钮不碰这两个调用，不受影响。
-// 只在横屏（宽>高）时拦截，竖屏完全不碰。DYYY 自己的横屏边缘手势（DYYYVideoGesture）
-// 通过打标放行，不受影响。附带一次性取证：
-// ① [gscan] 进横屏前 2 次扫手势树（谁挂了 pan、delegate 是谁）；
-// ② [volscan] 扫一次抖音二进制里 Volume/Brightness/Light/Slider 相关类名；
-// ③ [bright-set]/[vol-set] 每次真实调节记一笔（0.5s 节流），标明 DYYY 自己 or 原生。
-// 所有探针都是一次性或事件触发，无常驻轮询开销。
-static BOOL dyyyTagBrightFromDYYYGesture = NO;
-static BOOL dyyyTagVolumeFromDYYYGesture = NO;
-
+// 老板需求：全屏左右两侧上下滑动调音量/亮度全部禁掉，锁屏按钮一直生效。
+// 最终落地（真机日志实锤）：
+// ① AWEDPlayerInteractionView 竖直 pan 不让 begin（[pan-block]，手势源头）；
+// ② AWELandscapeVolumeBrightnessContainer 音量/亮度按钮强制 hidden（点不到激活不了）；
+// ③ 隐形 MPVolumeView 私有滑杆触摸跟踪 + setValue 拦截（[slider-block]，音量真路径）；
+// ④ AWESystemVolumnManager.setVolumeView: 接管时 userInteractionEnabled=NO（[vol-view]）。
 // 横屏判定：当前活跃窗口宽>高即视为全屏/横屏（竖屏返回 NO，完全不拦）
 static BOOL DYYYIsLandscapeFullscreenNow(void) {
     UIWindow *win = [DYYYUtils getActiveWindow];
     return win != nil && win.bounds.size.width > win.bounds.size.height;
 }
 
-static void DYYYScanLandscapeGesturesOnce(UIViewController *vc) {
-    static int dyyyGestureScanCount = 0;
-    if (vc.view == nil || dyyyGestureScanCount >= 2) {
-        return;
-    }
-    dyyyGestureScanCount++;
-    NSMutableArray *lines = [NSMutableArray array];
-    // BFS 遍历手势树：只记挂了手势的节点（上限 400 个节点、防御性截断）
-    NSMutableArray *stack = [NSMutableArray arrayWithObject:vc.view];
-    int visited = 0;
-    while (stack.count > 0 && visited < 400) {
-        UIView *v = stack.firstObject;
-        [stack removeObjectAtIndex:0];
-        visited++;
-        NSArray *grs = v.gestureRecognizers;
-        if (grs.count > 0) {
-            for (UIGestureRecognizer *gr in grs) {
-                if (lines.count < 60) {
-                    [lines addObject:[NSString stringWithFormat:@"view=%@ frame=%@ gr=%@ delegate=%@",
-                        NSStringFromClass([v class]), NSStringFromCGRect(v.frame),
-                        NSStringFromClass([gr class]),
-                        gr.delegate ? NSStringFromClass([gr.delegate class]) : @"-"]];
-                }
-            }
-        }
-        [stack addObjectsFromArray:v.subviews];
-    }
-    DYYYSpeedDiag([NSString stringWithFormat:@"[gscan#%d] scanned=%d %@", dyyyGestureScanCount, visited, lines]);
-}
-
-// 音量真凶拦截：AWESystemVolumnManager.setVolumn:（抖音拼写就是 Volumn）。
-// 实测链：按钮 hidden 后原位置竖滑仍真调音量，[vol-set]（AVSystemController）零记录、
-// [pan-block] 拦了 interactionView 的竖滑也没用 → 音量走 MPVolumeView 私有滑杆
-// （vscan 实锤它持有 volumnViewSlider/p_createVolumeView）。参数类型没实锤，
-// 按 method encoding 运行时分派 float/double（引擎钳制同款做法），只拦横屏。
-static IMP dyyyVolMgrSetOrigF = NULL;
-static IMP dyyyVolMgrSetOrigD = NULL;
-
-static void dyyyVolMgrSetThunkF(id self, SEL _cmd, float v) {
-    if (DYYYIsLandscapeFullscreenNow()) {
-        static NSTimeInterval dyyyLastVolMgrLog = 0;
-        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-        if (now - dyyyLastVolMgrLog > 0.5) {
-            dyyyLastVolMgrLog = now;
-            DYYYSpeedDiag([NSString stringWithFormat:@"[vol-mgr] setVolumn:%.3f 已拦（横屏）", v]);
-        }
-        return;
-    }
-    if (dyyyVolMgrSetOrigF) {
-        ((void (*)(id, SEL, float))dyyyVolMgrSetOrigF)(self, _cmd, v);
-    }
-}
-
-static void dyyyVolMgrSetThunkD(id self, SEL _cmd, double v) {
-    if (DYYYIsLandscapeFullscreenNow()) {
-        static NSTimeInterval dyyyLastVolMgrLog = 0;
-        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-        if (now - dyyyLastVolMgrLog > 0.5) {
-            dyyyLastVolMgrLog = now;
-            DYYYSpeedDiag([NSString stringWithFormat:@"[vol-mgr] setVolumn:%.3f 已拦（横屏）", v]);
-        }
-        return;
-    }
-    if (dyyyVolMgrSetOrigD) {
-        ((void (*)(id, SEL, double))dyyyVolMgrSetOrigD)(self, _cmd, v);
-    }
-}
-
-static void DYYYHookVolMgrSetVolumnOnce(void) {
-    @try {
-        Class volMgr = NSClassFromString(@"AWESystemVolumnManager");
-        SEL sel = NSSelectorFromString(@"setVolumn:");
-        if (!volMgr) {
-            DYYYSpeedDiag(@"[vol-mgr] AWESystemVolumnManager class=nil");
-            return;
-        }
-        Method m = class_getInstanceMethod(volMgr, sel);
-        if (!m) {
-            DYYYSpeedDiag(@"[vol-mgr] setVolumn: 方法不存在");
-            return;
-        }
-        char *argType = method_copyArgumentType(m, 2);
-        char a0 = argType ? argType[0] : 0;
-        if (argType) {
-            free(argType);
-        }
-        if (a0 == 'f') {
-            MSHookMessageEx(volMgr, sel, (IMP)dyyyVolMgrSetThunkF, &dyyyVolMgrSetOrigF);
-            DYYYSpeedDiag(@"[vol-mgr] 钩住 setVolumn: (float)");
-        } else if (a0 == 'd') {
-            MSHookMessageEx(volMgr, sel, (IMP)dyyyVolMgrSetThunkD, &dyyyVolMgrSetOrigD);
-            DYYYSpeedDiag(@"[vol-mgr] 钩住 setVolumn: (double)");
-        } else {
-            DYYYSpeedDiag([NSString stringWithFormat:@"[vol-mgr] setVolumn: 参数类型 %c 不认识，不钩", a0]);
-        }
-    } @catch (__unused NSException *e) {
-        DYYYSpeedDiag(@"[vol-mgr] hook exception");
-    }
-}
-
-static void DYYYScanVolBrightClassesOnce(void) {
-    static BOOL dyyyVolClassScanned = NO;
-    if (dyyyVolClassScanned) {
-        return;
-    }
-    dyyyVolClassScanned = YES;
-    // 音量真凶拦截先装上（横屏禁竖滑调音量的最终兜底）
-    DYYYHookVolMgrSetVolumnOnce();
-    // 嫌疑类方法清单一次性 dump（供下一轮精准补刀用）：
-    // 日志实锤原生音量不走 AVSystemController（[vol-set] 只有 DYYY 边缘手势记录），
-    // 疑走 MPVolumeView 私有滑杆（AWESystemVolumnManager / MPVolumeViewAspectInjector）
-    NSArray *suspects = @[
-        @"AWEDPlayerInteractionView",
-        @"AWESystemVolumnManager",
-        @"AWELandscapeVolumeBrightnessContainer",
-        @"MPVolumeSlider",
-        @"MPVolumeView",
-        @"AWEPlayerVolumeAdjustSmartService",
-        @"AWEPlayerBrightnessAdjustSmartService"
-    ];
-    for (NSString *clsName in suspects) {
-        Class cls = NSClassFromString(clsName);
-        if (!cls) {
-            DYYYSpeedDiag([NSString stringWithFormat:@"[vscan] %@ class=nil", clsName]);
-            continue;
-        }
-        unsigned int count = 0;
-        Method *methods = class_copyMethodList(cls, &count);
-        NSMutableArray *hits = [NSMutableArray array];
-        for (unsigned int i = 0; i < count; i++) {
-            NSString *sel = NSStringFromSelector(method_getName(methods[i]));
-            NSString *l = sel.lowercaseString;
-            if ([l containsString:@"vol"] || [l containsString:@"bright"] ||
-                [l containsString:@"light"] || [l containsString:@"pan"] ||
-                [l containsString:@"gesture"] || [l containsString:@"swipe"] ||
-                [l containsString:@"slide"]) {
-                if (hits.count < 60) {
-                    [hits addObject:sel];
-                }
-            }
-        }
-        if (methods) {
-            free(methods);
-        }
-        DYYYSpeedDiag([NSString stringWithFormat:@"[vscan] %@ hits(%lu/%u)=%@", clsName, (unsigned long)hits.count, count, hits]);
-    }
-}
-
+// DYYY 自己边缘手势（DYYYVideoGesture）打标：置 YES 表示本次亮度/音量设置来自
+// DYYY 边缘手势，效果层拦截 hook 要放行（横屏下边缘手势已禁用，此打标为竖屏路径保留）
+static BOOL dyyyTagBrightFromDYYYGesture = NO;
+static BOOL dyyyTagVolumeFromDYYYGesture = NO;
 
 // === 全屏大返回键：原生返回按钮热区扩大 ===
 // 返回按钮 = AWENoxusHighlightButton（日志实锤：重写 touches 自行处理点击，
@@ -3522,9 +3371,6 @@ static void DYYYScanVolBrightClassesOnce(void) {
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     DYYYReapplySpeedToCurrentPlayer(@"landscape");
-    // 新功能取证：扫手势树 + 类名（各限 2 次/1 次，一次性开销）
-    DYYYScanLandscapeGesturesOnce(self);
-    DYYYScanVolBrightClassesOnce();
 }
 %end
 
