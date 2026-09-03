@@ -560,7 +560,10 @@ static void DYYYSpeedDiag(NSString *msg) {
             [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
             [fh closeFile];
         } else {
-            [msg writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            // 文件句柄打开失败时用整文件重写兜底——必须先读旧内容拼接，否则会覆盖掉之前的诊断行
+            NSString *existing = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+            NSString *combined = existing ? [existing stringByAppendingString:line] : line;
+            [combined writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
         }
     } @catch (__unused NSException *e) {}
 }
