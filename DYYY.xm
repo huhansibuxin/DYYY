@@ -3568,6 +3568,82 @@ static void DYYYScanVolBrightClassesOnce(void) {
 }
 %end
 
+// [slider-block] 音量真·真凶兜底：vscan 实锤 AWESystemVolumnManager 持有 volumnViewSlider
+// （系统私有 MPVolumeView 的滑杆），且 setVolumn: 钩上后零命中 → 抖音是把隐形 MPVolumeView
+// 盖在原按钮位置、slider 直接吃触摸（UISlider 走 UIControl 触摸跟踪，不是手势识别器，
+// pan-block 拦不到；也不走 manager 的 setVolumn:）。双管齐下：
+// ① beginTracking：横屏下 MPVolumeSlider 实例直接拒绝触摸跟踪 → 拖不动；
+// ② setValue:/setValue:animated:：横屏下 MPVolumeSlider 实例吞掉 → 程序化设置也死。
+// 全部按 isKindOfClass:MPVolumeSlider 过滤，普通 slider（UI 状态条等）完全不受影响。
+static Class dyyyMPVolumeSliderClass(void) {
+    static Class cls;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ cls = NSClassFromString(@"MPVolumeSlider"); });
+    return cls;
+}
+
+static BOOL dyyyIsSystemVolumeSlider(UISlider *slider) {
+    Class cls = dyyyMPVolumeSliderClass();
+    return cls && [slider isKindOfClass:cls];
+}
+
+%hook UISlider
+- (BOOL)beginTrackingWithTouch:(UITouch *)touch withEvent:(UIEvent *)event {
+    if (DYYYIsLandscapeFullscreenNow() && dyyyIsSystemVolumeSlider(self)) {
+        static NSTimeInterval dyyyLastSliderTouchLog = 0;
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if (now - dyyyLastSliderTouchLog > 0.5) {
+            dyyyLastSliderTouchLog = now;
+            DYYYSpeedDiag(@"[slider-block] MPVolumeSlider 触摸跟踪已拦（横屏）");
+        }
+        return NO;
+    }
+    return %orig;
+}
+- (void)setValue:(float)value {
+    if (DYYYIsLandscapeFullscreenNow() && dyyyIsSystemVolumeSlider(self)) {
+        static NSTimeInterval dyyyLastSliderSetLog = 0;
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if (now - dyyyLastSliderSetLog > 0.5) {
+            dyyyLastSliderSetLog = now;
+            DYYYSpeedDiag([NSString stringWithFormat:@"[slider-block] MPVolumeSlider setValue:%.3f 已拦（横屏）", value]);
+        }
+        return;
+    }
+    %orig;
+}
+- (void)setValue:(float)value animated:(BOOL)animated {
+    if (DYYYIsLandscapeFullscreenNow() && dyyyIsSystemVolumeSlider(self)) {
+        static NSTimeInterval dyyyLastSliderSetALog = 0;
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if (now - dyyyLastSliderSetALog > 0.5) {
+            dyyyLastSliderSetALog = now;
+            DYYYSpeedDiag([NSString stringWithFormat:@"[slider-block] MPVolumeSlider setValue:%.3f animated:%d 已拦（横屏）", value, animated]);
+        }
+        return;
+    }
+    %orig;
+}
+%end
+
+// ③ 咽喉点补刀：AWESystemVolumnManager.setVolumeView: 是抖音把音量视图交给 manager 的唯一入口
+// （vscan 实锤 setVolumeView:/volumeView/p_createVolumeView）。接管瞬间直接把整个视图
+// userInteractionEnabled=NO：触摸根本到不了 slider（哪怕 MPVolumeSlider 重写了
+// setValue/beginTracking 也无效）。竖屏不碰（本钩子只在它设置视图时执行一次，无横竖屏门控——
+// 该视图本来就只在横屏全屏用；若后续发现竖屏受影响再加门控）。
+%hook AWESystemVolumnManager
+- (void)setVolumeView:(UIView *)view {
+    %orig;
+    if (view && !view.userInteractionEnabled) {
+        return;
+    }
+    if (view) {
+        view.userInteractionEnabled = NO;
+        DYYYSpeedDiag(@"[vol-view] setVolumeView: 接管，userInteractionEnabled=NO");
+    }
+}
+%end
+
 // 竖滑手势源头拦截：老板实测按钮 hidden 后原位置"点一下+竖滑"仍能真调音量
 // （音量走 MPVolumeView 私有路径，效果层 AVSystemController 拦不到）。
 // 手势源头 = AWEDPlayerInteractionView 上的 UIPanGestureRecognizer（[gscan] 实锤
