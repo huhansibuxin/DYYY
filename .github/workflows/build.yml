@@ -98,9 +98,9 @@ jobs:
         run: |
           make package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1 -j$(sysctl -n hw.ncpu)
           mkdir -p packages
-          DEB=$(ls -t packages/*.deb | head -1)
+          DEB_ABS="$PWD/$(ls -t packages/*.deb | head -1)"
           rm -rf /tmp/dyyy_ext && mkdir -p /tmp/dyyy_ext
-          ( cd /tmp/dyyy_ext && ar -x "$PWD/$DEB" && tar -xf data.tar.* )
+          ( cd /tmp/dyyy_ext && ar -x "$DEB_ABS" && tar -xf data.tar.* )
           DYLIB=$(find /tmp/dyyy_ext -type f -name 'DYYY.dylib' | head -1)
           cp "$DYLIB" packages/DYYY.dylib
           lipo -info packages/DYYY.dylib
