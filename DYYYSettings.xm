@@ -3411,6 +3411,14 @@ void showDYYYSettingsVC(UIViewController *rootVC, BOOL hasAgreed) {
               @"imageName" : @"ic_phonearrowdown_outlined_20"
           },
           @{
+              @"identifier" : @"DYYYDiagLog",
+              @"title" : @"诊断日志",
+              @"subTitle" : @"关闭后 DYYY 停止写入全部调试日志（speed_diag.log），开启后恢复写入，实时生效",
+              @"detail" : @"",
+              @"cellType" : @37,
+              @"imageName" : @"ic_gearsimplify_outlined_20"
+          },
+          @{
               @"identifier" : @"DYYYDisableAutoEnterLive",
               @"title" : @"禁用自动进入直播",
               @"subTitle" : @"禁止顶栏直播下自动进入直播间",

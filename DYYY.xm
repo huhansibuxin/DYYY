@@ -549,8 +549,12 @@ static double DYYYPreparedPlaybackSpeedForPlayer(id playerViewController) {
 // （frida 不可用、dylib NSLog 不被 oslog 捕获，只能写文件拿证据）
 // 性能：文件打开/写入/关闭全部丢到后台串行队列，主线程只做一次字符串拼接；
 // 串行队列保证日志顺序与调用顺序一致，时间戳在调用时刻取。
+// 门控：设置页"诊断日志"开关（DYYYDiagLog，默认开）——关掉后所有 DYYY 日志停写、零文件 IO。
 static void DYYYSpeedDiag(NSString *msg) {
     @try {
+        if (!DYYYGetBool(@"DYYYDiagLog")) {
+            return;
+        }
         NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
         static dispatch_queue_t dyyyDiagWriteQueue;
         static dispatch_once_t dyyyDiagOnce;
@@ -3488,6 +3492,31 @@ static void DYYYScanVolBrightClassesOnce(void) {
         return YES; // 原生竖滑调音量：吞掉，假装设置成功
     }
     dyyyTagVolumeFromDYYYGesture = NO;
+    return %orig;
+}
+%end
+
+// 竖滑手势源头拦截：老板实测按钮 hidden 后原位置"点一下+竖滑"仍能真调音量
+// （音量走 MPVolumeView 私有路径，效果层 AVSystemController 拦不到）。
+// 手势源头 = AWEDPlayerInteractionView 上的 UIPanGestureRecognizer（[gscan] 实锤
+// delegate 就是它自己）。竖直分量>水平分量直接不让手势 begin：调节和滑块 UI 一起死；
+// 水平滑动放行，锁屏/暂停是 tap 手势不经过这里。
+// ⚠️ 编译坑：该类只有前向声明，self.frame/self.hidden/传 UIView* 参数都要强转 (UIView *)self。
+%hook AWEDPlayerInteractionView
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
+    if (DYYYIsLandscapeFullscreenNow() && [gestureRecognizer isKindOfClass:[UIPanGestureRecognizer class]]) {
+        CGPoint vel = [(UIPanGestureRecognizer *)gestureRecognizer velocityInView:(UIView *)self];
+        if (fabs(vel.y) > fabs(vel.x)) {
+            static NSTimeInterval dyyyLastPanBlockLog = 0;
+            NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+            if (now - dyyyLastPanBlockLog > 1.0) {
+                dyyyLastPanBlockLog = now;
+                DYYYSpeedDiag([NSString stringWithFormat:@"[pan-block] 竖滑已拦 vel=(%.0f,%.0f)",
+                    vel.x, vel.y]);
+            }
+            return NO;
+        }
+    }
     return %orig;
 }
 %end
@@ -13857,7 +13886,8 @@ static void findTargetViewInView(UIView *view) {
 
 %ctor {
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
-        @"DYYYDisableFeedNowPlayingInfo" : @YES
+        @"DYYYDisableFeedNowPlayingInfo" : @YES,
+        @"DYYYDiagLog" : @YES
     }];
 
     DYYYMigrateCombinedHDRModeIfNeeded();
