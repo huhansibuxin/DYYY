@@ -3288,6 +3288,86 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
 
 %end
 
+// === 全屏大返回键：左上半区任意点按 = 返回 ===
+// 原理：在横屏/全屏容器视图上盖一块透明 UIControl（左半宽 × 上半高），
+// 点按结束时直接触发左上角返回按钮的 touchUpInside（覆盖该区域内其他按钮，老板已确认无所谓）。
+// 返回按钮识别：视图层级里最靠左上的可见 UIButton（minX/minY < 130，尺寸 >= 15）。
+// 开关：DYYYFullScreenBigBack（设置页"全屏大返回键"）。
+@interface DYYYBigBackOverlay : UIControl
+@property (nonatomic, weak) UIButton *backButton;
+@end
+
+@implementation DYYYBigBackOverlay
+- (void)endTrackingWithTouch:(UITouch *)touch withEvent:(UIEvent *)event {
+    [super endTrackingWithTouch:touch withEvent:event];
+    UIButton *back = self.backButton;
+    if (back && !back.hidden && back.window && back.alpha > 0.05) {
+        [back sendActionsForControlEvents:UIControlEventTouchUpInside];
+    }
+}
+@end
+
+static UIButton *DYYYFindTopLeftBackButton(UIView *root) {
+    UIButton *best = nil;
+    CGFloat bestScore = CGFLOAT_MAX;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+    while (stack.count > 0) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
+        for (UIView *sub in view.subviews) {
+            [stack addObject:sub];
+        }
+        if (![view isKindOfClass:[UIButton class]]) {
+            continue;
+        }
+        UIButton *button = (UIButton *)view;
+        if (button.hidden || button.alpha < 0.05 || !button.userInteractionEnabled || button.tag == 0xD9BB) {
+            continue;
+        }
+        CGRect frame = [button convertRect:button.bounds toView:root];
+        if (frame.minX < -5 || frame.minY < -5 || frame.minX > 130 || frame.minY > 130) {
+            continue;
+        }
+        if (frame.size.width < 15 || frame.size.height < 15) {
+            continue;
+        }
+        CGFloat score = frame.minX + frame.minY;
+        if (score < bestScore) {
+            bestScore = score;
+            best = button;
+        }
+    }
+    return best;
+}
+
+static void DYYYInstallBigBackOverlay(UIViewController *viewController) {
+    if (!viewController || !viewController.view) {
+        return;
+    }
+    if (!DYYYGetBool(@"DYYYFullScreenBigBack")) {
+        return;
+    }
+
+    UIView *container = viewController.view;
+    DYYYBigBackOverlay *overlay = (DYYYBigBackOverlay *)[container viewWithTag:0xD9BB];
+    if (!overlay || ![overlay isKindOfClass:[DYYYBigBackOverlay class]]) {
+        overlay = [[DYYYBigBackOverlay alloc] initWithFrame:CGRectMake(0, 0, container.bounds.size.width * 0.5, container.bounds.size.height * 0.5)];
+        overlay.tag = 0xD9BB;
+        overlay.backgroundColor = [UIColor clearColor];
+        overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        overlay.userInteractionEnabled = YES;
+        [container addSubview:overlay];
+    }
+    overlay.frame = CGRectMake(0, 0, container.bounds.size.width * 0.5, container.bounds.size.height * 0.5);
+    [container bringSubviewToFront:overlay];
+    overlay.backButton = DYYYFindTopLeftBackButton(container);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[big-back] <%p> %@ back=%@ frame=%@",
+        container,
+        NSStringFromClass([viewController class]),
+        overlay.backButton ? NSStringFromClass([overlay.backButton class]) : @"nil",
+        NSStringFromRect(overlay.backButton ? overlay.backButton.frame : CGRectZero)]);
+}
+
 %hook AWELandscapeFeedViewController
 - (void)viewDidLoad {
     %orig;
@@ -3304,6 +3384,7 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     DYYYReapplySpeedToCurrentPlayer(@"landscape");
+    DYYYInstallBigBackOverlay(self);
 }
 %end
 
@@ -7758,6 +7839,7 @@ static void DYYYLiveDurationInstallFromInnerFeedCell(id cell) {
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     DYYYReapplySpeedToCurrentPlayer(@"fullscreen");
+    DYYYInstallBigBackOverlay(self);
 }
 %end
 
