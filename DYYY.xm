@@ -572,39 +572,96 @@ static void DYYYSpeedDiag(NSString *msg) {
 static void DYYYApplyPreparedPlaybackSpeedToPlayer(id playerViewController);
 
 // ===== 37.5 倍速引擎层探针 + 钳制 =====
-// 日志已实证：AVPlayer.setRate: 全场 0 次调用、原生 AWEDPlayerSpeedController.setPlaybackRate:
-// 无重置调用、setVideoControllerPlaybackRate: 是空操作 → 真实速率驱动大概率在 TTVideoEngine
-// 播放引擎层（抖音自研内核，非 AVPlayer）。首次播放时 dump 各关键类所有含 speed/rate 的
-// 方法名定位入口，并按真实 encoding 把引擎级 setPlaybackSpeed: 钳回目标倍速。
-static void (*dyyyOrigEngineSetSpeedF)(id, SEL, float) = NULL;
-static void dyyyEngineSetSpeedF(id self, SEL _cmd, float speed) {
+// 实证链：AVPlayer.setRate: 0 次调用、原生 setPlaybackRate: 无重置、setVideoControllerPlaybackRate:
+// 是空操作；af034f3 已证实 TTVideoEngine.setPlaybackSpeed: 是真实入口之一（req=1.000 重置
+// 10 次全被钳回 1.5），但用户实测速率仍回不到 1.5 → 引擎内部还有第二条重置路径绕过该选择器。
+// 本版三管齐下：① dump 各引擎类所有含 speed/rate 的方法名；② 自动钩住 TTVideoEngine/
+// TTVideoEngineOwnPlayer 上所有单参数数值型 speed setter，全部钳回目标倍速（按真实
+// encoding 分派 f/d，arm64 CGFloat=double 混用会读错寄存器）；③ 钩 speed getter，
+// 仅在值变化时记 [engine-state]，区分「另一条 setter 路径」vs「引擎内部自行回退」。
+typedef struct {
+    SEL sel;
+    IMP origF; // float 变体原始实现
+    IMP origD; // double 变体原始实现
+} DYYYEngineSpeedHookEntry;
+
+static DYYYEngineSpeedHookEntry dyyyEngineSpeedSetHooks[16];
+static int dyyyEngineSpeedSetHookCount = 0;
+static DYYYEngineSpeedHookEntry dyyyEngineSpeedGetHooks[8];
+static int dyyyEngineSpeedGetHookCount = 0;
+
+static IMP DYYYEngineHookOrigFor(DYYYEngineSpeedHookEntry *table, int count, SEL sel, BOOL wantDouble) {
+    for (int i = 0; i < count; i++) {
+        if (sel_isEqual(table[i].sel, sel)) {
+            return wantDouble ? table[i].origD : table[i].origF;
+        }
+    }
+    return NULL;
+}
+
+static void dyyyEngineSetSpeedThunkF(id self, SEL _cmd, float speed) {
+    IMP orig = DYYYEngineHookOrigFor(dyyyEngineSpeedSetHooks, dyyyEngineSpeedSetHookCount, _cmd, NO);
     float out = speed;
     if (DYYYShouldHandleSpeedFeatures() && !dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive && speed > 0.01f) {
         double target = DYYYConfiguredPlaybackSpeed();
         if (target > 0.0 && fabs((double)speed - target) > 0.001) {
-            DYYYSpeedDiag([NSString stringWithFormat:@"[engine-speed] setPlaybackSpeed: req=%.3f -> %.3f", (double)speed, target]);
+            DYYYSpeedDiag([NSString stringWithFormat:@"[engine-speed] %@ req=%.3f -> %.3f", NSStringFromSelector(_cmd), (double)speed, target]);
             out = (float)target;
         }
     }
-    dyyyOrigEngineSetSpeedF(self, _cmd, out);
+    if (orig) {
+        ((void (*)(id, SEL, float))orig)(self, _cmd, out);
+    }
 }
 
-static void (*dyyyOrigEngineSetSpeedD)(id, SEL, double) = NULL;
-static void dyyyEngineSetSpeedD(id self, SEL _cmd, double speed) {
+static void dyyyEngineSetSpeedThunkD(id self, SEL _cmd, double speed) {
+    IMP orig = DYYYEngineHookOrigFor(dyyyEngineSpeedSetHooks, dyyyEngineSpeedSetHookCount, _cmd, YES);
     double out = speed;
     if (DYYYShouldHandleSpeedFeatures() && !dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive && speed > 0.01) {
         double target = DYYYConfiguredPlaybackSpeed();
         if (target > 0.0 && fabs(speed - target) > 0.001) {
-            DYYYSpeedDiag([NSString stringWithFormat:@"[engine-speed] setPlaybackSpeed: req=%.3f -> %.3f", speed, target]);
+            DYYYSpeedDiag([NSString stringWithFormat:@"[engine-speed] %@ req=%.3f -> %.3f", NSStringFromSelector(_cmd), speed, target]);
             out = target;
         }
     }
-    dyyyOrigEngineSetSpeedD(self, _cmd, out);
+    if (orig) {
+        ((void (*)(id, SEL, double))orig)(self, _cmd, out);
+    }
+}
+
+// getter 只做状态记录（值变化才写），用于判断引擎真实速率何时回退
+static void DYYYReportEngineSpeedRead(NSString *selName, double value) {
+    static double dyyyLastEngineSpeedSeen = -999.0;
+    if (fabs(value - dyyyLastEngineSpeedSeen) > 0.001) {
+        dyyyLastEngineSpeedSeen = value;
+        DYYYSpeedDiag([NSString stringWithFormat:@"[engine-state] %@=%.3f", selName, value]);
+    }
+}
+
+static float dyyyEngineGetSpeedThunkF(id self, SEL _cmd) {
+    IMP orig = DYYYEngineHookOrigFor(dyyyEngineSpeedGetHooks, dyyyEngineSpeedGetHookCount, _cmd, NO);
+    float v = orig ? ((float (*)(id, SEL))orig)(self, _cmd) : 0.0f;
+    DYYYReportEngineSpeedRead(NSStringFromSelector(_cmd), (double)v);
+    return v;
+}
+
+static double dyyyEngineGetSpeedThunkD(id self, SEL _cmd) {
+    IMP orig = DYYYEngineHookOrigFor(dyyyEngineSpeedGetHooks, dyyyEngineSpeedGetHookCount, _cmd, YES);
+    double v = orig ? ((double (*)(id, SEL))orig)(self, _cmd) : 0.0;
+    DYYYReportEngineSpeedRead(NSStringFromSelector(_cmd), v);
+    return v;
 }
 
 static void DYYYProbeEngineSpeedEntry(void) {
     @try {
-        NSArray *classNames = @[@"TTVideoEngine", @"AWEDPlayerSpeedController", @"AWEDPlayerViewController_Merge"];
+        NSArray *classNames = @[
+            @"TTVideoEngine",
+            @"TTVideoEngineOwnPlayer",
+            @"TTVideoEngineInternal",
+            @"TTVideoEngineAbstrator",
+            @"AWEDPlayerSpeedController",
+            @"AWEDPlayerViewController_Merge"
+        ];
         for (NSString *clsName in classNames) {
             Class cls = NSClassFromString(clsName);
             if (!cls) {
@@ -621,35 +678,56 @@ static void DYYYProbeEngineSpeedEntry(void) {
                     [hits addObject:sel];
                 }
             }
-            if (methods) {
-                free(methods);
-            }
             DYYYSpeedDiag([NSString stringWithFormat:@"[probe] %@ methods=%@ (total %u)", clsName, hits, count]);
-        }
 
-        Class engine = NSClassFromString(@"TTVideoEngine");
-        if (!engine) {
-            return;
+            // 自动钩取只作用于两个引擎类，VC/控制器类只 dump 不动
+            BOOL isEngineClass = [clsName isEqualToString:@"TTVideoEngine"] || [clsName isEqualToString:@"TTVideoEngineOwnPlayer"];
+            if (!isEngineClass || !methods) {
+                if (methods) {
+                    free(methods);
+                }
+                continue;
+            }
+            for (unsigned int i = 0; i < count; i++) {
+                Method m = methods[i];
+                SEL s = method_getName(m);
+                NSString *name = NSStringFromSelector(s);
+                NSString *lower = name.lowercaseString;
+                char *retType = method_copyReturnType(m);
+                char ret0 = retType ? retType[0] : 0;
+                if (retType) {
+                    free(retType);
+                }
+                if (ret0 != 'f' && ret0 != 'd') {
+                    continue; // 只碰数值型，BOOL/对象一律不动
+                }
+                if ([name hasPrefix:@"set"] && [lower containsString:@"speed"] && method_getNumberOfArguments(m) == 3 && dyyyEngineSpeedSetHookCount < 16) {
+                    char *argType = method_copyArgumentType(m, 2);
+                    BOOL isFloat = argType && argType[0] == 'f';
+                    if (argType) {
+                        free(argType);
+                    }
+                    DYYYEngineSpeedHookEntry entry = {s, NULL, NULL};
+                    if (isFloat) {
+                        MSHookMessageEx(cls, s, (IMP)dyyyEngineSetSpeedThunkF, &entry.origF);
+                    } else {
+                        MSHookMessageEx(cls, s, (IMP)dyyyEngineSetSpeedThunkD, &entry.origD);
+                    }
+                    dyyyEngineSpeedSetHooks[dyyyEngineSpeedSetHookCount++] = entry;
+                    DYYYSpeedDiag([NSString stringWithFormat:@"[probe] 钳 %@ %@ (%s)", clsName, name, isFloat ? "float" : "double"]);
+                } else if (![name hasPrefix:@"set"] && [lower containsString:@"speed"] && method_getNumberOfArguments(m) == 2 && dyyyEngineSpeedGetHookCount < 8) {
+                    DYYYEngineSpeedHookEntry entry = {s, NULL, NULL};
+                    if (ret0 == 'f') {
+                        MSHookMessageEx(cls, s, (IMP)dyyyEngineGetSpeedThunkF, &entry.origF);
+                    } else {
+                        MSHookMessageEx(cls, s, (IMP)dyyyEngineGetSpeedThunkD, &entry.origD);
+                    }
+                    dyyyEngineSpeedGetHooks[dyyyEngineSpeedGetHookCount++] = entry;
+                    DYYYSpeedDiag([NSString stringWithFormat:@"[probe] 监 %@ %@ (%s)", clsName, name, ret0 == 'f' ? "float" : "double"]);
+                }
+            }
+            free(methods);
         }
-        SEL sel = NSSelectorFromString(@"setPlaybackSpeed:");
-        Method m = class_getInstanceMethod(engine, sel);
-        if (!m) {
-            DYYYSpeedDiag(@"[probe] TTVideoEngine setPlaybackSpeed: 不存在");
-            return;
-        }
-        // 按真实参数类型选 float/double 变体（arm64 上 CGFloat=double，混用会读错寄存器）
-        char *argType = method_copyArgumentType(m, 2); // 0=self 1=_cmd 2=首个参数
-        BOOL isFloat = argType && argType[0] == 'f';
-        if (argType) {
-            DYYYSpeedDiag([NSString stringWithFormat:@"[probe] setPlaybackSpeed: argType=%s", argType]);
-            free(argType);
-        }
-        if (isFloat) {
-            MSHookMessageEx(engine, sel, (IMP)dyyyEngineSetSpeedF, (IMP *)&dyyyOrigEngineSetSpeedF);
-        } else {
-            MSHookMessageEx(engine, sel, (IMP)dyyyEngineSetSpeedD, (IMP *)&dyyyOrigEngineSetSpeedD);
-        }
-        DYYYSpeedDiag(@"[probe] TTVideoEngine setPlaybackSpeed: 钳制已安装");
     } @catch (__unused NSException *e) {
         DYYYSpeedDiag(@"[probe] exception");
     }
