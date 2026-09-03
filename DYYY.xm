@@ -568,6 +568,90 @@ static void DYYYSpeedDiag(NSString *msg) {
 // 前向声明（定义在下方）：避免全屏/横屏重焊函数反向引用未声明
 static void DYYYApplyPreparedPlaybackSpeedToPlayer(id playerViewController);
 
+// ===== 37.5 倍速引擎层探针 + 钳制 =====
+// 日志已实证：AVPlayer.setRate: 全场 0 次调用、原生 AWEDPlayerSpeedController.setPlaybackRate:
+// 无重置调用、setVideoControllerPlaybackRate: 是空操作 → 真实速率驱动大概率在 TTVideoEngine
+// 播放引擎层（抖音自研内核，非 AVPlayer）。首次播放时 dump 各关键类所有含 speed/rate 的
+// 方法名定位入口，并按真实 encoding 把引擎级 setPlaybackSpeed: 钳回目标倍速。
+static void (*dyyyOrigEngineSetSpeedF)(id, SEL, float) = NULL;
+static void dyyyEngineSetSpeedF(id self, SEL _cmd, float speed) {
+    float out = speed;
+    if (DYYYShouldHandleSpeedFeatures() && !dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive && speed > 0.01f) {
+        double target = DYYYConfiguredPlaybackSpeed();
+        if (target > 0.0 && fabs((double)speed - target) > 0.001) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[engine-speed] setPlaybackSpeed: req=%.3f -> %.3f", (double)speed, target]);
+            out = (float)target;
+        }
+    }
+    dyyyOrigEngineSetSpeedF(self, _cmd, out);
+}
+
+static void (*dyyyOrigEngineSetSpeedD)(id, SEL, double) = NULL;
+static void dyyyEngineSetSpeedD(id self, SEL _cmd, double speed) {
+    double out = speed;
+    if (DYYYShouldHandleSpeedFeatures() && !dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive && speed > 0.01) {
+        double target = DYYYConfiguredPlaybackSpeed();
+        if (target > 0.0 && fabs(speed - target) > 0.001) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[engine-speed] setPlaybackSpeed: req=%.3f -> %.3f", speed, target]);
+            out = target;
+        }
+    }
+    dyyyOrigEngineSetSpeedD(self, _cmd, out);
+}
+
+static void DYYYProbeEngineSpeedEntry(void) {
+    @try {
+        NSArray *classNames = @[@"TTVideoEngine", @"AWEDPlayerSpeedController", @"AWEDPlayerViewController_Merge"];
+        for (NSString *clsName in classNames) {
+            Class cls = NSClassFromString(clsName);
+            if (!cls) {
+                DYYYSpeedDiag([NSString stringWithFormat:@"[probe] %@ class=nil", clsName]);
+                continue;
+            }
+            unsigned int count = 0;
+            Method *methods = class_copyMethodList(cls, &count);
+            NSMutableArray *hits = [NSMutableArray array];
+            for (unsigned int i = 0; i < count; i++) {
+                NSString *sel = NSStringFromSelector(method_getName(methods[i]));
+                NSString *lower = sel.lowercaseString;
+                if ([lower containsString:@"speed"] || [lower containsString:@"rate"]) {
+                    [hits addObject:sel];
+                }
+            }
+            if (methods) {
+                free(methods);
+            }
+            DYYYSpeedDiag([NSString stringWithFormat:@"[probe] %@ methods=%@ (total %u)", clsName, hits, count]);
+        }
+
+        Class engine = NSClassFromString(@"TTVideoEngine");
+        if (!engine) {
+            return;
+        }
+        SEL sel = NSSelectorFromString(@"setPlaybackSpeed:");
+        Method m = class_getInstanceMethod(engine, sel);
+        if (!m) {
+            DYYYSpeedDiag(@"[probe] TTVideoEngine setPlaybackSpeed: 不存在");
+            return;
+        }
+        // 按真实参数类型选 float/double 变体（arm64 上 CGFloat=double，混用会读错寄存器）
+        char *argType = method_copyArgumentType(m, 2); // 0=self 1=_cmd 2=首个参数
+        BOOL isFloat = argType && argType[0] == 'f';
+        if (argType) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[probe] setPlaybackSpeed: argType=%s", argType]);
+            free(argType);
+        }
+        if (isFloat) {
+            MSHookMessageEx(engine, sel, (IMP)dyyyEngineSetSpeedF, (IMP *)&dyyyOrigEngineSetSpeedF);
+        } else {
+            MSHookMessageEx(engine, sel, (IMP)dyyyEngineSetSpeedD, (IMP *)&dyyyOrigEngineSetSpeedD);
+        }
+        DYYYSpeedDiag(@"[probe] TTVideoEngine setPlaybackSpeed: 钳制已安装");
+    } @catch (__unused NSException *e) {
+        DYYYSpeedDiag(@"[probe] exception");
+    }
+}
+
 // 进全屏/横屏时，按已知三个播放器类在视图层级里找当前播放器并把默认倍速重新焊上（幂等）
 static void DYYYReapplySpeedToCurrentPlayer(NSString *context) {
     if (!DYYYShouldHandleSpeedFeatures()) {
@@ -610,6 +694,8 @@ static void DYYYApplyPreparedPlaybackSpeedToPlayer(id playerViewController) {
             NSClassFromString(@"AWEDPlayerViewController_Merge") != nil,
             NSClassFromString(@"AVPlayer") != nil,
             DYYYConfiguredPlaybackSpeed()]);
+        // 引擎层探针：dump 速率相关方法 + 安装 TTVideoEngine.setPlaybackSpeed: 钳制（仅一次）
+        DYYYProbeEngineSpeedEntry();
     }
 
     double speed = DYYYPreparedPlaybackSpeedForPlayer(playerViewController);
