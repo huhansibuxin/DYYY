@@ -652,6 +652,54 @@ static double dyyyEngineGetSpeedThunkD(id self, SEL _cmd) {
     return v;
 }
 
+// 引擎上报速率变化回调（player:didChangePlaybackRate: / awePlayer:didChangePlaybackRate:）
+// —— 事件驱动兜底：引擎速率被内部路径重置回非目标值时立即重焊，不用轮询。
+static DYYYEngineSpeedHookEntry dyyyEngineRateChangedHooks[4];
+static int dyyyEngineRateChangedHookCount = 0;
+
+static void DYYYHandleRateChangedReport(id self, double rate, NSString *selName) {
+    if (!DYYYShouldHandleSpeedFeatures() || dyyyLongPressFastSpeedActive || dyyyLongPressLockedSpeedActive || rate <= 0.01) {
+        return;
+    }
+    double target = DYYYConfiguredPlaybackSpeed();
+    if (target <= 0.0 || fabs(rate - target) <= 0.001) {
+        return; // 已是目标速率（含我们钳制后的 1.5 上报），直接放行，防回环
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[rate-changed] %@ 上报 %.3f，重焊 %.3f", selName, rate, target]);
+    @try {
+        Method m = class_getInstanceMethod([self class], @selector(setPlaybackRate:));
+        if (!m) {
+            return;
+        }
+        char *at = method_copyArgumentType(m, 2);
+        BOOL isF = at && at[0] == 'f';
+        if (at) {
+            free(at);
+        }
+        if (isF) {
+            ((void (*)(id, SEL, float))objc_msgSend)(self, @selector(setPlaybackRate:), (float)target);
+        } else {
+            ((void (*)(id, SEL, double))objc_msgSend)(self, @selector(setPlaybackRate:), (double)target);
+        }
+    } @catch (__unused NSException *e) {}
+}
+
+static void dyyyEngineRateChangedThunkF(id self, SEL _cmd, id player, float rate) {
+    IMP orig = DYYYEngineHookOrigFor(dyyyEngineRateChangedHooks, dyyyEngineRateChangedHookCount, _cmd, NO);
+    if (orig) {
+        ((void (*)(id, SEL, id, float))orig)(self, _cmd, player, rate);
+    }
+    DYYYHandleRateChangedReport(self, (double)rate, NSStringFromSelector(_cmd));
+}
+
+static void dyyyEngineRateChangedThunkD(id self, SEL _cmd, id player, double rate) {
+    IMP orig = DYYYEngineHookOrigFor(dyyyEngineRateChangedHooks, dyyyEngineRateChangedHookCount, _cmd, YES);
+    if (orig) {
+        ((void (*)(id, SEL, id, double))orig)(self, _cmd, player, rate);
+    }
+    DYYYHandleRateChangedReport(self, rate, NSStringFromSelector(_cmd));
+}
+
 static void DYYYProbeEngineSpeedEntry(void) {
     @try {
         NSArray *classNames = @[
@@ -680,9 +728,11 @@ static void DYYYProbeEngineSpeedEntry(void) {
             }
             DYYYSpeedDiag([NSString stringWithFormat:@"[probe] %@ methods=%@ (total %u)", clsName, hits, count]);
 
-            // 自动钩取只作用于两个引擎类，VC/控制器类只 dump 不动
-            BOOL isEngineClass = [clsName isEqualToString:@"TTVideoEngine"] || [clsName isEqualToString:@"TTVideoEngineOwnPlayer"];
-            if (!isEngineClass || !methods) {
+            // 自动钩取作用类：两个引擎类 + Merge VC；控制器类由 Logos hook 负责
+            BOOL isHookable = [clsName isEqualToString:@"TTVideoEngine"] ||
+                              [clsName isEqualToString:@"TTVideoEngineOwnPlayer"] ||
+                              [clsName isEqualToString:@"AWEDPlayerViewController_Merge"];
+            if (!isHookable || !methods) {
                 if (methods) {
                     free(methods);
                 }
@@ -693,20 +743,21 @@ static void DYYYProbeEngineSpeedEntry(void) {
                 SEL s = method_getName(m);
                 NSString *name = NSStringFromSelector(s);
                 NSString *lower = name.lowercaseString;
-                char *retType = method_copyReturnType(m);
-                char ret0 = retType ? retType[0] : 0;
-                if (retType) {
-                    free(retType);
-                }
-                if (ret0 != 'f' && ret0 != 'd') {
-                    continue; // 只碰数值型，BOOL/对象一律不动
-                }
-                if ([name hasPrefix:@"set"] && [lower containsString:@"speed"] && method_getNumberOfArguments(m) == 3 && dyyyEngineSpeedSetHookCount < 16) {
+                unsigned int nargs = method_getNumberOfArguments(m);
+
+                // ① 速率 setter：set 开头 + 含 speed（或 Merge 的 setPlaybackRate:）+ 单参数。
+                //    ⚠️ setter 返回 void('v')，不能用返回值过滤——上一版就是这里写错导致全部漏钩。
+                if ([name hasPrefix:@"set"] && nargs == 3 && dyyyEngineSpeedSetHookCount < 16 &&
+                    ([lower containsString:@"speed"] || [lower isEqualToString:@"setplaybackrate:"])) {
                     char *argType = method_copyArgumentType(m, 2);
-                    BOOL isFloat = argType && argType[0] == 'f';
+                    char arg0 = argType ? argType[0] : 0;
                     if (argType) {
                         free(argType);
                     }
+                    if (arg0 != 'f' && arg0 != 'd') {
+                        continue; // 参数非浮点（BOOL/int/对象）一律不碰
+                    }
+                    BOOL isFloat = arg0 == 'f';
                     DYYYEngineSpeedHookEntry entry = {s, NULL, NULL};
                     if (isFloat) {
                         MSHookMessageEx(cls, s, (IMP)dyyyEngineSetSpeedThunkF, &entry.origF);
@@ -715,7 +766,39 @@ static void DYYYProbeEngineSpeedEntry(void) {
                     }
                     dyyyEngineSpeedSetHooks[dyyyEngineSpeedSetHookCount++] = entry;
                     DYYYSpeedDiag([NSString stringWithFormat:@"[probe] 钳 %@ %@ (%s)", clsName, name, isFloat ? "float" : "double"]);
-                } else if (![name hasPrefix:@"set"] && [lower containsString:@"speed"] && method_getNumberOfArguments(m) == 2 && dyyyEngineSpeedGetHookCount < 8) {
+                }
+                // ② 速率变化回调：事件驱动兜底（参数含 f/d 才钩）
+                else if ([lower containsString:@"didchangeplaybackrate"] && nargs == 4 && dyyyEngineRateChangedHookCount < 4) {
+                    char *argType = method_copyArgumentType(m, 3); // 0=self 1=_cmd 2=player 3=rate
+                    BOOL isFloat = argType && argType[0] == 'f';
+                    BOOL isDouble = argType && argType[0] == 'd';
+                    if (argType) {
+                        free(argType);
+                    }
+                    if (!isFloat && !isDouble) {
+                        continue;
+                    }
+                    DYYYEngineSpeedHookEntry entry = {s, NULL, NULL};
+                    if (isFloat) {
+                        MSHookMessageEx(cls, s, (IMP)dyyyEngineRateChangedThunkF, &entry.origF);
+                    } else {
+                        MSHookMessageEx(cls, s, (IMP)dyyyEngineRateChangedThunkD, &entry.origD);
+                    }
+                    dyyyEngineRateChangedHooks[dyyyEngineRateChangedHookCount++] = entry;
+                    DYYYSpeedDiag([NSString stringWithFormat:@"[probe] 监变化 %@ %@", clsName, name]);
+                }
+                // ③ 速率 getter 白名单：只看真实播放速率，避免网络速率等统计量刷屏
+                else if (nargs == 2 && dyyyEngineSpeedGetHookCount < 8 &&
+                         ([lower isEqualToString:@"playbackspeed"] || [lower isEqualToString:@"getplayspeed"] ||
+                          [lower isEqualToString:@"currentrate"] || [lower isEqualToString:@"playbackrate"])) {
+                    char *retType = method_copyReturnType(m);
+                    char ret0 = retType ? retType[0] : 0;
+                    if (retType) {
+                        free(retType);
+                    }
+                    if (ret0 != 'f' && ret0 != 'd') {
+                        continue;
+                    }
                     DYYYEngineSpeedHookEntry entry = {s, NULL, NULL};
                     if (ret0 == 'f') {
                         MSHookMessageEx(cls, s, (IMP)dyyyEngineGetSpeedThunkF, &entry.origF);
