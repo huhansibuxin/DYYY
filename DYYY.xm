@@ -3435,7 +3435,14 @@ static void DYYYTriggerBackButton(UIButton *back) {
                 NSArray *gTargets = [g valueForKey:@"targets"] ?: @[];
                 for (id info in gTargets) {
                     id target = [info valueForKey:@"target"];
-                    SEL sel = (SEL)[info valueForKey:@"action"];
+                    // KVC 拿到的是 objc_selector*（id 装载），ARC 下必须 __bridge 转 SEL
+                    id actionVal = [info valueForKey:@"action"];
+                    SEL sel = NULL;
+                    if ([actionVal isKindOfClass:[NSString class]]) {
+                        sel = NSSelectorFromString(actionVal);
+                    } else if (actionVal) {
+                        sel = (__bridge SEL)actionVal;
+                    }
                     if (target && sel && [target respondsToSelector:sel]) {
                         ((void (*)(id, SEL, id))objc_msgSend)(target, sel, g);
                         DYYYSpeedDiag([NSString stringWithFormat:@"[big-back] 手势直调 %@",
