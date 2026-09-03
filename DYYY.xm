@@ -3358,12 +3358,84 @@ static void DYYYScanLandscapeGesturesOnce(UIViewController *vc) {
     DYYYSpeedDiag([NSString stringWithFormat:@"[gscan#%d] scanned=%d %@", dyyyGestureScanCount, visited, lines]);
 }
 
+// 音量真凶拦截：AWESystemVolumnManager.setVolumn:（抖音拼写就是 Volumn）。
+// 实测链：按钮 hidden 后原位置竖滑仍真调音量，[vol-set]（AVSystemController）零记录、
+// [pan-block] 拦了 interactionView 的竖滑也没用 → 音量走 MPVolumeView 私有滑杆
+// （vscan 实锤它持有 volumnViewSlider/p_createVolumeView）。参数类型没实锤，
+// 按 method encoding 运行时分派 float/double（引擎钳制同款做法），只拦横屏。
+static IMP dyyyVolMgrSetOrigF = NULL;
+static IMP dyyyVolMgrSetOrigD = NULL;
+
+static void dyyyVolMgrSetThunkF(id self, SEL _cmd, float v) {
+    if (DYYYIsLandscapeFullscreenNow()) {
+        static NSTimeInterval dyyyLastVolMgrLog = 0;
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if (now - dyyyLastVolMgrLog > 0.5) {
+            dyyyLastVolMgrLog = now;
+            DYYYSpeedDiag([NSString stringWithFormat:@"[vol-mgr] setVolumn:%.3f 已拦（横屏）", v]);
+        }
+        return;
+    }
+    if (dyyyVolMgrSetOrigF) {
+        ((void (*)(id, SEL, float))dyyyVolMgrSetOrigF)(self, _cmd, v);
+    }
+}
+
+static void dyyyVolMgrSetThunkD(id self, SEL _cmd, double v) {
+    if (DYYYIsLandscapeFullscreenNow()) {
+        static NSTimeInterval dyyyLastVolMgrLog = 0;
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if (now - dyyyLastVolMgrLog > 0.5) {
+            dyyyLastVolMgrLog = now;
+            DYYYSpeedDiag([NSString stringWithFormat:@"[vol-mgr] setVolumn:%.3f 已拦（横屏）", v]);
+        }
+        return;
+    }
+    if (dyyyVolMgrSetOrigD) {
+        ((void (*)(id, SEL, double))dyyyVolMgrSetOrigD)(self, _cmd, v);
+    }
+}
+
+static void DYYYHookVolMgrSetVolumnOnce(void) {
+    @try {
+        Class volMgr = NSClassFromString(@"AWESystemVolumnManager");
+        SEL sel = NSSelectorFromString(@"setVolumn:");
+        if (!volMgr) {
+            DYYYSpeedDiag(@"[vol-mgr] AWESystemVolumnManager class=nil");
+            return;
+        }
+        Method m = class_getInstanceMethod(volMgr, sel);
+        if (!m) {
+            DYYYSpeedDiag(@"[vol-mgr] setVolumn: 方法不存在");
+            return;
+        }
+        char *argType = method_copyArgumentType(m, 2);
+        char a0 = argType ? argType[0] : 0;
+        if (argType) {
+            free(argType);
+        }
+        if (a0 == 'f') {
+            MSHookMessageEx(volMgr, sel, (IMP)dyyyVolMgrSetThunkF, &dyyyVolMgrSetOrigF);
+            DYYYSpeedDiag(@"[vol-mgr] 钩住 setVolumn: (float)");
+        } else if (a0 == 'd') {
+            MSHookMessageEx(volMgr, sel, (IMP)dyyyVolMgrSetThunkD, &dyyyVolMgrSetOrigD);
+            DYYYSpeedDiag(@"[vol-mgr] 钩住 setVolumn: (double)");
+        } else {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[vol-mgr] setVolumn: 参数类型 %c 不认识，不钩", a0]);
+        }
+    } @catch (__unused NSException *e) {
+        DYYYSpeedDiag(@"[vol-mgr] hook exception");
+    }
+}
+
 static void DYYYScanVolBrightClassesOnce(void) {
     static BOOL dyyyVolClassScanned = NO;
     if (dyyyVolClassScanned) {
         return;
     }
     dyyyVolClassScanned = YES;
+    // 音量真凶拦截先装上（横屏禁竖滑调音量的最终兜底）
+    DYYYHookVolMgrSetVolumnOnce();
     // 嫌疑类方法清单一次性 dump（供下一轮精准补刀用）：
     // 日志实锤原生音量不走 AVSystemController（[vol-set] 只有 DYYY 边缘手势记录），
     // 疑走 MPVolumeView 私有滑杆（AWESystemVolumnManager / MPVolumeViewAspectInjector）
