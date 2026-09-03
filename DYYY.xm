@@ -3503,13 +3503,13 @@ static void DYYYScanVolBrightClassesOnce(void) {
     if (!hidden && now - dyyyLastVolBtnLog > 1.0) {
         dyyyLastVolBtnLog = now;
         DYYYSpeedDiag([NSString stringWithFormat:@"[vol-btn] 拦截显示尝试，强制隐藏 frame=%@",
-            NSStringFromCGRect(self.frame)]);
+            NSStringFromCGRect(((UIView *)self).frame)]);
     }
     %orig(YES);
 }
 - (void)didMoveToWindow {
     %orig;
-    self.hidden = YES;
+    ((UIView *)self).hidden = YES;
 }
 %end
 
