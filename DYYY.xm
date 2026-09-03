@@ -3302,8 +3302,23 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
 // 前向声明（定义在 @implementation 之后）
 static UIButton *DYYYFindTopLeftBackButton(UIView *root);
 static void DYYYDumpTopLeftButtons(UIView *root);
+static void DYYYTriggerBackButton(UIButton *back);
 
 @implementation DYYYBigBackOverlay
+// 命中测试：触点落在原生返回按钮（外扩 30pt）内 → 返回 nil 穿透，
+// 让原生按钮自己处理触摸。铁律：绝不挡原生按钮——保底退出路径永远可用。
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *root = self.window ?: self;
+    UIButton *back = DYYYFindTopLeftBackButton(root);
+    if (back && back.window && !back.hidden && back.alpha > 0.05) {
+        CGRect frame = [back convertRect:back.bounds toView:self];
+        if (CGRectContainsPoint(CGRectInset(frame, -30, -30), point)) {
+            return nil;
+        }
+    }
+    return [super hitTest:point withEvent:event];
+}
+
 - (void)endTrackingWithTouch:(UITouch *)touch withEvent:(UIEvent *)event {
     [super endTrackingWithTouch:touch withEvent:event];
     // 点击时实时找（viewDidAppear 快照可能太早，返回按钮那时还没加载）
@@ -3311,7 +3326,7 @@ static void DYYYDumpTopLeftButtons(UIView *root);
     UIButton *back = DYYYFindTopLeftBackButton(root);
     if (back && !back.hidden && back.window && back.alpha > 0.05) {
         DYYYSpeedDiag([NSString stringWithFormat:@"[big-back] 命中 %@", NSStringFromClass([back class])]);
-        [back sendActionsForControlEvents:UIControlEventTouchUpInside];
+        DYYYTriggerBackButton(back);
     } else {
         DYYYSpeedDiag(@"[big-back] 未命中，dump 左上候选");
         DYYYDumpTopLeftButtons(root);
@@ -3383,6 +3398,61 @@ static void DYYYDumpTopLeftButtons(UIView *root) {
         }
         DYYYSpeedDiag([NSString stringWithFormat:@"[big-back-candidates] %lu 个: %@", (unsigned long)lines.count, lines]);
     } @catch (__unused NSException *e) {}
+}
+
+// 触发返回：Noxus 系按钮实测不吃 sendActionsForControlEvents（标准事件分发无效），
+// 按优先级依次尝试：① 直调 target-action（objc_msgSend）② 按钮/父视图上的 tap 手势
+// ③ 兜底 sendActions。拿到一条即返回，避免多重触发连退两层。
+static void DYYYTriggerBackButton(UIButton *back) {
+    @try {
+        // ① 直调 target-action
+        for (id target in [back allTargets]) {
+            NSArray *actions = [back actionsForTarget:target forControlEvent:UIControlEventTouchUpInside];
+            if (actions.count == 0) {
+                actions = [back actionsForTarget:target forControlEvent:UIControlEventValueChanged];
+            }
+            for (NSString *name in actions) {
+                SEL sel = NSSelectorFromString(name);
+                if (sel && [target respondsToSelector:sel]) {
+                    ((void (*)(id, SEL, id))objc_msgSend)(target, sel, back);
+                    DYYYSpeedDiag([NSString stringWithFormat:@"[big-back] 直调 %@.%@",
+                        NSStringFromClass([target class]), name]);
+                    return;
+                }
+            }
+        }
+        // ② tap 手势（KVC 私有 targets）
+        NSArray *gestures = back.gestureRecognizers;
+        UIView *parent = back.superview;
+        if (gestures.count == 0 && parent) {
+            gestures = parent.gestureRecognizers;
+        }
+        for (UIGestureRecognizer *g in gestures ?: @[]) {
+            if (![g isKindOfClass:[UITapGestureRecognizer class]] || !g.enabled) {
+                continue;
+            }
+            @try {
+                NSArray *gTargets = [g valueForKey:@"targets"] ?: @[];
+                for (id info in gTargets) {
+                    id target = [info valueForKey:@"target"];
+                    SEL sel = (SEL)[info valueForKey:@"action"];
+                    if (target && sel && [target respondsToSelector:sel]) {
+                        ((void (*)(id, SEL, id))objc_msgSend)(target, sel, g);
+                        DYYYSpeedDiag([NSString stringWithFormat:@"[big-back] 手势直调 %@",
+                            NSStringFromClass([target class])]);
+                        return;
+                    }
+                }
+            } @catch (__unused NSException *e) {
+                continue;
+            }
+        }
+        // ③ 兜底模拟事件（前两步都没拿到 target 时）
+        [back sendActionsForControlEvents:UIControlEventTouchUpInside];
+        DYYYSpeedDiag(@"[big-back] fallback sendActions");
+    } @catch (__unused NSException *e) {
+        DYYYSpeedDiag(@"[big-back] 触发异常");
+    }
 }
 
 static void DYYYInstallBigBackOverlay(UIViewController *viewController) {
