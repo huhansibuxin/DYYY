@@ -605,7 +605,7 @@ static void dyyyEngineSetSpeedThunkF(id self, SEL _cmd, float speed) {
     if (DYYYShouldHandleSpeedFeatures() && !dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive && speed > 0.01f) {
         double target = DYYYConfiguredPlaybackSpeed();
         if (target > 0.0 && fabs((double)speed - target) > 0.001) {
-            DYYYSpeedDiag([NSString stringWithFormat:@"[engine-speed] %@ req=%.3f -> %.3f", NSStringFromSelector(_cmd), (double)speed, target]);
+            DYYYSpeedDiag([NSString stringWithFormat:@"[engine-speed] <%p> %@.%@ req=%.3f -> %.3f", self, NSStringFromClass([self class]), NSStringFromSelector(_cmd), (double)speed, target]);
             out = (float)target;
         }
     }
@@ -620,7 +620,7 @@ static void dyyyEngineSetSpeedThunkD(id self, SEL _cmd, double speed) {
     if (DYYYShouldHandleSpeedFeatures() && !dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive && speed > 0.01) {
         double target = DYYYConfiguredPlaybackSpeed();
         if (target > 0.0 && fabs(speed - target) > 0.001) {
-            DYYYSpeedDiag([NSString stringWithFormat:@"[engine-speed] %@ req=%.3f -> %.3f", NSStringFromSelector(_cmd), speed, target]);
+            DYYYSpeedDiag([NSString stringWithFormat:@"[engine-speed] <%p> %@.%@ req=%.3f -> %.3f", self, NSStringFromClass([self class]), NSStringFromSelector(_cmd), speed, target]);
             out = target;
         }
     }
@@ -641,23 +641,63 @@ static void DYYYReportEngineSpeedRead(NSString *selName, double value) {
 static float dyyyEngineGetSpeedThunkF(id self, SEL _cmd) {
     IMP orig = DYYYEngineHookOrigFor(dyyyEngineSpeedGetHooks, dyyyEngineSpeedGetHookCount, _cmd, NO);
     float v = orig ? ((float (*)(id, SEL))orig)(self, _cmd) : 0.0f;
-    DYYYReportEngineSpeedRead(NSStringFromSelector(_cmd), (double)v);
+    DYYYReportEngineSpeedRead([NSString stringWithFormat:@"<%p> %@.%@", self, NSStringFromClass([self class]), NSStringFromSelector(_cmd)], (double)v);
     return v;
 }
 
 static double dyyyEngineGetSpeedThunkD(id self, SEL _cmd) {
     IMP orig = DYYYEngineHookOrigFor(dyyyEngineSpeedGetHooks, dyyyEngineSpeedGetHookCount, _cmd, YES);
     double v = orig ? ((double (*)(id, SEL))orig)(self, _cmd) : 0.0;
-    DYYYReportEngineSpeedRead(NSStringFromSelector(_cmd), v);
+    DYYYReportEngineSpeedRead([NSString stringWithFormat:@"<%p> %@.%@", self, NSStringFromClass([self class]), NSStringFromSelector(_cmd)], v);
     return v;
 }
 
 // 引擎上报速率变化回调（player:didChangePlaybackRate: / awePlayer:didChangePlaybackRate:）
 // —— 事件驱动兜底：引擎速率被内部路径重置回非目标值时立即重焊，不用轮询。
+// 重焊入口优先级（探针实证）：TTVideoEngineOwnPlayer.setPlayerPlaybackSpeed: 是唯一
+// 被证实真正驱动内核速率的入口（钳它之后 getter 立刻读到 1.5）；engine 包装层的
+// setPlaybackSpeed: 在 37.5 是死方法（钳后 getter 仍读 1.0）。回调的 player 参数就是
+// 播放器对象本身，直接对它重焊，不需要全局引用。
 static DYYYEngineSpeedHookEntry dyyyEngineRateChangedHooks[4];
 static int dyyyEngineRateChangedHookCount = 0;
 
-static void DYYYHandleRateChangedReport(id self, double rate, NSString *selName) {
+// 对 target 按 setPlayerPlaybackSpeed: > setPlaybackSpeed: > setPlaybackRate: 优先级
+// 施加速率，按真实 encoding 分派 float/double
+static void DYYYApplySpeedToObject(id target, double speed) {
+    if (!target) {
+        return;
+    }
+    @try {
+        SEL sels[3] = {
+            NSSelectorFromString(@"setPlayerPlaybackSpeed:"),
+            NSSelectorFromString(@"setPlaybackSpeed:"),
+            NSSelectorFromString(@"setPlaybackRate:")
+        };
+        for (int i = 0; i < 3; i++) {
+            if (![target respondsToSelector:sels[i]]) {
+                continue;
+            }
+            Method m = class_getInstanceMethod([target class], sels[i]);
+            if (!m) {
+                continue;
+            }
+            char *at = method_copyArgumentType(m, 2);
+            BOOL isF = at && at[0] == 'f';
+            if (at) {
+                free(at);
+            }
+            if (isF) {
+                ((void (*)(id, SEL, float))objc_msgSend)(target, sels[i], (float)speed);
+            } else {
+                ((void (*)(id, SEL, double))objc_msgSend)(target, sels[i], (double)speed);
+            }
+            DYYYSpeedDiag([NSString stringWithFormat:@"[reapply-via] <%p> %@ %@ -> %.3f", target, NSStringFromClass([target class]), NSStringFromSelector(sels[i]), speed]);
+            return;
+        }
+    } @catch (__unused NSException *e) {}
+}
+
+static void DYYYHandleRateChangedReport(id self, id player, double rate, NSString *selName) {
     if (!DYYYShouldHandleSpeedFeatures() || dyyyLongPressFastSpeedActive || dyyyLongPressLockedSpeedActive || rate <= 0.01) {
         return;
     }
@@ -665,23 +705,14 @@ static void DYYYHandleRateChangedReport(id self, double rate, NSString *selName)
     if (target <= 0.0 || fabs(rate - target) <= 0.001) {
         return; // 已是目标速率（含我们钳制后的 1.5 上报），直接放行，防回环
     }
-    DYYYSpeedDiag([NSString stringWithFormat:@"[rate-changed] %@ 上报 %.3f，重焊 %.3f", selName, rate, target]);
-    @try {
-        Method m = class_getInstanceMethod([self class], @selector(setPlaybackRate:));
-        if (!m) {
-            return;
-        }
-        char *at = method_copyArgumentType(m, 2);
-        BOOL isF = at && at[0] == 'f';
-        if (at) {
-            free(at);
-        }
-        if (isF) {
-            ((void (*)(id, SEL, float))objc_msgSend)(self, @selector(setPlaybackRate:), (float)target);
-        } else {
-            ((void (*)(id, SEL, double))objc_msgSend)(self, @selector(setPlaybackRate:), (double)target);
-        }
-    } @catch (__unused NSException *e) {}
+    DYYYSpeedDiag([NSString stringWithFormat:@"[rate-changed] <%p> %@ 上报 %.3f，重焊 %.3f", self, selName, rate, target]);
+    DYYYApplySpeedToObject(player, target);
+    // player 对象三条入口都不响应时，退回 Merge VC 自己的 setPlaybackRate:
+    if (player && !([player respondsToSelector:NSSelectorFromString(@"setPlayerPlaybackSpeed:")] ||
+                    [player respondsToSelector:NSSelectorFromString(@"setPlaybackSpeed:")] ||
+                    [player respondsToSelector:NSSelectorFromString(@"setPlaybackRate:")])) {
+        DYYYApplySpeedToObject(self, target);
+    }
 }
 
 static void dyyyEngineRateChangedThunkF(id self, SEL _cmd, id player, float rate) {
@@ -689,7 +720,7 @@ static void dyyyEngineRateChangedThunkF(id self, SEL _cmd, id player, float rate
     if (orig) {
         ((void (*)(id, SEL, id, float))orig)(self, _cmd, player, rate);
     }
-    DYYYHandleRateChangedReport(self, (double)rate, NSStringFromSelector(_cmd));
+    DYYYHandleRateChangedReport(self, player, (double)rate, NSStringFromSelector(_cmd));
 }
 
 static void dyyyEngineRateChangedThunkD(id self, SEL _cmd, id player, double rate) {
@@ -697,7 +728,7 @@ static void dyyyEngineRateChangedThunkD(id self, SEL _cmd, id player, double rat
     if (orig) {
         ((void (*)(id, SEL, id, double))orig)(self, _cmd, player, rate);
     }
-    DYYYHandleRateChangedReport(self, rate, NSStringFromSelector(_cmd));
+    DYYYHandleRateChangedReport(self, player, rate, NSStringFromSelector(_cmd));
 }
 
 static void DYYYProbeEngineSpeedEntry(void) {
@@ -745,10 +776,14 @@ static void DYYYProbeEngineSpeedEntry(void) {
                 NSString *lower = name.lowercaseString;
                 unsigned int nargs = method_getNumberOfArguments(m);
 
-                // ① 速率 setter：set 开头 + 含 speed（或 Merge 的 setPlaybackRate:）+ 单参数。
-                //    ⚠️ setter 返回 void('v')，不能用返回值过滤——上一版就是这里写错导致全部漏钩。
-                if ([name hasPrefix:@"set"] && nargs == 3 && dyyyEngineSpeedSetHookCount < 16 &&
-                    ([lower containsString:@"speed"] || [lower isEqualToString:@"setplaybackrate:"])) {
+                // ① 速率 setter 白名单：只钳这三个真实速率入口（探针实证），
+                //    严禁用 containsString("speed") 泛匹配——setSpeedModeStartNewTimestamp:
+                //    / setSpeedStartTimestamp: 这类时间戳 setter 会被误钳成 1.5 破坏抖音计时。
+                //    ⚠️ setter 返回 void('v')，不能用返回值过滤——上上版就是这里写错导致全部漏钩。
+                if (nargs == 3 && dyyyEngineSpeedSetHookCount < 16 &&
+                    ([lower isEqualToString:@"setplaybackspeed:"] ||
+                     [lower isEqualToString:@"setplayerplaybackspeed:"] ||
+                     [lower isEqualToString:@"setplaybackrate:"])) {
                     char *argType = method_copyArgumentType(m, 2);
                     char arg0 = argType ? argType[0] : 0;
                     if (argType) {
