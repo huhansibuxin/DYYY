@@ -4131,6 +4131,11 @@ static int DYYYBlockUpdateActionsInClass(Class cls) {
         if (nargs > 3) {
             continue; // 只处理无参/单参方法：多参常带 block 回调，签名复杂不动，防崩
         }
+        // 属性 getter 一律跳过：模型类里 requestParams / updateInfo 这类名字带动作词、
+        // 实为属性访问的方法，被置空返回 nil 会炸数据。class_getProperty 判一次，开销可忽略。
+        if (class_getProperty(cls, [name UTF8String])) {
+            continue;
+        }
         BOOL isAction = [l containsString:@"show"] || [l containsString:@"alert"] ||
                         [l containsString:@"present"] || [l containsString:@"popup"] ||
                         [l containsString:@"start"] || [l containsString:@"check"] ||
