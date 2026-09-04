@@ -4056,15 +4056,16 @@ static void DYYYApplyNormalPlaybackSpeedToNativeDPlayer(AWEDPlayerSpeedControlle
 //      update+awe / upgrade / appupdate），把它们的"动作型"方法（show/alert/present/popup/
 //      start/check/request/fetch/update/upgrade/install/appstore）按签名安全替换成空实现或
 //      返回 nil。只动无参/单对象参数 + void/id 返回的方法（签名明确，不会踩 block 回调的坑）。
-//   ② present 兜底：present 的是 UIAlertController / App Store 页，且文案命中更新关键词 → 不弹；
-//      非 alert 的自绘弹窗 VC 留痕类名（[upd-scan] present）。
-//   ③ window 兜底：直接加到 window 的浮层全量取证扫描（不再设面积门槛），严格命中→移除，
-//      宽松命中→[upd-loose] 留痕，其他→[upd-scan] 留痕。
-// 取证网（老板要求：下次再弹更新，日志必须抓到漏网类名）：
-//   [upd-classes] 被批量拦截的类清单；[upd-scan] alert/present/window 浮层类名+文案（限流）；
-//   [upd-loose] 宽松命中（文案含更新/升级/新版/版本但未进严格表）只留痕不删，供确认后补刀；
-//   [upd-url] App Store 跳转（openURL 兜底，弹窗若活到跳商店这一步这里必留痕）。
-// 性能：①启动后异步一次；②③④全部事件驱动（present/addSubview/openURL 才触发），
+//   ② present 兜底：present 的是 UIAlertController / App Store 页，且文案命中更新关键词 → 不弹。
+//   ③ window 兜底：直接加到 window 的浮层全量扫描（addSubview/insertSubview 双入口），
+//      严格命中→移除。
+//   ④ alert 收尸：UIAlertController viewDidAppear（私有 present 入口的最后必经点），
+//      严格命中→dismiss。实测弹窗为抖音自绘 + 私有 present，此层兜住漏网 alert。
+//   ⑤ openURL：App Store 域名跳转直接拦。
+// 日志只记拦截动作：[upd-classes] 冷启动拦截清单（一次）；[upd-block] 真拦到弹窗/商店页；
+//   [upd-badge] 红点。已按老板决定去掉全部"抓漏网"取证留痕（upd-scan/upd-loose/upd-candidates）——
+//   弹窗定性为抖音自绘，不再追类名。
+// 性能：①启动后异步一次；②~⑤全部事件驱动（present/addSubview/openURL/viewDidAppear 才触发），
 //   子树遍历有 view 级去重 + 每秒 6 次限流 + 80 节点/8 条文本封顶，无常驻开销。
 
 static BOOL DYYYIsUpdatePopupText(NSString *t) {
@@ -4117,23 +4118,7 @@ static NSString *DYYYUpdateCollectTexts(UIView *root) {
     return [texts componentsJoinedByString:@" | "];
 }
 
-// 宽松判定（老板实况：全屏播放时基本没有其他弹窗，弹出来多半就是更新弹窗；且抖音更新弹窗偏小）。
-// 只要浮层文案出现「更新/升级/新版/版本」任一即认。比严格表宽，日志用 [宽松] 标记，
-// 万一误拦一眼能从日志看出。注意：只对 window 浮层用（present 出来的 VC 如设置页
-// 本身含"版本号"字样，用宽松会被误伤，必须走严格判定）。
-static BOOL DYYYIsUpdatePopupTextLoose(NSString *t) {
-    if (t.length == 0 || t.length > 300) {
-        return NO;
-    }
-    return [t rangeOfString:@"更新"].location != NSNotFound ||
-           [t rangeOfString:@"升级"].location != NSNotFound ||
-           [t rangeOfString:@"新版"].location != NSNotFound ||
-           [t rangeOfString:@"版本"].location != NSNotFound;
-}
-
-// 取证扫描核心：对可疑浮层收集「类名 + 文案」，命中更新关键词返回 YES。
-// 覆盖盲区（旧版只查面积>40%的 window 浮层，小弹条/自绘弹窗 VC 全漏）：
-//   window 直接子 view、present 出来的自绘弹窗 VC、跳 App Store 的 openURL，一律留痕。
+// 取证扫描核心：对可疑浮层收集文案，命中更新关键词 → 拦截（removeFromSuperview）。
 // 性能：①每个 view 只处理一次（关联对象打标，重复 layout/bringSubviewToFront 不再遍历）；
 //       ②全局限流 1 秒内最多 6 次子树遍历；③子树遍历本身 80 节点/8 条文本封顶。
 // 全程事件驱动，无定时器无轮询，只在 DYYYNoUpdates 开启时被调用。
@@ -4161,29 +4146,13 @@ static BOOL DYYYForensicScan(UIView *v, NSString *where, BOOL allowRemove) {
     budget--;
 
     NSString *t = DYYYUpdateCollectTexts(v);
-    NSString *clsName = NSStringFromClass([v class]);
     if (DYYYIsUpdatePopupText(t)) {
         DYYYSpeedDiag([NSString stringWithFormat:@"[upd-block] 拦更新弹窗(%@) class=%@ text=%@",
-            where, clsName, t]);
+            where, NSStringFromClass([v class]), t]);
         if (allowRemove) {
             [v removeFromSuperview];
         }
         return YES;
-    }
-    // 宽松命中只留痕不删：「版本/更新」字样在正常 UI（设置页/功能说明）里也常见，
-    // 直接删误伤风险大。下次弹窗若日志出现 [upd-loose]，说明严格表缺这个词，照着补刀即可
-    if (allowRemove && DYYYIsUpdatePopupTextLoose(t)) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[upd-loose] 可疑更新浮层(%@) class=%@ text=%@",
-            where, clsName, t]);
-        return NO;
-    }
-    // 未命中也留痕：只要浮层里有文本就记（限流 2s），下次弹窗换文案也抓得到类名
-    if (t.length > 0) {
-        static NSTimeInterval lastScanLog = 0;
-        if (now - lastScanLog > 2.0) {
-            lastScanLog = now;
-            DYYYSpeedDiag([NSString stringWithFormat:@"[upd-scan] %@ class=%@ text=%@", where, clsName, t]);
-        }
     }
     return NO;
 }
@@ -4270,7 +4239,6 @@ static void DYYYBlockUpdateClassesOnce(void) {
         const char **names = img ? objc_copyClassNamesForImage(img, &total) : NULL;
         NSMutableArray *hits = [NSMutableArray array];
         NSMutableArray *hookedNames = [NSMutableArray array];
-        NSMutableArray *candidates = [NSMutableArray array]; // 类名含 update/upgrad 但没过语义过滤的，全量留痕排查漏网
         int hookedMethods = 0;
         for (unsigned int i = 0; i < total; i++) {
             NSString *n = [NSString stringWithUTF8String:names[i]];
@@ -4289,14 +4257,6 @@ static void DYYYBlockUpdateClassesOnce(void) {
                                ([l containsString:@"version"] || [l containsString:@"force"] ||
                                 [l containsString:@"account"]));
             if (!isUpdClass) {
-                // 取证：含 update/upgrad 语义但没过"版本"组合过滤的类全记下来
-                //（59ce6b7 实测：手动点"检查更新"弹窗绕过了全部取证网，
-                //  可能存在 AWEUpdateAlert* 这类没带 version 的漏网更新类）
-                if (candidates.count < 120 &&
-                    ([l containsString:@"update"] || [l containsString:@"upgrad"] ||
-                     [l containsString:@"appupdate"] || [l containsString:@"newversion"])) {
-                    [candidates addObject:n];
-                }
                 continue;
             }
             Class cls = NSClassFromString(n);
@@ -4311,22 +4271,9 @@ static void DYYYBlockUpdateClassesOnce(void) {
         }
         DYYYSpeedDiag([NSString stringWithFormat:@"[upd-classes] 拦截类=%lu 方法=%d 总类=%u 类=%@ 方法名=%@",
             (unsigned long)hits.count, hookedMethods, total, hits, hookedNames]);
-        DYYYSpeedDiag([NSString stringWithFormat:@"[upd-candidates] 未拦截候选=%@",
-            candidates]);
     } @catch (__unused NSException *e) {
         DYYYSpeedDiag(@"[upd-classes] exception");
     }
-}
-
-// 取证：弹窗类名+文案（限流 2s，供下一轮精准下刀）。where = 场景标记（alert / present）
-static void DYYYUpdateScanLog(NSString *where, NSString *clsName, NSString *text) {
-    static NSTimeInterval lastLog = 0;
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - lastLog < 2.0) {
-        return;
-    }
-    lastLog = now;
-    DYYYSpeedDiag([NSString stringWithFormat:@"[upd-scan] %@ %@ text=%@", where, clsName, text]);
 }
 
 %hook UIViewController
@@ -4352,22 +4299,17 @@ static void DYYYUpdateScanLog(NSString *where, NSString *clsName, NSString *text
                 }
                 return;
             }
-            DYYYUpdateScanLog(@"alert", clsName, t);
-        } else {
-            // 非 alert 的自绘弹窗 VC（老板实况：更新弹窗偏小，可能有自绘小弹条形态）：
-            // 不拦只留痕类名，下次弹窗日志必有线索
-            DYYYUpdateScanLog(@"present", clsName, viewControllerToPresent.title ?: @"");
         }
     }
     %orig;
 }
 %end
 
-// 取证网第四路：UIAlertController 显示成功的最后必经点。
+// 拦截网第四路：UIAlertController 显示成功的最后必经点。
 // 背景（59ce6b7 实测）：手动点"检查更新"弹的"发现新版本"弹窗绕过了 present hook
-// （零命中），说明抖音用了 presentViewController: 之外的私有 present 入口。
-// viewDidAppear 不管走哪条路都会到（此时 title/message 已就绪）：
-//   严格命中 → dismiss 收尸 + [upd-block]；否则 [upd-scan] alert-appear 留痕。
+//（零命中），说明抖音用了 presentViewController: 之外的私有 present 入口。
+// viewDidAppear 不管走哪条路都会到（此时 title/message 已就绪），
+// 严格命中 → dismiss 收尸 + [upd-block]。
 // 开销：alert 弹窗 app 内低频，viewDidAppear 只做一次字符串拼接判定，可忽略。
 %hook UIAlertController
 - (void)viewDidAppear:(BOOL)animated {
@@ -4384,11 +4326,11 @@ static void DYYYUpdateScanLog(NSString *where, NSString *clsName, NSString *text
         }
         DYYYSpeedDiag([NSString stringWithFormat:@"[upd-block] 拦更新弹窗(alert-didAppear) %@ actions=%@", t, acts]);
         [self dismissViewControllerAnimated:YES completion:nil];
-        return;
     }
-    DYYYUpdateScanLog(@"alert-appear", NSStringFromClass([self class]), t);
 }
 %end
+
+// 抖音设置里"检查更新"条目的红点（老板判据：真屏蔽了红点就该消失）。
 // 红点特征：小圆点（<=12pt、圆角≈半径）且附近有"更新"文本 → hidden=YES。
 // 前置判定只读 frame/cornerRadius（极便宜），只有小圆点才继续做文本遍历，无常驻开销。
 %hook UIView
