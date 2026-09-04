@@ -4186,11 +4186,18 @@ static void DYYYBlockUpdateClassesOnce(void) {
             NSString *n = [NSString stringWithUTF8String:names[i]];
             // 收紧：只要"版本更新"语义的类。抖音里 AWE*Update* 的数据/UI 刷新类一大堆
             // （AWEUserProfileUpdateHelper 之类），误拦会炸正常功能，所以必须限定 version/update 语义组合。
+            // 收紧再收紧：实测第一版含 "upgrad" 会误伤 IESIMGroupUpgrade*（群升级）、
+            // AEKUpgradeFilter*（剪辑滤镜升级）、CJPayECUpgrade*（支付免密升级）等无关类，
+            // 把它们的 show/start 置空 = 误伤正常功能。所以 "upgrad" 必须再叠加
+            // version/force/account 才认（真更新类 = AWEAccountForceUpgradeManager 这类）。
             NSString *l = n.lowercaseString;
             BOOL isUpdClass = [l containsString:@"versionupdate"] ||
                               ([l containsString:@"update"] && [l containsString:@"version"]) ||
-                              [l containsString:@"upgrad"] || [l containsString:@"appupdate"] ||
-                              [l containsString:@"newversion"];
+                              [l containsString:@"appupdate"] ||
+                              [l containsString:@"newversion"] ||
+                              ([l containsString:@"upgrad"] &&
+                               ([l containsString:@"version"] || [l containsString:@"force"] ||
+                                [l containsString:@"account"]));
             if (!isUpdClass) {
                 continue;
             }
