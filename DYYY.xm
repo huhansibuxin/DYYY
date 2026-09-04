@@ -4048,6 +4048,242 @@ static void DYYYApplyNormalPlaybackSpeedToNativeDPlayer(AWEDPlayerSpeedControlle
 
 %group DYYYSettingsGesture
 
+// ==================== 屏蔽抖音版本更新弹窗（加固版） ====================
+// 背景：原实现只拦 AWEVersionUpdateManager 的 startVersionUpdateWorkflow:/workflow/badgeModule
+// 三个口，但老板实测开关常开、更新弹窗仍偶发弹出 → 弹窗并不只从这三个口出来。
+// 加固三层，全部受 DYYYNoUpdates 开关控制：
+//   ① 源头：启动后异步扫描抖音主二进制里所有"更新"相关类（类名含 versionupdate /
+//      update+awe / upgrade / appupdate），把它们的"动作型"方法（show/alert/present/popup/
+//      start/check/request/fetch/update/upgrade/install/appstore）按签名安全替换成空实现或
+//      返回 nil。只动无参/单对象参数 + void/id 返回的方法（签名明确，不会踩 block 回调的坑）。
+//   ② present 兜底：present 的是 UIAlertController / App Store 页，且文案命中更新关键词 → 不弹。
+//   ③ window 兜底：直接加到 window、面积 > 屏幕 40% 的容器，下一帧查文案，命中就移除。
+// 取证：[upd-classes] 被批量拦截的类清单；[upd-scan] alert 弹窗类名+文案（限流）。
+// 性能：①启动后异步一次；②③只在弹窗出现时做有限遍历（先过尺寸/类型门槛，toast/HUD 零遍历）。
+
+static BOOL DYYYIsUpdatePopupText(NSString *t) {
+    if (t.length == 0 || t.length > 300) {
+        return NO;
+    }
+    static NSArray *keys;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        keys = @[@"新版本", @"版本更新", @"版本升级", @"发现新版本", @"立即更新", @"马上更新",
+                 @"前往更新", @"更新到最新", @"升级到最新", @"下载新版本", @"版本过旧", @"更新提示"];
+    });
+    for (NSString *k in keys) {
+        if ([t rangeOfString:k].location != NSNotFound) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+// 收集 view 子树里的可见文本（限节点数/条数，避免大子树遍历）
+static NSString *DYYYUpdateCollectTexts(UIView *root) {
+    if (!root) {
+        return @"";
+    }
+    NSMutableArray *texts = [NSMutableArray array];
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
+    int visited = 0;
+    while (stack.count > 0 && visited < 80 && texts.count < 8) {
+        UIView *v = stack.firstObject;
+        [stack removeObjectAtIndex:0];
+        visited++;
+        if ([v isKindOfClass:[UILabel class]]) {
+            NSString *t = ((UILabel *)v).text;
+            if (t.length > 0 && t.length < 100) {
+                [texts addObject:t];
+            }
+        } else if ([v isKindOfClass:[UIButton class]]) {
+            NSString *t = [(UIButton *)v titleForState:UIControlStateNormal];
+            if (t.length > 0 && t.length < 40) {
+                [texts addObject:t];
+            }
+        }
+        if (v.subviews.count > 0) {
+            [stack addObjectsFromArray:v.subviews];
+        }
+    }
+    return [texts componentsJoinedByString:@" | "];
+}
+
+// 单个类：把"动作型"简单方法替换成空实现 / nil
+static int DYYYBlockUpdateActionsInClass(Class cls) {
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    if (!methods) {
+        return 0;
+    }
+    int hooked = 0;
+    for (unsigned int i = 0; i < count; i++) {
+        Method m = methods[i];
+        SEL sel = method_getName(m);
+        NSString *name = NSStringFromSelector(sel);
+        NSString *l = name.lowercaseString;
+        // 状态查询类方法不动（返回语义重要，且不是动作）
+        if ([l hasPrefix:@"is"] || [l hasPrefix:@"has"] || [l hasPrefix:@"can"] ||
+            [l hasPrefix:@"should"] || [l hasPrefix:@"get"]) {
+            continue;
+        }
+        unsigned int nargs = method_getNumberOfArguments(m);
+        if (nargs > 3) {
+            continue; // 只处理无参/单参方法：多参常带 block 回调，签名复杂不动，防崩
+        }
+        BOOL isAction = [l containsString:@"show"] || [l containsString:@"alert"] ||
+                        [l containsString:@"present"] || [l containsString:@"popup"] ||
+                        [l containsString:@"start"] || [l containsString:@"check"] ||
+                        [l containsString:@"request"] || [l containsString:@"fetch"] ||
+                        [l containsString:@"update"] || [l containsString:@"upgrade"] ||
+                        [l containsString:@"install"] || [l containsString:@"appstore"];
+        if (!isAction) {
+            continue;
+        }
+        char *ret = method_copyReturnType(m);
+        char r0 = ret ? ret[0] : 0;
+        if (ret) {
+            free(ret);
+        }
+        IMP imp = NULL;
+        if (nargs == 2 && r0 == 'v') {
+            imp = imp_implementationWithBlock(^void(id s) {});
+        } else if (nargs == 2 && r0 == '@') {
+            imp = imp_implementationWithBlock(^id(id s) { return nil; });
+        } else if (nargs == 3 && r0 == 'v') {
+            imp = imp_implementationWithBlock(^void(id s, id a) {});
+        } else if (nargs == 3 && r0 == '@') {
+            imp = imp_implementationWithBlock(^id(id s, id a) { return nil; });
+        }
+        if (imp) {
+            MSHookMessageEx(cls, sel, imp, NULL);
+            hooked++;
+        }
+    }
+    free(methods);
+    return hooked;
+}
+
+// 源头：扫描抖音主二进制里所有"更新"相关类并批量拦截
+static void DYYYBlockUpdateClassesOnce(void) {
+    static BOOL dyyyUpdateClassesDone = NO;
+    if (dyyyUpdateClassesDone) {
+        return;
+    }
+    dyyyUpdateClassesDone = YES;
+    if (!DYYYGetBool(@"DYYYNoUpdates")) {
+        return;
+    }
+    @try {
+        // 以抖音自有类为锚点取其镜像，只扫主二进制（比 objc_copyClassList 全量扫快得多）
+        Class anchor = NSClassFromString(@"AWEVersionUpdateManager") ?: NSClassFromString(@"AWEFeedViewController");
+        const char *img = anchor ? class_getImageName(anchor) : NULL;
+        unsigned int total = 0;
+        const char **names = img ? objc_copyClassNamesForImage(img, &total) : NULL;
+        NSMutableArray *hits = [NSMutableArray array];
+        int hookedMethods = 0;
+        for (unsigned int i = 0; i < total; i++) {
+            NSString *n = [NSString stringWithUTF8String:names[i]];
+            // 收紧：只要"版本更新"语义的类。抖音里 AWE*Update* 的数据/UI 刷新类一大堆
+            // （AWEUserProfileUpdateHelper 之类），误拦会炸正常功能，所以必须限定 version/update 语义组合。
+            NSString *l = n.lowercaseString;
+            BOOL isUpdClass = [l containsString:@"versionupdate"] ||
+                              ([l containsString:@"update"] && [l containsString:@"version"]) ||
+                              [l containsString:@"upgrad"] || [l containsString:@"appupdate"] ||
+                              [l containsString:@"newversion"];
+            if (!isUpdClass) {
+                continue;
+            }
+            Class cls = NSClassFromString(n);
+            if (!cls || hits.count >= 60) {
+                continue;
+            }
+            hookedMethods += DYYYBlockUpdateActionsInClass(cls);
+            [hits addObject:n];
+        }
+        if (names) {
+            free(names);
+        }
+        DYYYSpeedDiag([NSString stringWithFormat:@"[upd-classes] 拦截类=%lu 方法=%d 总类=%u %@",
+            (unsigned long)hits.count, hookedMethods, total, hits]);
+    } @catch (__unused NSException *e) {
+        DYYYSpeedDiag(@"[upd-classes] exception");
+    }
+}
+
+// 取证：alert 弹窗类名+文案（限流 2s，供下一轮精准下刀）
+static void DYYYUpdateScanLog(NSString *clsName, NSString *text) {
+    static NSTimeInterval lastLog = 0;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - lastLog < 2.0) {
+        return;
+    }
+    lastLog = now;
+    DYYYSpeedDiag([NSString stringWithFormat:@"[upd-scan] alert %@ text=%@", clsName, text]);
+}
+
+%hook UIViewController
+- (void)presentViewController:(UIViewController *)viewControllerToPresent animated:(BOOL)flag completion:(void (^)(void))completion {
+    if (DYYYGetBool(@"DYYYNoUpdates") && viewControllerToPresent) {
+        NSString *clsName = NSStringFromClass([viewControllerToPresent class]);
+        // App Store 页（抖音更新会跳商店）直接拦
+        BOOL isStoreVC = [clsName containsString:@"SKStore"] || [clsName containsString:@"StoreProduct"];
+        if (isStoreVC) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[upd-block] 拦 App Store 页 %@", clsName]);
+            if (completion) {
+                completion();
+            }
+            return;
+        }
+        if ([viewControllerToPresent isKindOfClass:[UIAlertController class]]) {
+            UIAlertController *ac = (UIAlertController *)viewControllerToPresent;
+            NSString *t = [NSString stringWithFormat:@"%@ %@", ac.title ?: @"", ac.message ?: @""];
+            if (DYYYIsUpdatePopupText(t)) {
+                DYYYSpeedDiag([NSString stringWithFormat:@"[upd-block] 拦更新弹窗(alert) %@", t]);
+                if (completion) {
+                    completion();
+                }
+                return;
+            }
+            DYYYUpdateScanLog(clsName, t);
+        }
+    }
+    %orig;
+}
+%end
+
+// 抖音设置里"检查更新"条目的红点（老板判据：真屏蔽了红点就该消失）。
+// 红点特征：小圆点（<=12pt、圆角≈半径）且附近有"更新"文本 → hidden=YES。
+// 前置判定只读 frame/cornerRadius（极便宜），只有小圆点才继续做文本遍历，无常驻开销。
+%hook UIView
+- (void)didMoveToWindow {
+    %orig;
+    if (!DYYYGetBool(@"DYYYNoUpdates")) {
+        return;
+    }
+    CGRect f = self.frame;
+    if (f.size.width <= 0 || f.size.width > 12.0 || f.size.height > 12.0) {
+        return;
+    }
+    if (self.layer.cornerRadius < f.size.width * 0.4) {
+        return;
+    }
+    UIView *ctxView = self.superview ?: self;
+    NSString *t = DYYYUpdateCollectTexts(ctxView);
+    if ([t rangeOfString:@"更新"].location == NSNotFound) {
+        return;
+    }
+    self.hidden = YES;
+    static NSTimeInterval lastDotLog = 0;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - lastDotLog > 2.0) {
+        lastDotLog = now;
+        DYYYSpeedDiag([NSString stringWithFormat:@"[upd-badge] 隐藏更新红点 %@ in=%@ text=%@",
+            NSStringFromClass([self class]), NSStringFromClass([ctxView class]), t]);
+    }
+}
+%end
+
 %hook UIWindow
 - (instancetype)initWithFrame:(CGRect)frame {
     UIWindow *window = %orig(frame);
@@ -4057,6 +4293,36 @@ static void DYYYApplyNormalPlaybackSpeedToNativeDPlayer(AWEDPlayerSpeedControlle
         [window addGestureRecognizer:doubleFingerLongPressGesture];
     }
     return window;
+}
+
+// 更新弹窗兜底：直接加到 window 上的大容器（弹窗/浮层），下一帧查文案，命中更新关键词就移除。
+// 门槛：面积 > 屏幕 40% 才查（toast/HUD/键盘/cell 全部零遍历开销），受 DYYYNoUpdates 开关控制。
+- (void)addSubview:(UIView *)view {
+    %orig;
+    if (!view || !DYYYGetBool(@"DYYYNoUpdates")) {
+        return;
+    }
+    CGSize screen = [UIScreen mainScreen].bounds.size;
+    CGRect f = view.frame;
+    if (screen.width <= 0 || screen.height <= 0) {
+        return;
+    }
+    if (f.size.width * f.size.height < screen.width * screen.height * 0.4) {
+        return;
+    }
+    __weak UIView *weakView = view;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIView *v = weakView;
+        if (!v || !v.superview) {
+            return;
+        }
+        NSString *t = DYYYUpdateCollectTexts(v);
+        if (DYYYIsUpdatePopupText(t)) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[upd-block] 拦更新弹窗(window) %@ text=%@",
+                NSStringFromClass([v class]), t]);
+            [v removeFromSuperview];
+        }
+    });
 }
 
 %new
@@ -13883,6 +14149,13 @@ static void findTargetViewInView(UIView *view) {
         @"DYYYDisableFeedNowPlayingInfo" : @YES,
         @"DYYYDiagLog" : @YES
     }];
+
+    // 源头：扫描并批量拦截抖音"更新"相关类的动作方法（异步执行，不拖慢启动）
+    if (DYYYGetBool(@"DYYYNoUpdates")) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            DYYYBlockUpdateClassesOnce();
+        });
+    }
 
     DYYYMigrateCombinedHDRModeIfNeeded();
 
