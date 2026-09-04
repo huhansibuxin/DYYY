@@ -4270,6 +4270,7 @@ static void DYYYBlockUpdateClassesOnce(void) {
         const char **names = img ? objc_copyClassNamesForImage(img, &total) : NULL;
         NSMutableArray *hits = [NSMutableArray array];
         NSMutableArray *hookedNames = [NSMutableArray array];
+        NSMutableArray *candidates = [NSMutableArray array]; // 类名含 update/upgrad 但没过语义过滤的，全量留痕排查漏网
         int hookedMethods = 0;
         for (unsigned int i = 0; i < total; i++) {
             NSString *n = [NSString stringWithUTF8String:names[i]];
@@ -4288,6 +4289,14 @@ static void DYYYBlockUpdateClassesOnce(void) {
                                ([l containsString:@"version"] || [l containsString:@"force"] ||
                                 [l containsString:@"account"]));
             if (!isUpdClass) {
+                // 取证：含 update/upgrad 语义但没过"版本"组合过滤的类全记下来
+                //（59ce6b7 实测：手动点"检查更新"弹窗绕过了全部取证网，
+                //  可能存在 AWEUpdateAlert* 这类没带 version 的漏网更新类）
+                if (candidates.count < 120 &&
+                    ([l containsString:@"update"] || [l containsString:@"upgrad"] ||
+                     [l containsString:@"appupdate"] || [l containsString:@"newversion"])) {
+                    [candidates addObject:n];
+                }
                 continue;
             }
             Class cls = NSClassFromString(n);
@@ -4302,6 +4311,8 @@ static void DYYYBlockUpdateClassesOnce(void) {
         }
         DYYYSpeedDiag([NSString stringWithFormat:@"[upd-classes] 拦截类=%lu 方法=%d 总类=%u 类=%@ 方法名=%@",
             (unsigned long)hits.count, hookedMethods, total, hits, hookedNames]);
+        DYYYSpeedDiag([NSString stringWithFormat:@"[upd-candidates] 未拦截候选=%@",
+            candidates]);
     } @catch (__unused NSException *e) {
         DYYYSpeedDiag(@"[upd-classes] exception");
     }
@@ -4352,7 +4363,32 @@ static void DYYYUpdateScanLog(NSString *where, NSString *clsName, NSString *text
 }
 %end
 
-// 抖音设置里"检查更新"条目的红点（老板判据：真屏蔽了红点就该消失）。
+// 取证网第四路：UIAlertController 显示成功的最后必经点。
+// 背景（59ce6b7 实测）：手动点"检查更新"弹的"发现新版本"弹窗绕过了 present hook
+// （零命中），说明抖音用了 presentViewController: 之外的私有 present 入口。
+// viewDidAppear 不管走哪条路都会到（此时 title/message 已就绪）：
+//   严格命中 → dismiss 收尸 + [upd-block]；否则 [upd-scan] alert-appear 留痕。
+// 开销：alert 弹窗 app 内低频，viewDidAppear 只做一次字符串拼接判定，可忽略。
+%hook UIAlertController
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    if (!DYYYGetBool(@"DYYYNoUpdates")) {
+        return;
+    }
+    NSString *t = [NSString stringWithFormat:@"%@ %@", self.title ?: @"", self.message ?: @""];
+    if (DYYYIsUpdatePopupText(t)) {
+        NSString *acts = @"";
+        @try {
+            acts = [self.actions valueForKey:@"title"] ?: @"";
+        } @catch (__unused NSException *e) {
+        }
+        DYYYSpeedDiag([NSString stringWithFormat:@"[upd-block] 拦更新弹窗(alert-didAppear) %@ actions=%@", t, acts]);
+        [self dismissViewControllerAnimated:YES completion:nil];
+        return;
+    }
+    DYYYUpdateScanLog(@"alert-appear", NSStringFromClass([self class]), t);
+}
+%end
 // 红点特征：小圆点（<=12pt、圆角≈半径）且附近有"更新"文本 → hidden=YES。
 // 前置判定只读 frame/cornerRadius（极便宜），只有小圆点才继续做文本遍历，无常驻开销。
 %hook UIView
@@ -4410,6 +4446,22 @@ static void DYYYUpdateScanLog(NSString *where, NSString *clsName, NSString *text
         UIView *v = weakView;
         if (v && v.superview) {
             DYYYForensicScan(v, @"window", YES);
+        }
+    });
+}
+
+// 取证网第五路：insertSubview:atIndex: —— 弹窗库常用插入 API，和 addSubview 合计
+// 覆盖 window 加子 view 的两个入口。处理逻辑与 addSubview 完全一致。
+- (void)insertSubview:(UIView *)view atIndex:(NSInteger)index {
+    %orig;
+    if (!view || !DYYYGetBool(@"DYYYNoUpdates")) {
+        return;
+    }
+    __weak UIView *weakView = view;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIView *v = weakView;
+        if (v && v.superview) {
+            DYYYForensicScan(v, @"window-insert", YES);
         }
     });
 }
