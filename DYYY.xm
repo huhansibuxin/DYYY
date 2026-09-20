@@ -1413,6 +1413,24 @@ static BOOL DYYYShouldHoldNowPlaying(void) {
     return DYYYGetBool(@"DYYYKeepNowPlayingInBackground");
 }
 
+// 运行时取系统当前 nowPlayingInfo 的键数。
+// ⚠️ 必须走 NSClassFromString + objc_msgSend，**绝不能写 [MPNowPlayingInfoCenter defaultCenter]**：
+// 本工程 Makefile 没链接 MediaPlayer.framework（`%hook` 是动态的所以一直没暴露），
+// 一旦静态发消息就会产生未定义符号 `_OBJC_CLASS_$_MPNowPlayingInfoCenter` → 链接失败
+// （CI run 35503704907 实测 exit code 2："ld: symbol(s) not found for architecture arm64/arm64e"）。
+static NSInteger DYYYCurrentNowPlayingInfoCount(void) {
+    Class npc = NSClassFromString(@"MPNowPlayingInfoCenter");
+    if (!npc) {
+        return 0;
+    }
+    id center = ((id (*)(id, SEL))objc_msgSend)(npc, NSSelectorFromString(@"defaultCenter"));
+    if (!center) {
+        return 0;
+    }
+    id info = ((id (*)(id, SEL))objc_msgSend)(center, NSSelectorFromString(@"nowPlayingInfo"));
+    return [info isKindOfClass:[NSDictionary class]] ? (NSInteger)[info count] : 0;
+}
+
 // 日志：5 秒窗口内最多 24 条。退后台那一串收摊动作必须**全打出来**——
 // 之前用 2 秒限流，第①步之后的②③④全被吃掉，才导致"到底挡没挡住"看不清。
 static void DYYYNpHoldLog(NSString *fmt, ...) {
@@ -4965,7 +4983,7 @@ static void DYYYBlockUpdateClassesOnce(void) {
     DYYYSpeedDiag([NSString stringWithFormat:@"[np5] endReceivingRemoteControlEvents | %@",
                    DYYYNPWhoCalled()]);
     // 仅当确实挂着播放信息时才拦，避免干扰抖音冷启动期的正常初始化（那时尚无卡片）
-    if (DYYYShouldHoldNowPlaying() && [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo.count > 0) {
+    if (DYYYShouldHoldNowPlaying() && DYYYCurrentNowPlayingInfoCount() > 0) {
         DYYYSpeedDiag(@"[np5] 拦下 endReceivingRemoteControlEvents（托管中不撤 Now Playing 身份）");
         return;
     }
