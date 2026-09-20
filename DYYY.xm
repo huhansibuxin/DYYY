@@ -1364,6 +1364,7 @@ static NSInteger DYYYAppStateRaw(void) {
 //     抖音内部的播放器引用还在 → 它的 update 仍能组装出完整信息（diag/v10.log 10:44:11 实证：
 //     清空 3 秒后抖音仍能发布《翻龙之下九门》cnt=6/7 的完整内容）。
 static __weak id dyyyBGPlayModuleInstance = nil;   // AWEAwemeBackgroundPlayModule 实例（hook 里缓存）
+static BOOL dyyyNpPublishedSinceBoost = NO;   // Boost 后系统侧是否出现过非空发布（0 次重试的判据）
 
 // 主动声明"本 App 继续接收远程控制"——抖音在拉控制中心时自己也会调这一步（实测 19 次）。
 // 该方法是幂等的（抖音自己反复调没事），且它内部就是 MRMediaRemoteSetCanBeNowPlayingApplication(1)。
@@ -1507,7 +1508,6 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 //   canPauseForRemoteControl = 现在允许暂停 → 说明在播
 //   canPlayForRemoteControl  = 现在允许播放 → 说明已暂停
 static BOOL dyyyNpRatePatching = NO;   // 重入保护：读 getter 若又触发发布，不二次修正
-static BOOL dyyyNpPublishedSinceBoost = NO;   // Boost 后系统侧是否出现过非空发布（0 次重试的判据）
 
 // 返回：1 = 正在播放，2 = 已暂停，0 = 证据不足（此时绝不改动字典，保持抖音原样）
 // 阈值 |score| >= 2 是刻意的"保守档"：证据打架时一律判"不确定"→ 不动作、不产生回归。
