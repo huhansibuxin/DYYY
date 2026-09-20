@@ -1370,6 +1370,11 @@ static BOOL dyyyNpPublishedSinceBoost = NO;   // Boost 后系统侧是否出现�
 // 最新缓存（不会出现"上一条视频"）、rate 按投票补齐。
 static NSDictionary *dyyyLastGoodCurrentNPInfo = nil;
 
+// 前置声明（实现在下方 v12 播放态镜像区，Boost 兜底单发要用）
+static NSInteger DYYYReadDouyinPlayState(void);
+static NSDictionary *DYYYRateCorrectedNowPlayingInfo(NSDictionary *info, NSInteger state);
+static void DYYYDeclarePlaybackState(NSInteger state);
+
 // 主动声明"本 App 继续接收远程控制"——抖音在拉控制中心时自己也会调这一步（实测 19 次）。
 // 该方法是幂等的（抖音自己反复调没事），且它内部就是 MRMediaRemoteSetCanBeNowPlayingApplication(1)。
 static void DYYYForceBeginReceivingRemoteControlEvents(void) {
