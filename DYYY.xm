@@ -1646,6 +1646,61 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 
 %end
 
+// 【v4 真正的老巢】AWEAwemeBackgroundPlayModule —— dump 出来的方法表显示它才是 Now Playing 中枢：
+//   currentNowPlayingInfo / setCurrentNowPlayingInfo:（信息本体）
+//   setNeedCleanNowPlayingInfo:（"决定清空"标志位）
+//   setNeedResignPlayingPlayer:（"决定辞去播放身份"标志位）
+//   doExitBackgroundPlayMode / updateNowPlayingInfoWhenResiginActive（退后台收摊动作）
+// 按老板思路：在这些"决定"上直接 return，比在下游拦清空干净得多。
+%hook AWEAwemeBackgroundPlayModule
+
+// 内容来源：抖音每次更新"当前播放信息"时暂存一份（比系统的 setNowPlayingInfo: 靠谱，
+// 实测系统那条通道抖音根本不走）
+- (void)setCurrentNowPlayingInfo:(id)info {
+    DYYYStashNowPlayingInfo(info);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] setCurrentNowPlayingInfo cnt=%lu cls=%@",
+                   (unsigned long)([info isKindOfClass:[NSDictionary class]] ? [(NSDictionary *)info count] : 0),
+                   info ? NSStringFromClass([info class]) : @"(nil)"]);
+    %orig;
+}
+
+// "决定清空"：YES 时吞掉 → 抖音永远不会决定清空
+- (void)setNeedCleanNowPlayingInfo:(BOOL)value {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] setNeedCleanNowPlayingInfo:%d", (int)value]);
+    if (value && DYYYShouldHoldNowPlaying()) {
+        DYYYSpeedDiag(@"[np3] 拦下 setNeedCleanNowPlayingInfo:YES（源头掐死）");
+        DYYYScheduleNowPlayingReassert();
+        return;
+    }
+
+    %orig;
+}
+
+// "决定辞去播放身份"：YES 时吞掉
+- (void)setNeedResignPlayingPlayer:(BOOL)value {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] setNeedResignPlayingPlayer:%d", (int)value]);
+    if (value && DYYYShouldHoldNowPlaying()) {
+        DYYYSpeedDiag(@"[np3] 拦下 setNeedResignPlayingPlayer:YES（源头掐死）");
+        DYYYScheduleNowPlayingReassert();
+        return;
+    }
+
+    %orig;
+}
+
+// 退出后台播放模式（会收起播放态）→ 托管中不让退
+- (void)doExitBackgroundPlayMode {
+    DYYYSpeedDiag(@"[np3] hit doExitBackgroundPlayMode");
+    if (DYYYShouldHoldNowPlaying()) {
+        DYYYSpeedDiag(@"[np3] 拦下 doExitBackgroundPlayMode");
+        return;
+    }
+
+    %orig;
+}
+
+%end
+
 // 耳机或系统媒体会话可能绕过抖音播放中心，最终都要写入 MPNowPlayingInfoCenter。
 %hook MPNowPlayingInfoCenter
 
