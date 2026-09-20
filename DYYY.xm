@@ -1377,54 +1377,51 @@ static NSDictionary *DYYYRateCorrectedNowPlayingInfo(NSDictionary *info, NSInteg
 static void DYYYDeclarePlaybackState(NSInteger state);
 
 // 【v15.4】兜底最后手段：store 空 + 无缓存（原生发布链整场没跑过，如 16:27 第二轮重启会话：
-// 全场零次系统发布、store cnt=0、缓存 nil → 兜底彻底没弹药）时，从速度 hook 已捕获的
-// Merge VC 身上摸当前视频模型，自建最小字典（标题 + rate=0 + 时长）直发系统侧。
-// 全程 respondsToSelector 防御，摸不到就返回 nil——宁可不上卡片也不发错内容。
-// 这仍是【单发】：只在 Boost 1.2s 原生链不动作且投票=强暂停时执行一次，非循环回写。
+// 全场零次系统发布、store cnt=0、缓存 nil → 兜底彻底没弹药）时，自建最小字典（标题 + rate=0
+// + 时长）直发系统侧。
+// 【v15.5】弹药源修正（16:40 第二轮实测 respondsToSelector 探测全落空）：
+//   主源 = 速度功能现成跟踪的 dyyyCurrentSpeedAweme（AWEFeedContainerViewController 每次滑视频
+//          currentIndexDidChange 时更新，最可靠）；
+//   备源 = DYYYSpeedAwemeFromObject(Merge VC)——速度功能实战验证的 KVC 探测（valueForKey:
+//          能读到不响应 selector 的私有属性），比手动 respondsToSelector 强得多。
+// 摸不到就放弃——宁可不上卡片也不发错内容。仍是一次性单发，非回写拉锯。
 static NSDictionary *DYYYBuildMinimalNPInfoFromPlayer(void) {
-    id vc = dyyyLastMergeVC;
-    if (!vc) {
-        DYYYSpeedDiag(@"[npv] 自建字典跳过(无 Merge VC 实例)");
+    AWEAwemeModel *model = dyyyCurrentSpeedAweme ?: DYYYSpeedAwemeFromObject(dyyyLastMergeVC);
+    if (!model) {
+        DYYYSpeedDiag(@"[npv] 自建字典跳过(速度跟踪无模型且 VC KVC 探测失败)");
         return nil;
     }
     @try {
-        id model = nil;
-        for (NSString *selName in @[@"awemeModel", @"currentAwemeModel", @"model"]) {
-            SEL sel = NSSelectorFromString(selName);
-            if ([vc respondsToSelector:sel]) {
-                id m = ((id (*)(id, SEL))objc_msgSend)(vc, sel);
-                if (m && [m respondsToSelector:NSSelectorFromString(@"desc")]) {
-                    model = m;
-                    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 模型探到 selector=%@ class=%@", selName, NSStringFromClass([m class])]);
-                    break;
-                }
-            }
-        }
-        if (!model) {
-            DYYYSpeedDiag(@"[npv] 自建字典跳过(VC 上摸不到视频模型)");
-            return nil;
-        }
         NSString *title = nil;
-        for (NSString *selName in @[@"desc", @"title"]) {
-            SEL sel = NSSelectorFromString(selName);
-            if ([model respondsToSelector:sel]) {
-                id t = ((id (*)(id, SEL))objc_msgSend)(model, sel);
+        for (NSString *key in @[ @"desc", @"title", @"descriptionString" ]) {
+            @try {
+                id t = [model valueForKey:key];
                 if ([t isKindOfClass:[NSString class]] && [(NSString *)t length] > 0) {
                     title = t;
                     break;
                 }
+            } @catch (__unused NSException *e) {
             }
         }
         if (!title) {
-            DYYYSpeedDiag(@"[npv] 自建字典跳过(模型无 desc/title)");
+            DYYYSpeedDiag(@"[npv] 自建字典跳过(模型无标题)");
             return nil;
         }
         double duration = 0;
-        SEL durSel = NSSelectorFromString(@"duration");
-        if ([model respondsToSelector:durSel]) {
-            duration = ((double (*)(id, SEL))objc_msgSend)(model, durSel);
-            if (!(duration > 0 && duration < 86400)) {
-                duration = 0;   // duration 可能是整型属性按 double 解出垃圾值，明显不合理就弃用
+        for (id holder in @[ model, [model valueForKeyPath:@"video"] ?: [NSNull null] ]) {
+            if (holder == [NSNull null] || ![holder respondsToSelector:NSSelectorFromString(@"valueForKey:")]) {
+                continue;
+            }
+            @try {
+                id v = [holder valueForKey:@"duration"];
+                if ([v isKindOfClass:[NSNumber class]]) {
+                    double d = [(NSNumber *)v doubleValue];
+                    if (d > 0 && d < 86400) {
+                        duration = d;
+                        break;
+                    }
+                }
+            } @catch (__unused NSException *e) {
             }
         }
         NSMutableDictionary *info = [NSMutableDictionary dictionary];
@@ -1433,6 +1430,8 @@ static NSDictionary *DYYYBuildMinimalNPInfoFromPlayer(void) {
         if (duration > 0) {
             info[@"duration"] = @(duration);
         }
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 自建字典 OK：model=%@ 时长=%.0fs 标题=%@",
+            NSStringFromClass([model class]), duration, title]);
         return info;
     } @catch (NSException *e) {
         DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 自建字典 exception: %@", e.reason ?: @"unknown"]);
@@ -13432,6 +13431,7 @@ static Class tabBarButtonClass = nil;
 
 - (void)viewDidLayoutSubviews {
     %orig;
+    dyyyLastMergeVC = self;   // 【v15.5】扩大兜底 KVC 探测面（与 Merge VC 同等候选）
     if (DYYYGetBool(@"DYYYEnableFullScreen")) {
         UIView *contentView = self.contentView;
         if (contentView && contentView.superview) {
