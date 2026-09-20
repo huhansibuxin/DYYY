@@ -4949,16 +4949,26 @@ static void DYYYBlockUpdateClassesOnce(void) {
     %orig;
 }
 
-// 【定位探针】播放器停播的标准动作——调用 endReceivingRemoteControlEvents 后系统会撤掉
-// 控制中心卡片。这是"卡片消失"的另一个经典嫌疑，必须留痕。
+// 【v6 核心】这对公开 ObjC 方法才是"Now Playing 身份"的真正开关。
+// 铁证来自 v5 的崩溃栈（Aweme-2026-09-20-175451.ips）：
+//     -[UIApplication beginReceivingRemoteControlEvents]  →  MRMediaRemoteSetCanBeNowPlayingApplication
+// 即 begin 内部会把本 App【声明为 now playing app】；那么其反义方法 end 内部必然对应
+// 置 0 = 自愿退出 now playing → 系统立刻撤卡片。这条路径完全在 UIKit 内部，绕过抖音自有类、
+// 绕过所有 MPNowPlayingInfoCenter setter，所以之前怎么拦都拦不住。
+// 托管中不调 %orig，等于【永远不主动辞去 Now Playing 身份】。纯 ObjC，无 inline patch 风险。
 - (void)beginReceivingRemoteControlEvents {
-    DYYYSpeedDiag(@"[np2] beginReceivingRemoteControlEvents");
+    DYYYSpeedDiag(@"[np5] beginReceivingRemoteControlEvents");
     %orig;
 }
 
 - (void)endReceivingRemoteControlEvents {
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np2] endReceivingRemoteControlEvents | %@",
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np5] endReceivingRemoteControlEvents | %@",
                    DYYYNPWhoCalled()]);
+    // 仅当确实挂着播放信息时才拦，避免干扰抖音冷启动期的正常初始化（那时尚无卡片）
+    if (DYYYShouldHoldNowPlaying() && [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo.count > 0) {
+        DYYYSpeedDiag(@"[np5] 拦下 endReceivingRemoteControlEvents（托管中不撤 Now Playing 身份）");
+        return;
+    }
     %orig;
 }
 %end
@@ -14707,66 +14717,23 @@ static void findTargetViewInView(UIView *view) {
     }
 }
 
-// ===== 【v5】MediaRemote 私有 C 层：撤销"可作为 Now Playing App"的身份 =====
-// 这是最后一条能【绕过所有 ObjC setter】让控制中心卡片消失的路径。签名已联网核实，不靠猜：
-//   BOOL MRMediaRemoteSetCanBeNowPlayingApplication(BOOL);
-//   void MRMediaRemoteSetNowPlayingApplicationOverrideEnabled(BOOL);
-// 抖音（或它调用的 MediaPlayer 栈）一旦把 canBe 置 0，系统就当它自愿退出 now playing；
-// 此后无论 nowPlayingInfo 多完整（实测始终 7 键非空）、远程命令多齐全，卡片都不会再显示。
-// 这与"拦下 110 次 setPlayingPlayer:nil 卡片照样掉"的悖论完全吻合。
-typedef BOOL (*DYYYMRCanBeFn)(BOOL);
-typedef void (*DYYYMROverrideFn)(BOOL);
-static DYYYMRCanBeFn dyyyOrigMRCanBe = NULL;
-static DYYYMROverrideFn dyyyOrigMROverride = NULL;
-
-static BOOL dyyyHookMRCanBe(BOOL canBe) {
-    if (!canBe) {
-        DYYYSpeedDiag(@"[np5] MRSetCanBeNowPlayingApplication(0) ← 有人在撤 Now Playing 身份");
-        if (DYYYShouldHoldNowPlaying()) {
-            DYYYSpeedDiag(@"[np5] 拦下 MRSetCanBeNowPlayingApplication(0)（托管中不允许撤身份）");
-            return YES;
-        }
-    }
-    return dyyyOrigMRCanBe ? dyyyOrigMRCanBe(canBe) : NO;
-}
-
-static void dyyyHookMROverride(BOOL enabled) {
-    if (!enabled) {
-        DYYYSpeedDiag(@"[np5] MRSetNowPlayingApplicationOverrideEnabled(0)");
-        if (DYYYShouldHoldNowPlaying()) {
-            DYYYSpeedDiag(@"[np5] 拦下 MRSetNowPlayingApplicationOverrideEnabled(0)（托管中保留覆盖）");
-            return;
-        }
-    }
-    if (dyyyOrigMROverride) {
-        dyyyOrigMROverride(enabled);
-    }
-}
-
-// 安装：只 hook 上面两条【签名已核实】的函数。MRMediaRemoteSetNowPlayingInfo 的签名有歧义
-//（可能带 mergePolicy 第二参数），传参不当会污染第二个寄存器，故不 hook —— 宁可少一条证据，
-// 不冒崩溃风险。
-static void DYYYInstallMediaRemoteHooks(void) {
-    void *mr = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_NOW);
-    if (!mr) {
-        DYYYSpeedDiag(@"[np5] MediaRemote dlopen 失败，跳过身份层 hook");
-        return;
-    }
-    void *s1 = dlsym(mr, "MRMediaRemoteSetCanBeNowPlayingApplication");
-    void *s2 = dlsym(mr, "MRMediaRemoteSetNowPlayingApplicationOverrideEnabled");
-    if (s1) {
-        MSHookFunction(s1, (void *)dyyyHookMRCanBe, (void **)&dyyyOrigMRCanBe);
-    }
-    if (s2) {
-        MSHookFunction(s2, (void *)dyyyHookMROverride, (void **)&dyyyOrigMROverride);
-    }
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np5] MediaRemote 身份层 hook 安装 canBe=%d override=%d",
-                   s1 != NULL, s2 != NULL]);
-}
+// ===== ❌ 已废弃 & 已移除：MediaRemote 私有 C 层 inline hook（会闪退，勿恢复）=====
+// v5(3cf1722) 曾用 MSHookFunction 挂 MRMediaRemoteSetCanBeNowPlayingApplication /
+// MRMediaRemoteSetNowPlayingApplicationOverrideEnabled，结果【点开抖音即闪退】。
+// 崩溃日志铁证（Aweme-2026-09-20-175451.ips，bug_type 309）：
+//   #0 MRMediaRemoteSetCanBeNowPlayingApplication  @ MediaRemote
+//      fault addr 0x1acd8da38 = MediaRemote base 0x1acd13000 + 0x7aa38  ← 崩在系统框架自己的代码页
+//   #1 __MRMediaRemoteSetCanBeNowPlayingApplication @ MediaRemote
+//   #2 -[UIApplication beginReceivingRemoteControlEvents] @ UIKitCore
+//   EXC_BAD_ACCESS / SIGBUS / KERN_PROTECTION_FAILURE
+// 根因：arm64e(A16) 上，MSHookFunction 去 inline patch **dyld 共享缓存里的系统函数**是死路——
+//   改写的是系统框架的 __TEXT 页，执行即触发保护错误；且该函数会被 UIKit 在启动期调用。
+// 结论：**永远不要用 MSHookFunction 去打 dyld 共享缓存中的系统私有 C 函数**（fishhook 也不行，
+//   它只对 lazy-bind GOT 生效，UIKit 内部是直接跳转）。此路已封死，勿再尝试。
+// 另注：崩溃栈恰好说明 beginReceivingRemoteControlEvents 内部会调它 —— 那是系统【启用】
+//   远程控制（传 1），并不是撤身份，本来就不是我们要拦的目标。
 
 %ctor {
-    DYYYInstallMediaRemoteHooks();
-
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
         @"DYYYKeepNowPlayingInBackground" : @YES,
         @"DYYYDiagLog" : @YES
