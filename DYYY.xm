@@ -1421,6 +1421,23 @@ static void DYYYBoostNowPlayingAfterPause(void) {
         }
         SEL resignSel = NSSelectorFromString(@"appWillResignActiveNotification");
         SEL updateSel = NSSelectorFromString(@"updateNowPlayingInfoWhenResiginActive");
+        // 【v15.2】催发布前先从模块现读一份当前信息缓存。实测（16:04 会话）：抖音填充
+        // currentNowPlayingInfo store 不走 setter（全程无一次非空 setCurrentNowPlayingInfo:），
+        // 只在清空时走 → 我们的 setter 缓存永远为空、兜底无弹药。getter 读 store 是另一条路。
+        SEL getterSel = NSSelectorFromString(@"currentNowPlayingInfo");
+        @try {
+            if ([m respondsToSelector:getterSel]) {
+                NSDictionary *live = ((id (*)(id, SEL))objc_msgSend)(m, getterSel);
+                if ([live isKindOfClass:[NSDictionary class]] && live.count > 0) {
+                    dyyyLastGoodCurrentNPInfo = live;
+                    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 缓存模块 store cnt=%lu", (unsigned long)live.count]);
+                } else {
+                    DYYYSpeedDiag(@"[npv] 模块 store 为空(cnt=0)，无缓存可用");
+                }
+            }
+        } @catch (NSException *e) {
+            DYYYSpeedDiag(@"[npv] 读模块 store exception");
+        }
         @try {
             // ① 先声明继续接收远程控制（拉控制中心时抖音走的第一步）
             DYYYForceBeginReceivingRemoteControlEvents();
@@ -1475,6 +1492,20 @@ static void DYYYBoostNowPlayingAfterPause(void) {
                 return;
             }
             NSDictionary *cached = dyyyLastGoodCurrentNPInfo;
+            if (cached.count == 0) {
+                // 缓存仍空 → 最后再试一次模块 getter
+                id m3 = dyyyBGPlayModuleInstance;
+                SEL gs = NSSelectorFromString(@"currentNowPlayingInfo");
+                @try {
+                    if (m3 && [m3 respondsToSelector:gs]) {
+                        NSDictionary *live = ((id (*)(id, SEL))objc_msgSend)(m3, gs);
+                        if ([live isKindOfClass:[NSDictionary class]] && live.count > 0) {
+                            cached = live;
+                        }
+                    }
+                } @catch (__unused NSException *e) {
+                }
+            }
             if (cached.count == 0) {
                 DYYYSpeedDiag(@"[npv] 兜底跳过(无缓存信息)");
                 return;
@@ -1807,6 +1838,9 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
     // 这个键就是控制中心"画播放键还是暂停键"的开关（1.0=暂停键 / 0.0=播放键），抖音从不写它，
     // 所以卡片永远停在"暂停键"。我们只补这一个键，标题/封面/时长等内容一字不改。
     // 重入保护：读抖音 getter 若又触发一次发布，那次直接放行、不做二次修正。
+    if (nowPlayingInfo.count > 0) {
+        dyyyLastGoodCurrentNPInfo = nowPlayingInfo;   // 【v15.2】系统侧非空发布也刷新兜底缓存
+    }
     if (nowPlayingInfo.count > 0 && !dyyyNpRatePatching && DYYYShouldHoldNowPlaying()) {
         dyyyNpRatePatching = YES;
         NSInteger ps = DYYYReadDouyinPlayState();
