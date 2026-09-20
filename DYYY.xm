@@ -1396,7 +1396,43 @@ static BOOL DYYYShouldHoldNowPlaying(void) {
 // "use of undeclared identifier"（CI run 35526845456 实测 exit code 2）。
 static void DYYYCutVideoNudge(void);
 
-static void DYYYNoteAwemeChangedFrom(id object, NSString *source) {
+// ⭐【v23 探针】判定"这个 VC 是不是用户此刻真正在看的那一页"。
+// 必要性（diag/v22_check.log 铁证）：18:30:08 与 18:30:29，「最后一条候选」报的是
+// 《一天过了一天…》，而系统侧稳定停在《丈母娘的客栈-5》—— 说明 setIsAutoPlay:YES 在 feed 里
+// 会被【相邻 cell 的预加载】触发（抖音会给下一页预先 arm autoplay），
+// 于是 dyyyCurrentAwemeTitle 被邻页标题污染，我们兜底链的「期望」成了错的 →
+// 43 次复查结论是「未跟上且无当前视频弹药」（拿邻页标题去 store 里找，永远找不到），
+// 「切视频复查补发」全轮 0 发射。本轮先把"谁才是当前视频"变成可读数据，再决定怎么修。
+// 判据为什么不能简单用 view.window != nil：feed 是纵向分页的 scroll view，
+// 相邻页同样是 window 的子视图 → window 非空区分不了"在屏"与"预加载"。
+// 用"窗口竖向中点是否落在本 VC 的可见矩形内"才真正等于"这一页正在屏上"。
+static NSString *DYYYViewOnScreenMark(id host) {
+    if (!host) {
+        return @"[无宿主]";
+    }
+    @try {
+        id v = ((id (*)(id, SEL))objc_msgSend)(host, NSSelectorFromString(@"viewIfLoaded"));
+        if (!v) {
+            return @"[无view]";
+        }
+        id win = ((id (*)(id, SEL))objc_msgSend)(v, NSSelectorFromString(@"window"));
+        if (!win) {
+            return @"[不在窗]";
+        }
+        CGRect winBounds = ((CGRect (*)(id, SEL))objc_msgSend)(win, NSSelectorFromString(@"bounds"));
+        CGRect r = ((CGRect (*)(id, SEL, CGRect, id))objc_msgSend)(v,
+                        NSSelectorFromString(@"convertRect:toView:"),
+                        ((CGRect (*)(id, SEL))objc_msgSend)(v, NSSelectorFromString(@"bounds")), nil);
+        CGPoint c = CGPointMake(CGRectGetMidX(winBounds), CGRectGetMidY(winBounds));
+        return CGRectContainsPoint(r, c) ? @"[屏上]" : @"[屏外]";
+    } @catch (__unused NSException *e) {
+        return @"[异常]";
+    }
+}
+
+// 【v23】补 host 参数：object 是 aweme model（取标题用），host 是发起挂点的 VC（判"在屏"用）。
+// host 传 nil 表示该挂点没有可比对的宿主（Interaction.setModel 之外的旧调用点已全部补上）。
+static void DYYYNoteAwemeChangedFrom(id object, NSString *source, id host) {
     if (!DYYYShouldHoldNowPlaying()) {
         return;
     }
@@ -1405,8 +1441,8 @@ static void DYYYNoteAwemeChangedFrom(id object, NSString *source) {
         return;
     }
     dyyyCurrentAwemeTitle = title;
-    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 切视频候选 %@ → 当前=%@ | 系统侧=%@",
-        source, title, DYYYCurrentSystemNPTitle() ?: @"-"]);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 切视频候选 %@%@ → 当前=%@ | 系统侧=%@",
+        source, DYYYViewOnScreenMark(host), title, DYYYCurrentSystemNPTitle() ?: @"-"]);
 
     // ⭐【v18】切视频瞬间主动催一次原生发布。
     // 实测（diag/v17_check.log）：切到新视频后，抖音要 1~2s 才把新信息发到系统侧，
@@ -2238,11 +2274,25 @@ static void DYYYDumpRemoteControlSignatures(void) {
     DYYYDumpRemoteControlSignatures();   // 【v20】首次命中即 dump 一次远端方法签名（一次性）
     BOOL isEmpty = (![info isKindOfClass:[NSDictionary class]] || [(NSDictionary *)info count] == 0);
     // 【v16】非空也要过完整性门槛：切视频/暂停时 store 里可能混进 cnt=3 的残缺字典。
+    // ⭐【v23 探针】非空分支此前【完全没留痕】—— 十二轮迭代里一直是个盲点。
+    // 为什么现在必须闭它（diag/v22_check.log 的因果链）：
+    //   卡死窗口（18:27:34~18:28:39）里，复查 43 次全部报「无当前视频弹药 | store=-」，
+    //   而同一时间「放行 setCurrentNowPlayingInfo:nil(前台)」反复出现 —— 抖音把模块里的
+    //   "当前条目"清空了，之后就再没交出新的。于是 push 无弹药 → 系统侧 title 纹丝不动 →
+    //   控制中心 play 命令落点仍是旧条目（50 次 play 里 22 次发生在错位状态，且呈簇状）。
+    //   但"再没交出新的"只是【从 store 读出来是空】反推的，中间隔着一层 getter；
+    //   本探针直接把"抖音有没有交回条目"变成可读数据，一分钱不花就能定论：
+    //     · 有非空命中 = 抖音交了，问题在我们读 store 的那条路（或我们把它盖了）
+    //     · 全程 0 命中 = 抖音自己就不交，瓶颈在它的状态机上游（别再三轮改我们的兜底）
     if (!isEmpty && DYYYNPInfoLooksComplete((NSDictionary *)info)) {
         dyyyLastGoodCurrentNPInfo = info;   // 完整信息才刷新缓存（Boost 兜底单发用，v15.1）
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 模块收下当前条目 cnt=%lu title=%@",
+            (unsigned long)[(NSDictionary *)info count],
+            [(NSDictionary *)info[@"title"] description] ?: @"-"]);
     } else if (!isEmpty) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 拒收残缺弹药：setCurrentNowPlayingInfo cnt=%lu",
-            (unsigned long)[(NSDictionary *)info count]]);
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 拒收残缺弹药：setCurrentNowPlayingInfo cnt=%lu title=%@",
+            (unsigned long)[(NSDictionary *)info count],
+            [(NSDictionary *)info[@"title"] description] ?: @"-"]);
     }
     // 【v11】抖音把"当前播放信息"清空 = 用户暂停了。它的发布链此刻还没跑（要等 resignActive），
     // 我们主动替它补一次，让卡片当场挂上 —— 不必等用户去拉控制中心。
@@ -13754,7 +13804,7 @@ static Class tabBarButtonClass = nil;
     isInPlayInteractionVC = YES;
     dyyyCurrentSpeedAweme = self.model;
     // 【v17】切视频候选：交互层 VC 出现 —— self.model 就是这条视频。
-    DYYYNoteAwemeChangedFrom(self.model, @"Interaction.viewWillAppear");
+    DYYYNoteAwemeChangedFrom(self.model, @"Interaction.viewWillAppear", self);
     DYYYRestoreFloatSpeedButtonForAwemeIfNeeded(self.model);
     DYYYEnsureFloatSpeedButton(self);
     reloadClearButtonConfiguration();
@@ -13764,7 +13814,7 @@ static Class tabBarButtonClass = nil;
 // 且不受"VC 是否重新 appear"影响）。是"当前视频是谁"最可能的权威来源。
 - (void)setModel:(AWEAwemeModel *)arg1 {
     %orig(arg1);
-    DYYYNoteAwemeChangedFrom(arg1, @"Interaction.setModel");
+    DYYYNoteAwemeChangedFrom(arg1, @"Interaction.setModel", self);
 }
 
 - (void)viewDidLayoutSubviews {
@@ -13942,7 +13992,7 @@ static Class tabBarButtonClass = nil;
         // 【v17】切视频候选：只有"要播的那条"才会被置 YES —— 语义上最贴近"切到这条"。
         // 一次挂到三个播放器 VC 上，日志自带类名，一轮实测即可确定谁才是真命中点。
         DYYYNoteAwemeChangedFrom(self, [NSString stringWithFormat:@"%@.setIsAutoPlay",
-            NSStringFromClass([self class])]);
+            NSStringFromClass([self class])], self);
     }
     DYYYApplyPreparedPlaybackSpeedToPlayer(self);
 }
@@ -13951,7 +14001,7 @@ static Class tabBarButtonClass = nil;
     %orig;
     // 【v17】切视频候选：cell/播放器准备显示 —— 抖音 feed 换视频的必经点之一。
     DYYYNoteAwemeChangedFrom(self, [NSString stringWithFormat:@"%@.prepareForDisplay",
-        NSStringFromClass([self class])]);
+        NSStringFromClass([self class])], self);
     if (!DYYYShouldHandleSpeedFeatures()) {
         return;
     }
@@ -14001,7 +14051,7 @@ static Class tabBarButtonClass = nil;
         // 【v17】切视频候选：只有"要播的那条"才会被置 YES —— 语义上最贴近"切到这条"。
         // 一次挂到三个播放器 VC 上，日志自带类名，一轮实测即可确定谁才是真命中点。
         DYYYNoteAwemeChangedFrom(self, [NSString stringWithFormat:@"%@.setIsAutoPlay",
-            NSStringFromClass([self class])]);
+            NSStringFromClass([self class])], self);
     }
     DYYYApplyPreparedPlaybackSpeedToPlayer(self);
 }
@@ -14010,7 +14060,7 @@ static Class tabBarButtonClass = nil;
     %orig;
     // 【v17】切视频候选：cell/播放器准备显示 —— 抖音 feed 换视频的必经点之一。
     DYYYNoteAwemeChangedFrom(self, [NSString stringWithFormat:@"%@.prepareForDisplay",
-        NSStringFromClass([self class])]);
+        NSStringFromClass([self class])], self);
     if (!DYYYShouldHandleSpeedFeatures()) {
         return;
     }
@@ -14059,7 +14109,7 @@ static Class tabBarButtonClass = nil;
         // 【v17】切视频候选：只有"要播的那条"才会被置 YES —— 语义上最贴近"切到这条"。
         // 一次挂到三个播放器 VC 上，日志自带类名，一轮实测即可确定谁才是真命中点。
         DYYYNoteAwemeChangedFrom(self, [NSString stringWithFormat:@"%@.setIsAutoPlay",
-            NSStringFromClass([self class])]);
+            NSStringFromClass([self class])], self);
     }
     DYYYApplyPreparedPlaybackSpeedToPlayer(self);
 }
@@ -14068,7 +14118,7 @@ static Class tabBarButtonClass = nil;
     %orig;
     // 【v17】切视频候选：cell/播放器准备显示 —— 抖音 feed 换视频的必经点之一。
     DYYYNoteAwemeChangedFrom(self, [NSString stringWithFormat:@"%@.prepareForDisplay",
-        NSStringFromClass([self class])]);
+        NSStringFromClass([self class])], self);
     if (!DYYYShouldHandleSpeedFeatures()) {
         return;
     }
