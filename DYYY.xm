@@ -2246,14 +2246,28 @@ static void DYYYDumpRemoteControlSignatures(void) {
     }
     // 【v11】抖音把"当前播放信息"清空 = 用户暂停了。它的发布链此刻还没跑（要等 resignActive），
     // 我们主动替它补一次，让卡片当场挂上 —— 不必等用户去拉控制中心。
-    // 【v15.3】空信息写入【吞掉不落盘】：实测（16:15 重启会话）暂停时 %orig 会把模块 store
-    // 清成 cnt=0，Boost 读 getter 无弹药、兜底单发没货 → 重启后第一次暂停必失败
-    //（第一次能成功只因播放时退过后台、原生链闸门开过）。"决定清空"(setNeedClean=YES)
-    // 已吞，"执行清空"同步吞掉语义才一致；store 保留的正是暂停那一刻的当前视频信息。
+    // 【v15.3】空信息写入曾【无条件吞掉不落盘】——为了保住模块 store 当兜底弹药。
+    // 【v22 修正，同一个坑第四次】改成和 v9/v19 完全一样的前后台分流：
+    //   铁证（diag/v21_check.log，18:16:49）：老板【前台(st=0)】滑下一条视频时，抖音同样调
+    //   setCurrentNowPlayingInfo:nil —— 那是"退出旧视频的后台播放态"的第一步，被我们吞掉后
+    //   整条"退出→进入→发布"状态机就断了：抖音内部当前条目永远停在旧视频（系统侧 title
+    //   33 秒纹丝不动，全程"亮瞎眼的小蓝灯"，而老板已滑到"海王星"/《绝代明星》）→ 控制中心
+    //   play 命令虽被抖音执行（ret=0、投票=1），落点却是旧条目 → 老板体感"点了没效果/不播当前这条"。
+    //   这正是本文件 v9 注释里记下的那次事故（拦 doExit：每滑一条必调 3 次全拦 → 系统侧彻底停摆
+    //   → "点击没反应"）的同一条链，当年只放行了 doExit 一个，这一组剩下的三个一直没跟着改。
+    //   安全性：卡片清空由 MPNowPlayingInfoCenter 层吞掉兜底（v19 已验证），兜底弹药另有
+    //   我们自己的 dyyyLastGoodCurrentNPInfo 缓存（完整性门槛保护），不依赖模块 store。
     if (isEmpty && DYYYShouldHoldNowPlaying()) {
-        DYYYSpeedDiag(@"[npv] 暂停检测：setCurrentNowPlayingInfo 空信息（吞掉，保 store 弹药）");
+        NSInteger st = DYYYAppStateRaw();
+        dyyyBGPlayModuleInstance = self;
+        if (st == 2) {
+            DYYYSpeedDiag(@"[npv] 拦 setCurrentNowPlayingInfo:nil(后台) → 吞掉，不收摊");
+            DYYYBoostNowPlayingAfterPause();
+            return;
+        }
+        DYYYSpeedDiag([NSString stringWithFormat:
+            @"[npv] 放行 setCurrentNowPlayingInfo:nil(前台 st=%ld) → 让抖音走完切视频状态机", (long)st]);
         DYYYBoostNowPlayingAfterPause();
-        return;
     }
     %orig;
 }
@@ -2265,19 +2279,31 @@ static void DYYYDumpRemoteControlSignatures(void) {
 - (void)setNeedCleanNowPlayingInfo:(BOOL)value {
     if (value && DYYYShouldHoldNowPlaying()) {
         dyyyBGPlayModuleInstance = self;
-        DYYYSpeedDiag(@"[npv] 拦 setNeedClean=YES → Boost");
+        NSInteger st = DYYYAppStateRaw();
+        if (st == 2) {
+            DYYYSpeedDiag(@"[npv] 拦 setNeedClean=YES(后台) → Boost");
+            DYYYBoostNowPlayingAfterPause();
+            return;
+        }
+        DYYYSpeedDiag([NSString stringWithFormat:
+            @"[npv] 放行 setNeedClean=YES(前台 st=%ld) → 让抖音推进切视频状态机", (long)st]);
         DYYYBoostNowPlayingAfterPause();
-        return;
     }
 
     %orig;
 }
 
-// "决定辞去播放身份"：YES 时吞掉
+// "决定辞去播放身份"：后台才吞（同 doExit / setPlayingPlayer:nil 的判据）。
+// 【v22】前台放行 —— 它是"退出旧视频播放态"这一组的第三环，拦着同样会让状态机断链。
 - (void)setNeedResignPlayingPlayer:(BOOL)value {
     if (value && DYYYShouldHoldNowPlaying()) {
-        DYYYSpeedDiag(@"[npv] 拦 setNeedResign=YES");
-        return;
+        NSInteger st = DYYYAppStateRaw();
+        if (st == 2) {
+            DYYYSpeedDiag(@"[npv] 拦 setNeedResign=YES(后台)");
+            return;
+        }
+        DYYYSpeedDiag([NSString stringWithFormat:
+            @"[npv] 放行 setNeedResign=YES(前台 st=%ld)", (long)st]);
     }
 
     %orig;
@@ -2300,6 +2326,25 @@ static void DYYYDumpRemoteControlSignatures(void) {
         return;
     }
     %orig;
+}
+
+// 【v22 探针】"进入新视频的后台播放态"这一环 —— 抖音滑视频流程的第②步。
+// v9 的注释把流程写得很清楚（退出旧态 → 进入新态 → 发布新信息），但这条链的第②步
+// 九轮迭代里从来没留过痕。本轮放行了第①步（三处决定类方法前台放行）后，
+// 用这两条日志直接验证第②步有没有跟着发生：
+//   · 命中 = 分流奏效，状态机真的走通了
+//   · 0 命中 = 第①步不是瓶颈，得往上找谁掐住了"进入"
+- (void)realEnterBackgroundPlayMode {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ⏵ 进入播放态 realEnterBackgroundPlayMode | st=%ld | 当前视频=%@",
+        (long)DYYYAppStateRaw(), dyyyCurrentAwemeTitle ?: @"-"]);
+    %orig;
+}
+
+- (BOOL)shouldEnterBackgroundPlayMode {
+    BOOL r = %orig;
+    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ⏵ shouldEnterBackgroundPlayMode=%d | st=%ld",
+        (int)r, (long)DYYYAppStateRaw()]);
+    return r;
 }
 
 // ⭐⭐【v20 靶心】"禁止从后台恢复播放"闸门。
