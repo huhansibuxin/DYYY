@@ -1836,28 +1836,39 @@ static void DYYYCutVideoNudge(void) {
 // 老板定的原则："不要拦清空→回写拉锯，要在源头让它 return"。现在源头已 return，回写删除。
 //（DYYYStashNowPlayingInfo / dyyyLastGoodNowPlayingInfo 已随本机制一并删除，无任何引用）
 
-// 只保 play/pause/toggle 三条命令（用命令中心实例判等，最可靠）：
-// stop/close 必须放行——用户点卡片上的"关闭"是明确要关，不能也被挡住。
-static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
+// 【v20】把命令对象映射成短标签（play/pause/toggle），让日志能一眼看出是哪条命令的事件。
+// 只有这三条播放类命令会被"保住可用"，stop/close 一律放行。
+static NSString *DYYYRemoteCommandTag(id cmd) {
     if (!cmd) {
-        return NO;
+        return nil;
     }
     Class centerClass = NSClassFromString(@"MPRemoteCommandCenter");
     if (!centerClass) {
-        return NO;
+        return nil;
     }
     @try {
         id center = ((id (*)(id, SEL))objc_msgSend)(centerClass, @selector(sharedCommandCenter));
         if (!center) {
-            return NO;
+            return nil;
         }
-        id play = ((id (*)(id, SEL))objc_msgSend)(center, NSSelectorFromString(@"playCommand"));
-        id pause = ((id (*)(id, SEL))objc_msgSend)(center, NSSelectorFromString(@"pauseCommand"));
-        id toggle = ((id (*)(id, SEL))objc_msgSend)(center, NSSelectorFromString(@"togglePlayPauseCommand"));
-        return (cmd == play || cmd == pause || cmd == toggle);
+        if (cmd == ((id (*)(id, SEL))objc_msgSend)(center, NSSelectorFromString(@"playCommand"))) {
+            return @"play";
+        }
+        if (cmd == ((id (*)(id, SEL))objc_msgSend)(center, NSSelectorFromString(@"pauseCommand"))) {
+            return @"pause";
+        }
+        if (cmd == ((id (*)(id, SEL))objc_msgSend)(center, NSSelectorFromString(@"togglePlayPauseCommand"))) {
+            return @"toggle";
+        }
     } @catch (__unused NSException *e) {
     }
-    return NO;
+    return nil;
+}
+
+// 只保 play/pause/toggle 三条命令（用命令中心实例判等，最可靠）：
+// stop/close 必须放行——用户点卡片上的"关闭"是明确要关，不能也被挡住。
+static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
+    return DYYYRemoteCommandTag(cmd) != nil;
 }
 
 // ===== 【v12】播放态镜像：让控制中心知道"抖音现在到底是播放还是暂停" =====
@@ -1952,6 +1963,60 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
     }
 }
 
+// ===== 【v20】控制中心「点播放」链路照亮 + 精准放行 =====
+// 老板口径（v19 实测两轮仍不行）："文字不会跟，主要是会卡住播放"。
+// → 卡片文字可以不跟，但【点控制中心的播放/暂停必须作用到当前这条】，这是本轮靶心。
+//
+// 抖音的远程播命令链路（方法表 dump 实证，不是猜的）：
+//   MPRemoteCommandCenter.playCommand → AWENowPlayingInfoCenter.handlePlayCommand
+//     → playingPlayer（实测类名 = AWEAwemeBackgroundPlayModule）.playForRemoteControl
+//   模块上另有 forbidResumePlayFromBackground / shouldforbidResumePlayFromBackground
+//   （字面 = 禁止从后台恢复播放）、canPlay / canPauseForRemoteControl（决定按钮可用性）。
+//
+// v5 的历史实证很关键：当年【无条件】把 forbidResume 改判 NO 后，老板反馈"点播放确实开始播了，
+// 只是播了记录里的第一条"。⇒ **它就是"点播放没反应/卡住"的那道闸门**；当年"只播第一条"是同期
+// 其它硬拦（setPlayingPlayer:nil 等）把播放器引用钉死在旧对象上造成的，而那些在 v19 已改为
+// 前台放行。本轮据此做【精准窗口】放行，不再全局越权：
+//   只在 handlePlayCommand 的执行栈内改判 → 后台自动续播等其它路径一概不受影响。
+
+// 播命令保护窗口：仅在 handlePlayCommand 执行栈内为真
+static BOOL dyyyPlayCmdInFlight = NO;
+
+// 一次性打印远端方法签名（返回类型靠 method_getTypeEncoding 实证，绝不靠猜 —— 猜错返回类型
+// 会让调用方读到 x0 垃圾值）
+static void DYYYDumpRemoteControlSignatures(void) {
+    static BOOL done = NO;
+    if (done) {
+        return;
+    }
+    done = YES;
+    NSArray<NSString *> *classNames = @[ @"AWEAwemeBackgroundPlayModule", @"AWENowPlayingInfoCenter",
+                                         @"AWEFeedBackgroundPlayManager" ];
+    NSArray<NSString *> *selectorNames = @[
+        @"playForRemoteControl", @"pauseForRemoteControl", @"canPlayForRemoteControl",
+        @"canPauseForRemoteControl", @"forbidResumePlayFromBackground",
+        @"setForbidResumePlayFromBackground:", @"shouldforbidResumePlayFromBackground",
+        @"handlePlayCommand", @"handlePauseCommand", @"becomePlayingPlayer:", @"setPlayingPlayer:",
+        @"resignPlayingPlayer:", @"playingPlayer", @"updateNowPlayingInfoWhenResiginActive",
+        @"setNeedResignPlayingPlayer:"
+    ];
+    for (NSString *className in classNames) {
+        Class cls = NSClassFromString(className);
+        if (!cls) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[npv-sig] 类 %@ 未加载", className]);
+            continue;
+        }
+        for (NSString *selectorName in selectorNames) {
+            Method m = class_getInstanceMethod(cls, NSSelectorFromString(selectorName));
+            if (!m) {
+                continue;
+            }
+            DYYYSpeedDiag([NSString stringWithFormat:@"[npv-sig] %@ %@ → %s", className, selectorName,
+                                                     method_getTypeEncoding(m)]);
+        }
+    }
+}
+
 // 【已移除】AWEAwemeBackgroundPlayModule / AWEFeedBackgroundPlayManager 两个 hook 块：
 // 它们只服务于已删除的「信息流不显示播放信息」开关（清空系统 nowPlayingInfo），
 // 与保留卡片的目标冲突，整块删除。抖音的播放信息走 AWENowPlayingInfoCenter，
@@ -2033,6 +2098,34 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
     %orig;
 }
 
+// ⭐⭐【v20 靶心】控制中心「播放」命令的单一入口。命中 = 命令确实送到了抖音内部；
+// 若一轮下来它 0 命中，说明命令在系统层就没到抖音这里（那是另一条完全不同的路）。
+- (void)handlePlayCommand {
+    DYYYDumpRemoteControlSignatures();
+    dyyyPlayCmdInFlight = YES;
+    id me = (id)self;
+    id player = ((id (*)(id, SEL))objc_msgSend)(me, NSSelectorFromString(@"playingPlayer"));
+    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ 收到 play 命令（控制中心点了播放）→ 开续播保护窗口 | 当前 playingPlayer=%@",
+                                             player ? NSStringFromClass([player class]) : @"(nil)"]);
+    %orig;
+    dyyyPlayCmdInFlight = NO;
+    DYYYSpeedDiag(@"[npv] ▶ play 命令处理完毕");
+}
+
+// 暂停命令同样留痕（对照用：暂停一直好用，播放不好用，差异点就藏在这两条的尾链里）
+- (void)handlePauseCommand {
+    DYYYSpeedDiag(@"[npv] ⏸ 收到 pause 命令（控制中心点了暂停）");
+    %orig;
+}
+
+// becomePlayingPlayer: = "从现在起由这个对象代表抖音对外播放"，play 命令最终打到它身上
+- (void)becomePlayingPlayer:(id)player {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 上岗 becomePlayingPlayer=%@ | 状态=%ld",
+                                             player ? NSStringFromClass([player class]) : @"(nil)",
+                                             (long)DYYYAppStateRaw()]);
+    %orig;
+}
+
 // 【v4】removeRemoteCommandTarget = 摘掉远程命令（播放/暂停按钮消失）。托管中不让摘。
 - (void)removeRemoteCommandTarget {
     if (DYYYShouldHoldNowPlaying()) {
@@ -2103,6 +2196,7 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 // 实测系统那条通道抖音根本不走）
 - (void)setCurrentNowPlayingInfo:(id)info {
     dyyyBGPlayModuleInstance = self;   // 缓存实例，供"暂停后补 resignActive"调用（v11）
+    DYYYDumpRemoteControlSignatures();   // 【v20】首次命中即 dump 一次远端方法签名（一次性）
     BOOL isEmpty = (![info isKindOfClass:[NSDictionary class]] || [(NSDictionary *)info count] == 0);
     // 【v16】非空也要过完整性门槛：切视频/暂停时 store 里可能混进 cnt=3 的残缺字典。
     if (!isEmpty && DYYYNPInfoLooksComplete((NSDictionary *)info)) {
@@ -2167,6 +2261,54 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
         return;
     }
     %orig;
+}
+
+// ⭐⭐【v20 靶心】"禁止从后台恢复播放"闸门。
+// v5 实证：无条件改判 NO 之后，老板反馈"点播放确实开始播了" ⇒ 这道门就是"点播放没反应"的根。
+// 本轮只敢开【精准窗口】：仅在 handlePlayCommand 的执行栈内改判，其它时机（含退后台自动续播）
+// 一律原样返回 —— 避免出现"暂停了自己又播起来"这类新问题。
+- (BOOL)forbidResumePlayFromBackground {
+    BOOL value = %orig;
+    if (!DYYYShouldHoldNowPlaying()) {
+        return value;
+    }
+    if (value && dyyyPlayCmdInFlight) {
+        DYYYSpeedDiag(@"[npv] ▶ forbidResume=YES，但正处于播命令窗口 → 改判 NO（允许后台续播）");
+        return NO;
+    }
+    if (value) {
+        DYYYSpeedDiag(@"[npv] forbidResume=YES（非播命令时机，原样返回）");
+    }
+    return value;
+}
+
+// 同义决策方法（"should" 变体）：同样只在播命令窗口内放行
+- (BOOL)shouldforbidResumePlayFromBackground {
+    BOOL value = %orig;
+    if (value && dyyyPlayCmdInFlight && DYYYShouldHoldNowPlaying()) {
+        DYYYSpeedDiag(@"[npv] ▶ shouldforbidResume=YES → 改判 NO（播命令窗口内）");
+        return NO;
+    }
+    return value;
+}
+
+// 只观测不改写：看抖音到底何时把它置 YES（v5 曾在这里直接改 NO，属全局越权，已废止）
+- (void)setForbidResumePlayFromBackground:(BOOL)value {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] setForbidResume=%d", value]);
+    %orig;
+}
+
+// 按钮可用性：canPlay=YES 才能点播放；被置 NO 时控制中心按钮呈失效态
+- (BOOL)canPlayForRemoteControl {
+    BOOL value = %orig;
+    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] canPlayForRemoteControl=%d", value]);
+    return value;
+}
+
+- (BOOL)canPauseForRemoteControl {
+    BOOL value = %orig;
+    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] canPauseForRemoteControl=%d", value]);
+    return value;
 }
 
 // 【v7 已移除】forbidResumePlayFromBackground 的强制改写。
@@ -2271,7 +2413,24 @@ static BOOL DYYYIsAmbientCategory(NSString *c) {
 // stop/close 一律放行（用户点卡片"关闭"要真能关）。
 %hook MPRemoteCommand
 
+// 【v20 观测】谁给播放命令注册了 handler —— 拿到抖音真正的处理者类名与 selector，
+// 以后要精确 hook「点播放」就能直接打靶，不必再猜。
+- (void)addTarget:(id)target action:(SEL)action {
+    NSString *tag = DYYYRemoteCommandTag(self);
+    if (tag) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv-rc] addTarget cmd=%@ target=%@ action=%@", tag,
+                                                 target ? NSStringFromClass([target class]) : @"(nil)",
+                                                 NSStringFromSelector(action) ?: @"?"]);
+    }
+    %orig;
+}
+
 - (void)removeTarget:(id)target action:(SEL)action {
+    NSString *tag = DYYYRemoteCommandTag(self);
+    if (tag) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv-rc] removeTarget cmd=%@ action=%@", tag,
+                                                 NSStringFromSelector(action) ?: @"?"]);
+    }
     if (DYYYShouldHoldNowPlaying() && DYYYIsPreservedPlaybackCommand(self)) {
         return;
     }
@@ -2280,6 +2439,10 @@ static BOOL DYYYIsAmbientCategory(NSString *c) {
 }
 
 - (void)removeTarget:(id)target {
+    NSString *tag = DYYYRemoteCommandTag(self);
+    if (tag) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv-rc] removeTarget(全部) cmd=%@", tag]);
+    }
     if (DYYYShouldHoldNowPlaying() && DYYYIsPreservedPlaybackCommand(self)) {
         return;
     }
@@ -2288,6 +2451,11 @@ static BOOL DYYYIsAmbientCategory(NSString *c) {
 }
 
 - (void)setEnabled:(BOOL)enabled {
+    NSString *tag = DYYYRemoteCommandTag(self);
+    if (tag) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv-rc] setEnabled=%d cmd=%@ | 状态=%ld", (int)enabled, tag,
+                                                 (long)DYYYAppStateRaw()]);
+    }
     if (!enabled && DYYYShouldHoldNowPlaying() && DYYYIsPreservedPlaybackCommand(self)) {
         return;
     }
