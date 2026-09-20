@@ -4574,7 +4574,11 @@ static int DYYYBlockUpdateActionsInClass(Class cls, NSMutableArray *hookedNames)
     return hooked;
 }
 
-// 源头：扫描抖音主二进制里所有"更新"相关类并批量拦截
+// 源头：按【精确类名清单】拦截抖音"更新"相关类。
+// 旧版做镜像全量扫描（objc_copyClassNamesForImage 返回 11 万+ 类名逐个 lowercase 匹配），
+// 启动开销大，且模糊匹配正是之前误伤群升级/滤镜升级类的根源 —— 已废弃。
+// 清单来源：2026-09-20 实机日志实捞的 25 个类，25 次 NSClassFromString 微秒级完成。
+// 抖音升级若新增类漏拦，由运行时兜底接住：UIViewController hook 按弹窗文本 + App Store 页拦，不依赖类名。
 static void DYYYBlockUpdateClassesOnce(void) {
     static BOOL dyyyUpdateClassesDone = NO;
     if (dyyyUpdateClassesDone) {
@@ -4585,45 +4589,46 @@ static void DYYYBlockUpdateClassesOnce(void) {
         return;
     }
     @try {
-        // 以抖音自有类为锚点取其镜像，只扫主二进制（比 objc_copyClassList 全量扫快得多）
-        Class anchor = NSClassFromString(@"AWEVersionUpdateManager") ?: NSClassFromString(@"AWEFeedViewController");
-        const char *img = anchor ? class_getImageName(anchor) : NULL;
-        unsigned int total = 0;
-        const char **names = img ? objc_copyClassNamesForImage(img, &total) : NULL;
-        NSMutableArray *hits = [NSMutableArray array];
-        NSMutableArray *hookedNames = [NSMutableArray array];
+        NSArray *knownUpdateClasses = @[
+            @"AWEHPNewVersionFeedbackController",
+            @"AWENewVersionFeedbackView",
+            @"AWEMainNewVersionRecordLaunchTask",
+            @"AWEVersionUpdateABSettings",
+            @"AWEVersionUpdateAlert",
+            @"AWEVersionUpdateBadgeModule",
+            @"AWEVersionUpdateConfigModel",
+            @"AWEVersionUpdateForcePopupPlugin",
+            @"AWEVersionUpdateManager",
+            @"AWEVersionUpdateNetworkModule",
+            @"AWEVersionUpdatePopup",
+            @"AWEVersionUpdateSettingCellController",
+            @"AWEVersionUpdateColdLaunchDelayTriggerEvent",
+            @"AWEVersionUpdateForcePopupEvent",
+            @"AWEVersionUpdateWorkflow",
+            @"AWEVersionUpdateReleaseModel",
+            @"AWETeenVersionUpdateManager",
+            @"AWEAccountForceUpgradeManager",
+            @"AWENewVersionAlertUtils",
+            @"AWENewVersionCheckInfo",
+            @"AWENewVersionAlertManager",
+            @"AWENewVersionAlertView",
+            @"IESOuterTestNewVersionRequestParamsModel",
+            @"IESOuterTestNewVersionTaskRequestParamsModel",
+            @"TIMXUpdateConvInfoExtByVersionModel",
+        ];
+        int hookedClasses = 0;
         int hookedMethods = 0;
-        for (unsigned int i = 0; i < total; i++) {
-            NSString *n = [NSString stringWithUTF8String:names[i]];
-            // 收紧：只要"版本更新"语义的类。抖音里 AWE*Update* 的数据/UI 刷新类一大堆
-            // （AWEUserProfileUpdateHelper 之类），误拦会炸正常功能，所以必须限定 version/update 语义组合。
-            // 收紧再收紧：实测第一版含 "upgrad" 会误伤 IESIMGroupUpgrade*（群升级）、
-            // AEKUpgradeFilter*（剪辑滤镜升级）、CJPayECUpgrade*（支付免密升级）等无关类，
-            // 把它们的 show/start 置空 = 误伤正常功能。所以 "upgrad" 必须再叠加
-            // version/force/account 才认（真更新类 = AWEAccountForceUpgradeManager 这类）。
-            NSString *l = n.lowercaseString;
-            BOOL isUpdClass = [l containsString:@"versionupdate"] ||
-                              ([l containsString:@"update"] && [l containsString:@"version"]) ||
-                              [l containsString:@"appupdate"] ||
-                              [l containsString:@"newversion"] ||
-                              ([l containsString:@"upgrad"] &&
-                               ([l containsString:@"version"] || [l containsString:@"force"] ||
-                                [l containsString:@"account"]));
-            if (!isUpdClass) {
-                continue;
-            }
+        for (NSString *n in knownUpdateClasses) {
             Class cls = NSClassFromString(n);
-            if (!cls || hits.count >= 60) {
+            if (!cls) {
                 continue;
             }
-            hookedMethods += DYYYBlockUpdateActionsInClass(cls, hookedNames);
-            [hits addObject:n];
+            hookedMethods += DYYYBlockUpdateActionsInClass(cls, NULL);
+            hookedClasses++;
         }
-        if (names) {
-            free(names);
+        if (hookedClasses > 0) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[upd-classes] 精确拦截 类=%d 方法=%d", hookedClasses, hookedMethods]);
         }
-        DYYYSpeedDiag([NSString stringWithFormat:@"[upd-classes] 拦截类=%lu 方法=%d 总类=%u 类=%@ 方法名=%@",
-            (unsigned long)hits.count, hookedMethods, total, hits, hookedNames]);
     } @catch (__unused NSException *e) {
         DYYYSpeedDiag(@"[upd-classes] exception");
     }
@@ -14642,11 +14647,8 @@ static void findTargetViewInView(UIView *view) {
     // 老版本遗留开关值清掉（该功能已移除，留着只会在设置页/调试时造成困惑）
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"DYYYDisableFeedNowPlayingInfo"];
 
-    // 源头：扫描并批量拦截抖音"更新"相关类的动作方法（异步执行，不拖慢启动）
+    // 源头：按精确类名清单拦截抖音"更新"相关类（25 次 NSClassFromString，微秒级）
     if (DYYYGetBool(@"DYYYNoUpdates")) {
-        // 走 global queue 而非主队列：实测 objc_copyClassNamesForImage 返回 11 万+ 类名，
-        // 逐个 lowercase+containsString 在主队列会卡启动几十~几百 ms；MSHookMessageEx
-        // 钩 ObjC 方法不要求主线程，放后台跑。
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             DYYYBlockUpdateClassesOnce();
         });
