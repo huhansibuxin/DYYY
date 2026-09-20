@@ -1210,7 +1210,7 @@ void showDYYYSettingsVC(UIViewController *rootVC, BOOL hasAgreed) {
             @"imageName" : kDYYYFeedNowPlayingSVGIconName},
           @{@"identifier" : @"DYYYKeepNowPlayingInBackground",
             @"title" : @"暂停后保留控制中心控件",
-            @"subTitle" : @"暂停视频退回桌面后，控制中心仍保留播放控件，可直接续播",
+            @"subTitle" : @"",
             @"detail" : @"",
             @"cellType" : @37,
             @"imageName" : kDYYYFeedNowPlayingSVGIconName},
