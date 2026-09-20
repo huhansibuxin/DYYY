@@ -1384,21 +1384,29 @@ static void DYYYForceBeginReceivingRemoteControlEvents(void) {
 
 // 暂停后补一次 resignActive：让抖音把"当前视频 + 暂停态"发布到控制中心，卡片当场挂上，
 // 不必等用户去拉控制中心。节流 1.5s，避免抖音那条链被重复触发成抖动。
+// 【v15 稳定性】Boost 发出 1.2s 后检查系统侧是否真的出现过非空发布（dyyyNpPublishedSinceBoost，
+// 在 MPNowPlayingInfoCenter 非空 setNowPlayingInfo: 时置位）；没落地就绕过节流补一轮
+//（有界一次，事件驱动，非常驻轮询）——修"第一次暂停有时上有时不上"。
 static void DYYYBoostNowPlayingAfterPause(void) {
     static NSTimeInterval lastBoost = 0;
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     if (now - lastBoost < 1.5) {
+        DYYYSpeedDiag(@"[npv] Boost 节流跳过");
         return;
     }
     lastBoost = now;
+    dyyyNpPublishedSinceBoost = NO;
+    DYYYSpeedDiag(@"[npv] Boost 触发(暂停检测)");
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (!DYYYShouldHoldNowPlaying()) {
+            DYYYSpeedDiag(@"[npv] Boost 放弃(托管已撤)");
             return;
         }
         id m = dyyyBGPlayModuleInstance;
         if (!m) {
+            DYYYSpeedDiag(@"[npv] Boost 放弃(无 BGPlayModule 实例)");
             return;
         }
         SEL resignSel = NSSelectorFromString(@"appWillResignActiveNotification");
@@ -1407,14 +1415,44 @@ static void DYYYBoostNowPlayingAfterPause(void) {
             // ① 先声明继续接收远程控制（拉控制中心时抖音走的第一步）
             DYYYForceBeginReceivingRemoteControlEvents();
             // ② 让抖音重新组装并发布当前视频的 now playing 信息
-            if ([m respondsToSelector:updateSel]) {
+            BOOL didUpdate = [m respondsToSelector:updateSel];
+            BOOL didResign = [m respondsToSelector:resignSel];
+            if (didUpdate) {
                 ((void (*)(id, SEL))objc_msgSend)(m, updateSel);
             }
-            if ([m respondsToSelector:resignSel]) {
+            if (didResign) {
                 ((void (*)(id, SEL))objc_msgSend)(m, resignSel);
             }
-        } @catch (__unused NSException *e) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[npv] Boost 已发 update=%d resign=%d", didUpdate, didResign]);
+        } @catch (NSException *e) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[npv] Boost exception: %@", e.reason ?: @"unknown"]);
         }
+
+        // 1.2s 后确认发布是否落地；没落地补一轮（有界一次）
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (!DYYYShouldHoldNowPlaying() || dyyyNpPublishedSinceBoost) {
+                if (dyyyNpPublishedSinceBoost) {
+                    DYYYSpeedDiag(@"[npv] Boost 确认：发布已落地 ✓");
+                }
+                return;
+            }
+            @try {
+                id m2 = dyyyBGPlayModuleInstance;
+                if (!m2) {
+                    return;
+                }
+                DYYYSpeedDiag(@"[npv] Boost 后 1.2s 未见发布，补一轮");
+                if ([m2 respondsToSelector:updateSel]) {
+                    ((void (*)(id, SEL))objc_msgSend)(m2, updateSel);
+                }
+                if ([m2 respondsToSelector:resignSel]) {
+                    ((void (*)(id, SEL))objc_msgSend)(m2, resignSel);
+                }
+            } @catch (NSException *e) {
+                DYYYSpeedDiag([NSString stringWithFormat:@"[npv] Boost 补发 exception: %@", e.reason ?: @"unknown"]);
+            }
+        });
     });
 }
 
@@ -1469,6 +1507,7 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 //   canPauseForRemoteControl = 现在允许暂停 → 说明在播
 //   canPlayForRemoteControl  = 现在允许播放 → 说明已暂停
 static BOOL dyyyNpRatePatching = NO;   // 重入保护：读 getter 若又触发发布，不二次修正
+static BOOL dyyyNpPublishedSinceBoost = NO;   // Boost 后系统侧是否出现过非空发布（0 次重试的判据）
 
 // 返回：1 = 正在播放，2 = 已暂停，0 = 证据不足（此时绝不改动字典，保持抖音原样）
 // 阈值 |score| >= 2 是刻意的"保守档"：证据打架时一律判"不确定"→ 不动作、不产生回归。
@@ -1558,6 +1597,7 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 // 所以判据不能要求"非前台"，否则永远晚一步。
 - (void)setPlayingPlayer:(id)player {
     if (!player && DYYYShouldHoldNowPlaying()) {
+        DYYYSpeedDiag(@"[npv] 拦 setPlayingPlayer:nil");
         return;
     }
 
@@ -1567,6 +1607,7 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 - (void)setNowPlayingInfo:(id)nowPlayingInfo {
     // 清空抖音侧信息（收摊第②步）→ 托管中吞掉。暂停那一刻就会来，必须挡。
     if (!nowPlayingInfo && DYYYShouldHoldNowPlaying()) {
+        DYYYSpeedDiag(@"[npv] 拦 AWENPC setNowPlayingInfo:nil");
         return;
     }
 
@@ -1586,6 +1627,7 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 // 另：b8e4fdf 版日志显示拦下 51 次 resignPlayingPlayer 卡片依然照掉 → 拦它既无收益又有害。
 - (void)resignPlayingPlayer:(id)player {
     if (DYYYShouldHoldNowPlaying() && DYYYAppStateRaw() == 2) {
+        DYYYSpeedDiag(@"[npv] 拦 resignPlayingPlayer(后台)");
         return;
     }
     %orig;
@@ -1609,6 +1651,7 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 
 - (void)clearNowPlayingInfo {
     if (DYYYShouldHoldNowPlaying()) {
+        DYYYSpeedDiag(@"[npv] 拦 clearNowPlayingInfo");
         return;
     }
 
@@ -1617,6 +1660,7 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 
 - (void)clearCommand {
     if (DYYYShouldHoldNowPlaying()) {
+        DYYYSpeedDiag(@"[npv] 拦 clearCommand");
         return;
     }
 
@@ -1649,14 +1693,21 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
     // 【v11】抖音把"当前播放信息"清空 = 用户暂停了。它的发布链此刻还没跑（要等 resignActive），
     // 我们主动替它补一次，让卡片当场挂上 —— 不必等用户去拉控制中心。
     if (isEmpty && DYYYShouldHoldNowPlaying()) {
+        DYYYSpeedDiag(@"[npv] 暂停检测：setCurrentNowPlayingInfo 空信息");
         DYYYBoostNowPlayingAfterPause();
     }
     %orig;
 }
 
 // "决定清空"：YES 时吞掉 → 抖音永远不会决定清空
+// 【v15 稳定性】这里同样是暂停信号（v12 日志证明暂停时必来）——之前 Boost 只挂在
+// setCurrentNowPlayingInfo 空信息这一条路上，若抖音某些暂停路径只发标志位不发空信息，
+// Boost 就永远不触发 → "第一次暂停有时上有时不上"。两条信号都挂上，节流兜底去重。
 - (void)setNeedCleanNowPlayingInfo:(BOOL)value {
     if (value && DYYYShouldHoldNowPlaying()) {
+        dyyyBGPlayModuleInstance = self;
+        DYYYSpeedDiag(@"[npv] 拦 setNeedClean=YES → Boost");
+        DYYYBoostNowPlayingAfterPause();
         return;
     }
 
@@ -1666,6 +1717,7 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 // "决定辞去播放身份"：YES 时吞掉
 - (void)setNeedResignPlayingPlayer:(BOOL)value {
     if (value && DYYYShouldHoldNowPlaying()) {
+        DYYYSpeedDiag(@"[npv] 拦 setNeedResign=YES");
         return;
     }
 
@@ -1685,6 +1737,7 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 - (void)doExitBackgroundPlayMode {
     NSInteger st = DYYYAppStateRaw();
     if (DYYYShouldHoldNowPlaying() && st == 2) {
+        DYYYSpeedDiag(@"[npv] 拦 doExitBackgroundPlayMode(后台)");
         return;
     }
     %orig;
@@ -1719,6 +1772,10 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
         NSDictionary *fixed = DYYYRateCorrectedNowPlayingInfo(nowPlayingInfo, ps);
         DYYYDeclarePlaybackState(ps);
         dyyyNpRatePatching = NO;
+        dyyyNpPublishedSinceBoost = YES;   // 【v15】Boost 重试判据：系统侧出现过非空发布
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 系统发布 cnt=%lu 投票=%ld 补键=%d title=%@",
+            (unsigned long)nowPlayingInfo.count, (long)ps, fixed != nowPlayingInfo ? 1 : 0,
+            nowPlayingInfo[@"title"] ?: @"-"]);
         if (fixed != nowPlayingInfo) {
             %orig(fixed);
             return;
