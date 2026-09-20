@@ -9,6 +9,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
+#import <execinfo.h>
 #import <float.h>
 #import <math.h>
 #import <objc/message.h>
@@ -1266,7 +1267,19 @@ static void DYYYHandleCurrentSpeedAwemeChanged(id aweme) {
 
 @interface MPNowPlayingInfoCenter : NSObject
 @property(nonatomic, copy) NSDictionary *nowPlayingInfo;
+@property(nonatomic, assign) NSInteger playbackState;
 + (instancetype)defaultCenter;
+@end
+
+// 探针用最小接口声明（不 import MediaPlayer 头，避免和上面的 stub 重复声明冲突）
+@interface MPRemoteCommand : NSObject
+- (void)addTarget:(id)target action:(SEL)action;
+- (void)addTargetWithHandler:(id)handler;
+- (void)removeTarget:(id)target action:(SEL)action;
+@end
+
+@interface MPRemoteCommandCenter : NSObject
++ (instancetype)sharedCommandCenter;
 @end
 
 static BOOL dyyyClearingFeedNowPlayingSystemInfo = NO;
@@ -1313,9 +1326,56 @@ static BOOL DYYYShouldBlockFeedNowPlayingSystemInfoWrite(void) {
     return DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo") && !dyyyClearingFeedNowPlayingSystemInfo;
 }
 
+// ===== Now Playing 卡片消失链路探针（诊断构建）=====
+// 现象：抖音播放中退后台 → 控制中心有卡片（暂停/关闭可用）；暂停后退后台 → 卡片消失。
+// 目标：抓出「暂停 → 卡片消失」的确切调用链（会话被 setActive:NO / nowPlayingInfo 被清空 /
+//       remote command 被 removeTarget 或 enabled=NO / 引擎 pause 时序）。
+// 说明：所有日志走 DYYYSpeedDiag（受 DYYYDiagLog 门控）；探针本身只在事件发生时才执行。
+//      MediaPlayer 的常量一律用字面量 key，避免引入框架符号依赖。
+
+// 轻量调用栈（最多 6 帧）：release 包符号被剥，主要用来区分发起模块（如 TTVideoEngine.framework）
+static NSString *DYYYNPCallerStack(void) {
+    void *frames[16];
+    int n = backtrace(frames, 16);
+    if (n <= 1) {
+        return @"";
+    }
+    char **syms = backtrace_symbols(frames, n);
+    NSMutableArray *arr = [NSMutableArray array];
+    if (syms) {
+        for (int i = 1; i < n && arr.count < 6; i++) {
+            NSString *s = [NSString stringWithUTF8String:syms[i]];
+            if (s.length > 0) {
+                [arr addObject:s];
+            }
+        }
+        free(syms);
+    }
+    return [arr componentsJoinedByString:@" << "];
+}
+
+// nowPlayingInfo 摘要：不依赖 MediaPlayer 常量，直接列 key + 关键字段，避免 key 名猜错漏信息
+static NSString *DYYYNPDescribeInfo(id info) {
+    if (!info) {
+        return @"(nil)";
+    }
+    if (![info isKindOfClass:[NSDictionary class]]) {
+        return [NSString stringWithFormat:@"(非字典 %@)", NSStringFromClass([info class])];
+    }
+    NSDictionary *d = (NSDictionary *)info;
+    NSArray *keys = d.allKeys;
+    NSString *keyList = keys.count > 10 ? [[keys subarrayWithRange:NSMakeRange(0, 10)] componentsJoinedByString:@","] : [keys componentsJoinedByString:@","];
+    return [NSString stringWithFormat:@"count=%lu keys=[%@] title=%@ rate=%@ elapsed=%@ dur=%@",
+            (unsigned long)d.count, keyList,
+            d[@"title"] ?: @"-", d[@"playbackRate"] ?: @"-",
+            d[@"MPNowPlayingInfoPropertyElapsedPlaybackTime"] ?: @"-",
+            d[@"playbackDuration"] ?: @"-"];
+}
+
 %hook AWEAwemeBackgroundPlayModule
 
 - (id)nowPlayingInfo {
+    DYYYSpeedDiag(@"[np-app] AWEAwemeBackgroundPlayModule nowPlayingInfo get");
     if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
         DYYYClearFeedNowPlayingSystemInfoThrottled();
         return nil;
@@ -1325,6 +1385,7 @@ static BOOL DYYYShouldBlockFeedNowPlayingSystemInfoWrite(void) {
 }
 
 - (void)refreshNowPlayingInfoIfNeeded {
+    DYYYSpeedDiag(@"[np-app] AWEAwemeBackgroundPlayModule refreshNowPlayingInfoIfNeeded");
     if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
         DYYYClearFeedNowPlayingSystemInfoThrottled();
         return;
@@ -1334,6 +1395,7 @@ static BOOL DYYYShouldBlockFeedNowPlayingSystemInfoWrite(void) {
 }
 
 - (void)updateNowPlayingInfoPlayback {
+    DYYYSpeedDiag(@"[np-app] AWEAwemeBackgroundPlayModule updateNowPlayingInfoPlayback");
     if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
         DYYYClearFeedNowPlayingSystemInfoThrottled();
         return;
@@ -1347,6 +1409,7 @@ static BOOL DYYYShouldBlockFeedNowPlayingSystemInfoWrite(void) {
 %hook AWEFeedBackgroundPlayManager
 
 - (id)nowPlayingInfo {
+    DYYYSpeedDiag(@"[np-app] AWEFeedBackgroundPlayManager nowPlayingInfo get");
     if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
         DYYYClearFeedNowPlayingSystemInfoThrottled();
         return nil;
@@ -1356,6 +1419,7 @@ static BOOL DYYYShouldBlockFeedNowPlayingSystemInfoWrite(void) {
 }
 
 - (void)setNowPlayingInfo:(id)nowPlayingInfo {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-app] AWEFeedBackgroundPlayManager setNowPlayingInfo: %@", DYYYNPDescribeInfo(nowPlayingInfo)]);
     if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
         DYYYClearFeedNowPlayingSystemInfoThrottled();
         return;
@@ -1365,6 +1429,7 @@ static BOOL DYYYShouldBlockFeedNowPlayingSystemInfoWrite(void) {
 }
 
 - (void)resetNowPlayingInfo:(id)model {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-app] AWEFeedBackgroundPlayManager resetNowPlayingInfo: %@", DYYYNPDescribeInfo(model)]);
     if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
         DYYYClearFeedNowPlayingSystemInfoThrottled();
         return;
@@ -1374,6 +1439,7 @@ static BOOL DYYYShouldBlockFeedNowPlayingSystemInfoWrite(void) {
 }
 
 - (void)refreshNowPlayingInfo {
+    DYYYSpeedDiag(@"[np-app] AWEFeedBackgroundPlayManager refreshNowPlayingInfo");
     if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
         DYYYClearFeedNowPlayingSystemInfoThrottled();
         return;
@@ -1383,6 +1449,7 @@ static BOOL DYYYShouldBlockFeedNowPlayingSystemInfoWrite(void) {
 }
 
 - (void)refreshNowPlayingInfoIsForce:(BOOL)isForce {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-app] AWEFeedBackgroundPlayManager refreshNowPlayingInfoIsForce:%d", (int)isForce]);
     if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
         DYYYClearFeedNowPlayingSystemInfoThrottled();
         return;
@@ -1392,6 +1459,7 @@ static BOOL DYYYShouldBlockFeedNowPlayingSystemInfoWrite(void) {
 }
 
 - (void)updateNowPlayingInfoPlayback {
+    DYYYSpeedDiag(@"[np-app] AWEFeedBackgroundPlayManager updateNowPlayingInfoPlayback");
     if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
         DYYYClearFeedNowPlayingSystemInfoThrottled();
         return;
@@ -1406,6 +1474,8 @@ static BOOL DYYYShouldBlockFeedNowPlayingSystemInfoWrite(void) {
 %hook AWENowPlayingInfoCenter
 
 - (void)becomePlayingPlayer:(id)player {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-app] AWENowPlayingInfoCenter becomePlayingPlayer: %@",
+                   player ? NSStringFromClass([player class]) : @"(nil)"]);
     if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
         DYYYClearFeedNowPlayingSystemInfoThrottled();
         return;
@@ -1414,7 +1484,15 @@ static BOOL DYYYShouldBlockFeedNowPlayingSystemInfoWrite(void) {
     %orig;
 }
 
+// playingPlayer 被置 nil = 抖音主动放弃"正在播放"角色，是卡片被系统撤走的直接触发点之一
+- (void)setPlayingPlayer:(id)player {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-app] AWENowPlayingInfoCenter setPlayingPlayer: %@",
+                   player ? NSStringFromClass([player class]) : @"(nil)"]);
+    %orig;
+}
+
 - (void)setNowPlayingInfo:(id)nowPlayingInfo {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-app] AWENowPlayingInfoCenter setNowPlayingInfo: %@", DYYYNPDescribeInfo(nowPlayingInfo)]);
     if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
         DYYYClearFeedNowPlayingSystemInfoThrottled();
         return;
@@ -1424,6 +1502,7 @@ static BOOL DYYYShouldBlockFeedNowPlayingSystemInfoWrite(void) {
 }
 
 - (void)refreshNowPlayingInfo {
+    DYYYSpeedDiag(@"[np-app] AWENowPlayingInfoCenter refreshNowPlayingInfo");
     if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
         DYYYClearFeedNowPlayingSystemInfoThrottled();
         return;
@@ -1438,6 +1517,9 @@ static BOOL DYYYShouldBlockFeedNowPlayingSystemInfoWrite(void) {
 %hook MPNowPlayingInfoCenter
 
 - (void)setNowPlayingInfo:(NSDictionary *)nowPlayingInfo {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-sys] setNowPlayingInfo: %@ block=%d | %@",
+                   DYYYNPDescribeInfo(nowPlayingInfo), (int)DYYYShouldBlockFeedNowPlayingSystemInfoWrite(),
+                   DYYYNPCallerStack()]);
     if (DYYYShouldBlockFeedNowPlayingSystemInfoWrite()) {
         %orig(nil);
         return;
@@ -1447,6 +1529,9 @@ static BOOL DYYYShouldBlockFeedNowPlayingSystemInfoWrite(void) {
 }
 
 - (void)setPlaybackState:(NSInteger)playbackState {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-sys] setPlaybackState:%ld block=%d | %@",
+                   (long)playbackState, (int)DYYYShouldBlockFeedNowPlayingSystemInfoWrite(),
+                   DYYYNPCallerStack()]);
     if (DYYYShouldBlockFeedNowPlayingSystemInfoWrite()) {
         %orig(0);
         return;
@@ -1456,6 +1541,220 @@ static BOOL DYYYShouldBlockFeedNowPlayingSystemInfoWrite(void) {
 }
 
 %end
+
+// ===== 探针 1/4：会话层 —— 谁 deactivate 了 AVAudioSession / 改了 category（卡片被系统撤走的直接原因之一）
+%hook AVAudioSession
+
+- (BOOL)setActive:(BOOL)active error:(NSError **)outError {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-session] setActive:%d error: cat=%@ mode=%@ | %@",
+                   (int)active, [self category], [self mode], DYYYNPCallerStack()]);
+    return %orig;
+}
+
+- (BOOL)setActive:(BOOL)active withOptions:(AVAudioSessionSetActiveOptions)options error:(NSError **)outError {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-session] setActive:%d options:%lu error: cat=%@ mode=%@ | %@",
+                   (int)active, (unsigned long)options, [self category], [self mode], DYYYNPCallerStack()]);
+    return %orig;
+}
+
+- (BOOL)setCategory:(AVAudioSessionCategory)category error:(NSError **)outError {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-session] setCategory:%@ | %@", category, DYYYNPCallerStack()]);
+    return %orig;
+}
+
+- (BOOL)setCategory:(AVAudioSessionCategory)category mode:(AVAudioSessionMode)mode options:(AVAudioSessionCategoryOptions)options error:(NSError **)outError {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-session] setCategory:%@ mode:%@ options:%lu | %@",
+                   category, mode, (unsigned long)options, DYYYNPCallerStack()]);
+    return %orig;
+}
+
+- (BOOL)setMode:(AVAudioSessionMode)mode error:(NSError **)outError {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-session] setMode:%@ | %@", mode, DYYYNPCallerStack()]);
+    return %orig;
+}
+
+%end
+
+// ===== 探针 2/4：远程命令层 —— 暂停时是否把 play/pause 命令 removeTarget 或 enabled=NO
+// （卡片上"播放/暂停按钮"消失，多半就是这一步）
+%hook MPRemoteCommand
+
+- (void)addTarget:(id)target action:(SEL)action {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-cmd] %@ addTarget %@.%@",
+                   NSStringFromClass([self class]),
+                   target ? NSStringFromClass([target class]) : @"(nil)",
+                   action ? NSStringFromSelector(action) : @"(null)"]);
+    %orig;
+}
+
+- (void)addTargetWithHandler:(id)handler {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-cmd] %@ addTargetWithHandler", NSStringFromClass([self class])]);
+    %orig;
+}
+
+- (void)removeTarget:(id)target action:(SEL)action {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-cmd] %@ removeTarget %@.%@",
+                   NSStringFromClass([self class]),
+                   target ? NSStringFromClass([target class]) : @"(nil)",
+                   action ? NSStringFromSelector(action) : @"(null)"]);
+    %orig;
+}
+
+- (void)removeTarget:(id)target {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-cmd] %@ removeTarget(all) %@",
+                   NSStringFromClass([self class]),
+                   target ? NSStringFromClass([target class]) : @"(nil)"]);
+    %orig;
+}
+
+- (void)setEnabled:(BOOL)enabled {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-cmd] %@ setEnabled:%d", NSStringFromClass([self class]), (int)enabled]);
+    %orig;
+}
+
+%end
+
+// ===== 探针 3/4：抖音应用层类方法 dump（一次性）——确认真实选择器名，避免"探针挂错路径"
+static void DYYYNpProbeDumpClasses(void) {
+    if (!DYYYGetBool(@"DYYYDiagLog")) {
+        return;
+    }
+    NSArray *appNames = @[@"AWENowPlayingInfoCenter", @"AWEFeedBackgroundPlayManager",
+                          @"AWEAwemeBackgroundPlayModule", @"AWEAwemeBackgroundPlayManager"];
+    NSArray *engineNames = @[@"TTVideoEngine", @"TTVideoEngineOwnPlayer"];
+    for (NSString *n in [appNames arrayByAddingObjectsFromArray:engineNames]) {
+        Class c = NSClassFromString(n);
+        if (!c) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[np-dump] %@ 不存在", n]);
+            continue;
+        }
+        BOOL isEngine = [engineNames containsObject:n];
+        NSMutableArray *sels = [NSMutableArray array];
+        unsigned int cnt = 0;
+        Method *ms = class_copyMethodList(c, &cnt);
+        for (unsigned int i = 0; i < cnt && sels.count < 80; i++) {
+            NSString *s = NSStringFromSelector(method_getName(ms[i]));
+            BOOL hit = isEngine
+                ? ([s containsString:@"play"] || [s containsString:@"pause"] || [s containsString:@"stop"] ||
+                   [s containsString:@"close"] || [s containsString:@"speed"])
+                : ([s containsString:@"play"] || [s containsString:@"pause"] || [s containsString:@"stop"] ||
+                   [s containsString:@"ackground"] || [s containsString:@"owPlaying"] ||
+                   [s containsString:@"ctive"] || [s containsString:@"ession"] || [s containsString:@"esume"]);
+            if (hit) {
+                [sels addObject:s];
+            }
+        }
+        if (ms) {
+            free(ms);
+        }
+        DYYYSpeedDiag([NSString stringWithFormat:@"[np-dump] %@ 相关方法=(%@)", n, sels]);
+    }
+}
+
+// ===== 探针 4/4：引擎层 play/pause/stop/close —— 动态只挂"真实存在的 void 无参方法"（ABI 安全）
+typedef struct {
+    SEL sel;
+    IMP orig;
+} DYYYNpEngineHookEntry;
+
+static DYYYNpEngineHookEntry dyyyNpEngineHooks[8];
+static int dyyyNpEngineHookCount = 0;
+
+static void dyyyNpEngineThunk(id self, SEL _cmd) {
+    IMP orig = NULL;
+    for (int i = 0; i < dyyyNpEngineHookCount; i++) {
+        if (sel_isEqual(dyyyNpEngineHooks[i].sel, _cmd)) {
+            orig = dyyyNpEngineHooks[i].orig;
+            break;
+        }
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-eng] <%p> %@.%@",
+                   self, NSStringFromClass([self class]), NSStringFromSelector(_cmd)]);
+    if (orig) {
+        ((void (*)(id, SEL))orig)(self, _cmd);
+    }
+}
+
+static void DYYYNpProbeInstallEngineHooks(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSArray *classes = @[@"TTVideoEngine", @"TTVideoEngineOwnPlayer"];
+        NSArray *wantSels = @[@"play", @"pause", @"stop", @"close"];
+        for (NSString *cn in classes) {
+            Class c = NSClassFromString(cn);
+            if (!c) {
+                DYYYSpeedDiag([NSString stringWithFormat:@"[np-dump] 引擎探针 %@ 未加载，跳过", cn]);
+                continue;
+            }
+            NSMutableArray *hooked = [NSMutableArray array];
+            for (NSString *sn in wantSels) {
+                SEL sel = NSSelectorFromString(sn);
+                Method m = class_getInstanceMethod(c, sel);
+                if (!m) {
+                    continue;
+                }
+                char *rt = method_copyReturnType(m);
+                char r0 = rt ? rt[0] : 0;
+                if (rt) {
+                    free(rt);
+                }
+                if (r0 != 'v' || method_getNumberOfArguments(m) != 2) {
+                    continue; // 只动 void 无参：不动带参/带返回值方法，防 ABI 错位
+                }
+                IMP orig = NULL;
+                MSHookMessageEx(c, sel, (IMP)dyyyNpEngineThunk, &orig);
+                if (dyyyNpEngineHookCount < 8) {
+                    dyyyNpEngineHooks[dyyyNpEngineHookCount].sel = sel;
+                    dyyyNpEngineHooks[dyyyNpEngineHookCount].orig = orig;
+                    dyyyNpEngineHookCount++;
+                }
+                [hooked addObject:sn];
+            }
+            DYYYSpeedDiag([NSString stringWithFormat:@"[np-dump] 引擎探针 %@ 已挂=(%@)", cn, hooked]);
+        }
+    });
+}
+
+// 生命周期 + 会话通知时间线（通知名用字面量，避免引入框架数据符号）
+static void DYYYNpProbeInstallObservers(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+        NSArray *names = @[@"UIApplicationDidEnterBackgroundNotification",
+                           @"UIApplicationWillEnterForegroundNotification",
+                           @"UIApplicationWillResignActiveNotification",
+                           @"UIApplicationDidBecomeActiveNotification",
+                           @"AVAudioSessionInterruptionNotification",
+                           @"AVAudioSessionRouteChangeNotification",
+                           @"AVAudioSessionMediaServicesWereLostNotification",
+                           @"AVAudioSessionMediaServicesWereResetNotification"];
+        for (NSString *n in names) {
+            [nc addObserverForName:n object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
+                DYYYSpeedDiag([NSString stringWithFormat:@"[np-life] %@ info=%@", note.name, note.userInfo]);
+            }];
+        }
+    });
+}
+
+static void DYYYNpProbeInstall(void) {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-dump] 开关 DYYYDisableFeedNowPlayingInfo=%d DYYYDiagLog=%d",
+                   (int)DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo"), (int)DYYYGetBool(@"DYYYDiagLog")]);
+    // hook 装载瞬间的类可用性校验：Logos 对"此刻还不存在的类"会静默跳过 hook，
+    // 这条日志用于判定 np-session/np-cmd/np-sys 零命中到底是"没发生"还是"没挂上"。
+    NSArray *verifyNames = @[@"AVAudioSession", @"MPRemoteCommand", @"MPRemoteCommandCenter", @"MPNowPlayingInfoCenter"];
+    NSMutableArray *verifyResult = [NSMutableArray array];
+    for (NSString *n in verifyNames) {
+        [verifyResult addObject:[NSString stringWithFormat:@"%@=%@", n, objc_getClass(n.UTF8String) ? @"OK" : @"MISSING"]];
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np-dump] hook挂载校验 %@", [verifyResult componentsJoinedByString:@" "]]);
+    DYYYNpProbeInstallObservers();
+    // 引擎/类的 dump 延后 5s：TTVideoEngine.framework 是懒加载，load 时刻可能还没进来
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+        DYYYNpProbeDumpClasses();
+        DYYYNpProbeInstallEngineHooks();
+    });
+}
 
 static BOOL DYYYShouldDisableAllHDR(void);
 static NSArray *DYYYFilteredSDRBitrateModels(NSArray *models);
@@ -14255,6 +14554,9 @@ static void findTargetViewInView(UIView *view) {
         @"DYYYDisableFeedNowPlayingInfo" : @YES,
         @"DYYYDiagLog" : @YES
     }];
+
+    // Now Playing 卡片消失链路探针（诊断用，日志受 DYYYDiagLog 门控）
+    DYYYNpProbeInstall();
 
     // 源头：扫描并批量拦截抖音"更新"相关类的动作方法（异步执行，不拖慢启动）
     if (DYYYGetBool(@"DYYYNoUpdates")) {
