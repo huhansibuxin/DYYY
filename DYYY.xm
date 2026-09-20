@@ -1300,9 +1300,11 @@ static void DYYYHandleCurrentSpeedAwemeChanged(id aweme) {
 // 不需要我们去猜它内部怎么恢复播放（等价于音乐 App "暂停后仍持有控制权"的模型）。
 // 回前台/恢复播放即解除托管，一切交还抖音；别的 App 要抢卡片就让它抢（不做抢占仲裁）。
 //
-// 【v2 补强】只挡清空不够（实测：暂停后抖音再没发布过非空信息，系统侧信息本来就是空的，
-// 而且 setPlaybackState: 从头到尾没被调用过）→ 收摊时还要主动把暂存的最后一份信息回写上去，
-// 并声明 playbackState=Paused。见下面 DYYYReassertNowPlayingState() 的说明。
+// 【v2 补强 → v7 已废除】v2 曾用"暂存信息回写 + 声明 Paused"来补偿，v7 判定它是【污染源】并整块移除：
+// 上游源头（setNeedClean / setNeedResign / resignPlayingPlayer / clearNowPlayingInfo / clearCommand /
+// removeRemoteCommandTarget / endReceiving）如今已全部 return，卡片根本不再被清，回写纯属多余；
+// 而且回写会用旧的暂存信息覆盖系统侧内容、强行把 playbackState 写成 Paused，直接造成
+// "控制中心控制的是上一条视频 / 点暂停不暂停"。**不要再恢复任何形式的回写。**
 //
 // 判据：用 applicationState != Active（Inactive 即命中），**不依赖通知投递时序**——
 // block 形式的通知观察者挂 mainQueue 是异步投递，可能晚于抖音的清空动作；
@@ -1472,68 +1474,18 @@ static void DYYYStashNowPlayingInfo(id info) {
     dyyyLastGoodNowPlayingInfo = [(NSDictionary *)info copy];
 }
 
-// 回写：把暂存的信息重新发布到系统播放中心，并把播放态标成"暂停"。
-// 效果 = 控制中心出现卡片且带播放键；点播放会走抖音自己注册的 handler 续播。
-static BOOL DYYYReassertNowPlayingState(void) {
-    Class cls = NSClassFromString(@"MPNowPlayingInfoCenter");
-    if (!cls) {
-        return NO;
-    }
-    id center = ((id (*)(Class, SEL))objc_msgSend)(cls, @selector(defaultCenter));
-    if (!center) {
-        return NO;
-    }
-    NSDictionary *keep = dyyyLastGoodNowPlayingInfo;
-    if (keep.count == 0) {
-        DYYYNpHoldLog(@"回写失败：无暂存信息（本会话抖音还没发布过非空信息）");
-        return NO;
-    }
-
-    NSMutableDictionary *pub = [keep mutableCopy];
-    pub[@"MPNowPlayingInfoPropertyPlaybackRate"] = @(0.0);
-
-    @try {
-        dyyyNpSelfWrite = YES;
-        ((void (*)(id, SEL, id))objc_msgSend)(center, @selector(setNowPlayingInfo:), pub);
-        SEL stateSel = NSSelectorFromString(@"setPlaybackState:");
-        if ([center respondsToSelector:stateSel]) {
-            ((void (*)(id, SEL, NSInteger))objc_msgSend)(center, stateSel, 2); // 2 = Paused
-        }
-        dyyyNpSelfWrite = NO;
-        // 【定位探针】回读验证：我们的回写到底有没有真的落进系统播放中心
-        id back = ((id (*)(id, SEL))objc_msgSend)(center, @selector(nowPlayingInfo));
-        unsigned long backCnt = 0;
-        if ([back isKindOfClass:[NSDictionary class]]) {
-            backCnt = (unsigned long)[(NSDictionary *)back count];
-        }
-        DYYYSpeedDiag([NSString stringWithFormat:@"[np2] REWRITE 写入=%lu 回读=%lu",
-                       (unsigned long)pub.count, backCnt]);
-    } @catch (__unused NSException *e) {
-        dyyyNpSelfWrite = NO;
-    }
-    DYYYNpHoldLog(@"回写 nowPlayingInfo keys=%lu title=%@ + playbackState=Paused",
-                  (unsigned long)pub.count, pub[@"title"] ?: @"-");
-    return YES;
-}
-
-// 抖音收摊后补发两次（它偶尔会晚一步再清一次）。开关关闭即放弃。
-static void DYYYScheduleNowPlayingReassert(void) {
-    static NSTimeInterval lastSchedule = 0;
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - lastSchedule < 1.0) {
-        return; // 一次收摊只排一次队（②③④会连着来）
-    }
-    lastSchedule = now;
-    for (NSNumber *d in @[@(0.3), @(1.2)]) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (!DYYYGetBool(@"DYYYKeepNowPlayingInBackground")) {
-                return;
-            }
-            DYYYReassertNowPlayingState();
-        });
-    }
-}
+// ===== ❌【v7 已整块移除】"回写/补发"机制（DYYYReassertNowPlayingState + ...Reassert）=====
+// 它曾在 v3 扮演"抖音清空后把暂存信息顶回系统"的角色，但那是【下游拉锯】。上游源头
+// （setNeedCleanNowPlayingInfo: / setNeedResignPlayingPlayer: / resignPlayingPlayer: /
+// clearNowPlayingInfo / clearCommand / removeRemoteCommandTarget / endReceivingRemoteControlEvents）
+// 如今已全部 return 掐死，回写不但无用，还是【污染源】，实测三个恶果：
+//   ① 每 1 秒最多连排两次、每次强行 setNowPlayingInfo(暂存信息) + setPlaybackState(Paused)，
+//      与抖音自身状态机高频打架 → 老板实测"开头点暂停它不会暂停 / 时好时坏"；
+//   ② 把【上一份暂存信息】顶回系统（dyyyLastGoodNowPlayingInfo 是全局单份），
+//      切到下一条视频后系统侧仍是旧内容 → 控制中心"又是上一条，只播放记录的第一条视频"；
+//   ③ 强行把 playbackState 写成 Paused，覆盖抖音真实播放态。
+// 老板定的原则："不要拦清空→回写拉锯，要在源头让它 return"。现在源头已 return，回写删除。
+// 保留 DYYYStashNowPlayingInfo 仅作留痕用（不再有任何回写动作）。
 
 // 只保 play/pause/toggle 三条命令（用命令中心实例判等，最可靠）：
 // stop/close 必须放行——用户点卡片上的"关闭"是明确要关，不能也被挡住。
@@ -1571,7 +1523,6 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 - (void)setPlayingPlayer:(id)player {
     if (!player && DYYYShouldHoldNowPlaying()) {
         DYYYNpHoldLog(@"挡下 AWENowPlayingInfoCenter setPlayingPlayer:(nil)");
-        DYYYScheduleNowPlayingReassert();
         return;
     }
 
@@ -1584,7 +1535,6 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
     // 清空抖音侧信息（收摊第②步）→ 托管中吞掉。暂停那一刻就会来，必须挡。
     if (!nowPlayingInfo && DYYYShouldHoldNowPlaying()) {
         DYYYNpHoldLog(@"挡下 AWENowPlayingInfoCenter setNowPlayingInfo:(nil)");
-        DYYYScheduleNowPlayingReassert();
         return;
     }
 
@@ -1598,7 +1548,6 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
                    player ? NSStringFromClass([player class]) : @"(nil)"]);
     if (DYYYShouldHoldNowPlaying()) {
         DYYYSpeedDiag(@"[np3] 拦下 resignPlayingPlayer:");
-        DYYYScheduleNowPlayingReassert();
         return;
     }
 
@@ -1687,7 +1636,6 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
     DYYYSpeedDiag([NSString stringWithFormat:@"[np3] setNeedCleanNowPlayingInfo:%d", (int)value]);
     if (value && DYYYShouldHoldNowPlaying()) {
         DYYYSpeedDiag(@"[np3] 拦下 setNeedCleanNowPlayingInfo:YES（源头掐死）");
-        DYYYScheduleNowPlayingReassert();
         return;
     }
 
@@ -1699,7 +1647,6 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
     DYYYSpeedDiag([NSString stringWithFormat:@"[np3] setNeedResignPlayingPlayer:%d", (int)value]);
     if (value && DYYYShouldHoldNowPlaying()) {
         DYYYSpeedDiag(@"[np3] 拦下 setNeedResignPlayingPlayer:YES（源头掐死）");
-        DYYYScheduleNowPlayingReassert();
         return;
     }
 
@@ -1717,19 +1664,10 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
     %orig;
 }
 
-// 【v5 新发现】forbidResumePlayFromBackground = "禁止从后台恢复播放"（dump 方法表里扒出来的）。
-// 老板实测："控制中心那个播放按钮，它会打开最开始那个视频，就是不会播放" —— 这条 getter 就是
-// 那个"不会播放"的开关：抖音暂停后退后台把它置 YES，于是远程 play 命令即使被收到也被拒绝，
-// 只剩下"切回前台打开视频"的残action。托管中强制 NO，让抖音自己的 handlePlayCommand 真正续播
-//（它才是唯一知道"当前该播哪一条"的人，我们不猜它的播放上下文）。
-- (BOOL)forbidResumePlayFromBackground {
-    BOOL v = %orig;
-    if (v && DYYYShouldHoldNowPlaying()) {
-        DYYYSpeedDiag(@"[np5] forbidResumePlayFromBackground=YES → 托管中强制 NO（让后台点播放真能续播）");
-        return NO;
-    }
-    return v;
-}
+// 【v7 已移除】forbidResumePlayFromBackground 的强制改写。
+// v5 曾把它的 YES 强改 NO，理由是"让后台点播放真能续播"——纯推测，实测有害（本次日志命中 11 次）：
+// 抖音把它置 YES 是它自己状态机的决定，我们越权改写只会把控制中心的播放命令引到错误的恢复路径上
+//（老板实测"只播放记录的第一条视频"）。恢复原样，不再干预抖音的播放状态机。
 
 %end
 
@@ -1746,26 +1684,12 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
     // 暂存抖音发布到系统的非空信息（回写时的内容来源）
     DYYYStashNowPlayingInfo(nowPlayingInfo);
 
-    // 清空系统侧信息 = 卡片被撤的直接原因。托管中不吞掉，而是【同步】用暂存内容顶回去。
-    // 同步是重点：之前靠 dispatch_after 延后回写，App 退后台被系统挂起后 block 根本没跑
-    //（日志里回写记录 0 条，就是这个原因），所以必须在这里当场写回。
+    // 清空系统侧信息 = 卡片被撤的直接原因。托管中【直接吞掉】不调 %orig，
+    // 但**不再做"将暂存信息顶回"的下游拉锯**——那正是导致"控制中心控制的是上一条视频 /
+    // 播放态被强行写成 Paused / 时好时坏"的根源（详见上方 v7 移除说明）。
+    // 上游源头已经全部 return，这里只需安静地不让清空落地。
     if (nowPlayingInfo.count == 0 && DYYYShouldHoldNowPlaying()) {
-        NSDictionary *keep = dyyyLastGoodNowPlayingInfo;
-        if (keep.count > 0) {
-            NSMutableDictionary *pub = [keep mutableCopy];
-            pub[@"MPNowPlayingInfoPropertyPlaybackRate"] = @(0.0);
-            dyyyNpSelfWrite = YES;
-            %orig(pub);
-            dyyyNpSelfWrite = NO;
-            DYYYNpHoldLog(@"同步顶回 nowPlayingInfo keys=%lu title=%@",
-                          (unsigned long)pub.count, pub[@"title"] ?: @"-");
-        } else {
-            DYYYNpHoldLog(@"清空被挡但无暂存信息可顶回");
-        }
-        // 【定位探针】回读：确认系统侧现在实际是什么（验证"回写到底有没有落地"）
-        NSDictionary *actual = [self nowPlayingInfo];
-        DYYYSpeedDiag([NSString stringWithFormat:@"[np2] AFTER readback cnt=%lu title=%@",
-                       (unsigned long)actual.count, actual[@"title"] ?: @"-"]);
+        DYYYNpHoldLog(@"挡下 MPNowPlayingInfoCenter setNowPlayingInfo:(nil)");
         return;
     }
 
