@@ -1543,9 +1543,24 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 
 // 【v4 定位+掐死】resignPlayingPlayer: = 显式"辞去正在播放身份"（动作方法，比属性 setter 更可能
 // 是抖音停播时真正走的那一步）。记录 + 托管中直接 return，不让它辞职。
+// 【v8 关键修正】入参有三种（实测分布：Foreground 15 / nil 15 / AwemeBackgroundPlayModule 7），
+// 它们的语义完全不同，**绝不能无差别全拦**：
+//   AWEPlayVideoForegroundRemoteControlManager ← **前台切换视频时的正常交接**，必须放行！
+//   AWEAwemeBackgroundPlayModule                ← 后台播放模块收摊，拦
+//   (nil)                                       ← 通用清理，拦
+// 铁证（diag/v7.log）：10:15:17 老板在抖音滑到下一条视频，抖音调
+//   `resignPlayingPlayer:AWEPlayVideoForegroundRemoteControlManager` 交接前台远程控制 →
+//   被我们拦下后，`setCurrentNowPlayingInfo` 再没出现过非空值(cnt=0 一路到 10:16:20)、
+//   `SET info`（系统侧发布）彻底停摆 → 控制中心永远停在旧视频、点播放无响应。
+// 结论：拦"辞职"必须按对象区分——前台交接放行，只掐后台收摊。
 - (void)resignPlayingPlayer:(id)player {
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] hit resignPlayingPlayer: %@",
-                   player ? NSStringFromClass([player class]) : @"(nil)"]);
+    NSString *cls = player ? NSStringFromClass([player class]) : @"(nil)";
+    if ([cls containsString:@"Foreground"]) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[np3] 放行前台交接 resignPlayingPlayer: %@", cls]);
+        %orig;
+        return;
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] hit resignPlayingPlayer: %@", cls]);
     if (DYYYShouldHoldNowPlaying()) {
         DYYYSpeedDiag(@"[np3] 拦下 resignPlayingPlayer:");
         return;
