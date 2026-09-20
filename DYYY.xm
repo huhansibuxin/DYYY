@@ -1409,7 +1409,7 @@ static NSDictionary *DYYYBuildMinimalNPInfoFromPlayer(void) {
             SEL sel = NSSelectorFromString(selName);
             if ([model respondsToSelector:sel]) {
                 id t = ((id (*)(id, SEL))objc_msgSend)(model, sel);
-                if ([t isKindOfClass:[NSString class]] && t.length > 0) {
+                if ([t isKindOfClass:[NSString class]] && [(NSString *)t length] > 0) {
                     title = t;
                     break;
                 }
