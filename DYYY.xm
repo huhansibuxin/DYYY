@@ -1640,6 +1640,120 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
     return NO;
 }
 
+// ===== 【v12】播放态镜像：让控制中心知道"抖音现在到底是播放还是暂停" =====
+// 症结（已联网核实，不是猜的）：控制中心那个按钮画的是"暂停键"还是"播放键"，由 nowPlayingInfo
+// 里的 MPNowPlayingInfoPropertyPlaybackRate 决定 ——
+//   1.0（>0）= 系统认为在播 → 显示【暂停键】；0.0 = 系统知道已暂停 → 显示【播放键】。
+// 抖音【从不写这个键】，也从不调 MPNowPlayingInfoCenter.setPlaybackState:
+//（本机实测 setPlaybackState: 调用 0 次，日志里 [np2] STATE 一次都没出现）
+// → 系统永远当它在播放 → 老板实测"暂停后退到主界面，控制中心显示的是暂停按钮"。
+// 对策：内容一个字节都不改，只在【同一次调用内】把正确的 rate 值补进字典副本再交给 %orig。
+//   没有异步回写、没有全局暂存、不和其他调用打架 —— 与"不要回写拉锯"的原则不冲突。
+// 状态来源：抖音自己的 getter 多信号投票（缺哪个都不影响）：
+//   backgroundIsPlaying      = 后台播放模块"当前是否在播"
+//   canPauseForRemoteControl = 现在允许暂停 → 说明在播
+//   canPlayForRemoteControl  = 现在允许播放 → 说明已暂停
+static BOOL dyyyNpRatePatching = NO;   // 重入保护：读 getter 若又触发发布，不二次修正
+
+// 把抖音模块的播放态 getter 打成一行（探针用；缺某个 selector 打 "-"）
+static NSString *DYYYPlayStateDesc(id m) {
+    if (!m) {
+        return @"(nil)";
+    }
+    NSMutableString *s = [NSMutableString string];
+    for (NSString *name in @[@"backgroundIsPlaying", @"canPlayForRemoteControl", @"canPauseForRemoteControl"]) {
+        SEL sel = NSSelectorFromString(name);
+        if ([m respondsToSelector:sel]) {
+            BOOL v = ((BOOL (*)(id, SEL))objc_msgSend)(m, sel);
+            [s appendFormat:@"%@=%d ", name, (int)v];
+        } else {
+            [s appendFormat:@"%@=- ", name];
+        }
+    }
+    return s;
+}
+
+// 返回：1 = 正在播放，2 = 已暂停，0 = 证据不足（此时绝不改动字典，保持抖音原样）
+// 阈值 |score| >= 2 是刻意的"保守档"：证据打架时一律判"不确定"→ 不动作、不产生回归。
+static NSInteger DYYYReadDouyinPlayState(void) {
+    id m = dyyyBGPlayModuleInstance;
+    if (!m) {
+        return 0;
+    }
+    NSInteger score = 0;
+    @try {
+        SEL s1 = NSSelectorFromString(@"backgroundIsPlaying");
+        if ([m respondsToSelector:s1]) {
+            score += ((BOOL (*)(id, SEL))objc_msgSend)(m, s1) ? 3 : -3;
+        }
+        SEL s2 = NSSelectorFromString(@"canPauseForRemoteControl");
+        if ([m respondsToSelector:s2]) {
+            score += ((BOOL (*)(id, SEL))objc_msgSend)(m, s2) ? 1 : -1;
+        }
+        SEL s3 = NSSelectorFromString(@"canPlayForRemoteControl");
+        if ([m respondsToSelector:s3]) {
+            score += ((BOOL (*)(id, SEL))objc_msgSend)(m, s3) ? -1 : 1;
+        }
+    } @catch (__unused NSException *e) {
+        return 0;
+    }
+    if (score >= 2) {
+        return 1;
+    }
+    if (score <= -2) {
+        return 2;
+    }
+    return 0;
+}
+
+// 只在 rate 的"符号"不对时才改字典（系统只看符号），改动最小、不抖动
+static NSDictionary *DYYYRateCorrectedNowPlayingInfo(NSDictionary *info, NSInteger state) {
+    if (!info || state == 0) {
+        return info;
+    }
+    BOOL playing = (state == 1);
+    id cur = info[@"MPNowPlayingInfoPropertyPlaybackRate"];
+    if ([cur isKindOfClass:[NSNumber class]] && (([cur floatValue] > 0.0f) == playing)) {
+        return info;   // 已经正确，一个字节都不动
+    }
+    NSMutableDictionary *d = [info mutableCopy];
+    d[@"MPNowPlayingInfoPropertyPlaybackRate"] = @(playing ? 1.0f : 0.0f);
+    if (!d[@"MPNowPlayingInfoPropertyDefaultPlaybackRate"]) {
+        d[@"MPNowPlayingInfoPropertyDefaultPlaybackRate"] = @(1.0f);
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np7] 修正 rate → %.1f（抖音状态=%ld，rate 原值=%@）",
+                   playing ? 1.0 : 0.0, (long)state,
+                   [cur isKindOfClass:[NSNumber class]] ? [NSString stringWithFormat:@"%.2f", [cur floatValue]] : @"无此键"]);
+    return d;
+}
+
+// 第二条通道：显式声明 playbackState（抖音从不调，本机实测 0 次）
+static void DYYYDeclarePlaybackState(NSInteger state) {
+    if (state == 0) {
+        return;
+    }
+    Class cls = NSClassFromString(@"MPNowPlayingInfoCenter");
+    if (!cls) {
+        return;
+    }
+    @try {
+        id center = ((id (*)(Class, SEL))objc_msgSend)(cls, @selector(defaultCenter));
+        if (!center) {
+            return;
+        }
+        NSInteger cur = ((NSInteger (*)(id, SEL))objc_msgSend)(center, NSSelectorFromString(@"playbackState"));
+        if (cur == state) {
+            return;
+        }
+        dyyyNpSelfWrite = YES;
+        ((void (*)(id, SEL, NSInteger))objc_msgSend)(center, NSSelectorFromString(@"setPlaybackState:"), state);
+        dyyyNpSelfWrite = NO;
+        DYYYSpeedDiag([NSString stringWithFormat:@"[np7] 声明 playbackState %ld → %ld", (long)cur, (long)state]);
+    } @catch (__unused NSException *e) {
+        dyyyNpSelfWrite = NO;
+    }
+}
+
 // 【已移除】AWEAwemeBackgroundPlayModule / AWEFeedBackgroundPlayManager 两个 hook 块：
 // 它们只服务于已删除的「信息流不显示播放信息」开关（清空系统 nowPlayingInfo），
 // 与保留卡片的目标冲突，整块删除。抖音的播放信息走 AWENowPlayingInfoCenter，
@@ -1846,7 +1960,11 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 }
 
 - (void)updateNowPlayingInfoPlayback {
-    DYYYSpeedDiag(@"[np6] hit updateNowPlayingInfoPlayback");
+    // 【v12 探针】这个方法是"播放心跳"（播放中约每 1-2 秒一次）。把三个状态 getter 的真实值
+    // 和我们的投票结果一起打出来 —— 下一版日志可直接核对"暂停时 getter 是不是真的翻过来了"，
+    // 若翻不过来，说明 backgroundIsPlaying 语义不是"是否在播"，照日志换权重即可。
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np7] updateNowPlayingInfoPlayback 抖音态: %@| 判定=%ld",
+                   DYYYPlayStateDesc(self), (long)DYYYReadDouyinPlayState()]);
     %orig;
 }
 
@@ -1873,6 +1991,22 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
     if (nowPlayingInfo.count == 0 && DYYYShouldHoldNowPlaying()) {
         DYYYNpHoldLog(@"挡下 MPNowPlayingInfoCenter setNowPlayingInfo:(nil)");
         return;
+    }
+
+    // 【v12】非空发布 → 按抖音真实播放态补上 MPNowPlayingInfoPropertyPlaybackRate。
+    // 这个键就是控制中心"画播放键还是暂停键"的开关（1.0=暂停键 / 0.0=播放键），抖音从不写它，
+    // 所以卡片永远停在"暂停键"。我们只补这一个键，标题/封面/时长等内容一字不改。
+    // 重入保护：读抖音 getter 若又触发一次发布，那次直接放行、不做二次修正。
+    if (nowPlayingInfo.count > 0 && !dyyyNpRatePatching && DYYYShouldHoldNowPlaying()) {
+        dyyyNpRatePatching = YES;
+        NSInteger ps = DYYYReadDouyinPlayState();
+        NSDictionary *fixed = DYYYRateCorrectedNowPlayingInfo(nowPlayingInfo, ps);
+        DYYYDeclarePlaybackState(ps);
+        dyyyNpRatePatching = NO;
+        if (fixed != nowPlayingInfo) {
+            %orig(fixed);
+            return;
+        }
     }
 
     %orig;
