@@ -1369,75 +1369,16 @@ static BOOL dyyyNpPublishedSinceBoost = NO;   // Boost 后系统侧是否出现�
 // "回写拉锯"本质不同：不循环、只在原生发布链确认不动作时发一次、发布内容是暂停瞬间的
 // 最新缓存（不会出现"上一条视频"）、rate 按投票补齐。
 static NSDictionary *dyyyLastGoodCurrentNPInfo = nil;
-static __weak id dyyyLastMergeVC = nil;   // 【v15.4】AWEDPlayerViewController_Merge 实例（hook 里缓存），兜底自建字典用
 
 // 前置声明（实现在下方 v12 播放态镜像区，Boost 兜底单发要用）
 static NSInteger DYYYReadDouyinPlayState(void);
 static NSDictionary *DYYYRateCorrectedNowPlayingInfo(NSDictionary *info, NSInteger state);
 static void DYYYDeclarePlaybackState(NSInteger state);
 
-// 【v15.4】兜底最后手段：store 空 + 无缓存（原生发布链整场没跑过，如 16:27 第二轮重启会话：
-// 全场零次系统发布、store cnt=0、缓存 nil → 兜底彻底没弹药）时，自建最小字典（标题 + rate=0
-// + 时长）直发系统侧。
-// 【v15.5】弹药源修正（16:40 第二轮实测 respondsToSelector 探测全落空）：
-//   主源 = 速度功能现成跟踪的 dyyyCurrentSpeedAweme（AWEFeedContainerViewController 每次滑视频
-//          currentIndexDidChange 时更新，最可靠）；
-//   备源 = DYYYSpeedAwemeFromObject(Merge VC)——速度功能实战验证的 KVC 探测（valueForKey:
-//          能读到不响应 selector 的私有属性），比手动 respondsToSelector 强得多。
-// 摸不到就放弃——宁可不上卡片也不发错内容。仍是一次性单发，非回写拉锯。
-static NSDictionary *DYYYBuildMinimalNPInfoFromPlayer(void) {
-    AWEAwemeModel *model = dyyyCurrentSpeedAweme ?: DYYYSpeedAwemeFromObject(dyyyLastMergeVC);
-    if (!model) {
-        DYYYSpeedDiag(@"[npv] 自建字典跳过(速度跟踪无模型且 VC KVC 探测失败)");
-        return nil;
-    }
-    @try {
-        NSString *title = nil;
-        for (NSString *key in @[ @"desc", @"title", @"descriptionString" ]) {
-            @try {
-                id t = [model valueForKey:key];
-                if ([t isKindOfClass:[NSString class]] && [(NSString *)t length] > 0) {
-                    title = t;
-                    break;
-                }
-            } @catch (__unused NSException *e) {
-            }
-        }
-        if (!title) {
-            DYYYSpeedDiag(@"[npv] 自建字典跳过(模型无标题)");
-            return nil;
-        }
-        double duration = 0;
-        for (id holder in @[ model, [model valueForKeyPath:@"video"] ?: [NSNull null] ]) {
-            if (holder == [NSNull null] || ![holder respondsToSelector:NSSelectorFromString(@"valueForKey:")]) {
-                continue;
-            }
-            @try {
-                id v = [holder valueForKey:@"duration"];
-                if ([v isKindOfClass:[NSNumber class]]) {
-                    double d = [(NSNumber *)v doubleValue];
-                    if (d > 0 && d < 86400) {
-                        duration = d;
-                        break;
-                    }
-                }
-            } @catch (__unused NSException *e) {
-            }
-        }
-        NSMutableDictionary *info = [NSMutableDictionary dictionary];
-        info[@"title"] = title;
-        info[@"rate"] = @0.0;   // 暂停态 → 控制中心画播放键
-        if (duration > 0) {
-            info[@"duration"] = @(duration);
-        }
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 自建字典 OK：model=%@ 时长=%.0fs 标题=%@",
-            NSStringFromClass([model class]), duration, title]);
-        return info;
-    } @catch (NSException *e) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 自建字典 exception: %@", e.reason ?: @"unknown"]);
-        return nil;
-    }
-}
+// 【已移除】v15.4/v15.5 的"自建最小字典"兜底（DYYYBuildMinimalNPInfoFromPlayer）。
+// 四轮实机（2026-09-20 16:50~16:54）统计：该函数命中 0 次——v15.3 吞掉空 store 写入后，
+// 抖音的 store 再也没被清过，原生链每次暂停都能发布（系统发布 38 次、缓存永远有货），
+// 兜底永远走"用抖音缓存信息直发"那条路（命中 8 次），自建这条路彻底成为死代码。
 
 // 主动声明"本 App 继续接收远程控制"——抖音在拉控制中心时自己也会调这一步（实测 19 次）。
 // 该方法是幂等的（抖音自己反复调没事），且它内部就是 MRMediaRemoteSetCanBeNowPlayingApplication(1)。
@@ -1475,12 +1416,10 @@ static void DYYYBoostNowPlayingAfterPause(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (!DYYYShouldHoldNowPlaying()) {
-            DYYYSpeedDiag(@"[npv] Boost 放弃(托管已撤)");
             return;
         }
         id m = dyyyBGPlayModuleInstance;
         if (!m) {
-            DYYYSpeedDiag(@"[npv] Boost 放弃(无 BGPlayModule 实例)");
             return;
         }
         SEL resignSel = NSSelectorFromString(@"appWillResignActiveNotification");
@@ -1552,8 +1491,7 @@ static void DYYYBoostNowPlayingAfterPause(void) {
             //    只发一次（不循环）、信息是暂停瞬间的最新缓存、仅强证据"已暂停"(投票=2)才动作。
             NSInteger vote = DYYYReadDouyinPlayState();
             if (vote != 2) {
-                DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 兜底跳过(投票=%ld 非强暂停)", (long)vote]);
-                return;
+                return;   // 投票非强暂停（切视频/在播）→ 不介入，避免误伤交接
             }
             NSDictionary *cached = dyyyLastGoodCurrentNPInfo;
             if (cached.count == 0) {
@@ -1571,17 +1509,8 @@ static void DYYYBoostNowPlayingAfterPause(void) {
                 }
             }
             if (cached.count == 0) {
-                // 【v15.4】缓存/store 全空（原生发布链整场没跑过，如 16:27 第二轮重启会话：
-                // 全场零次系统发布 → store 永远没被填过）→ 从 Merge VC 的视频模型自建
-                // 最小字典（标题+rate=0+时长）作为最后弹药。
-                NSDictionary *built = DYYYBuildMinimalNPInfoFromPlayer();
-                if (built.count == 0) {
-                    DYYYSpeedDiag(@"[npv] 兜底跳过(无缓存信息且自建失败)");
-                    return;
-                }
-                cached = built;
-                dyyyLastGoodCurrentNPInfo = built;
-                DYYYSpeedDiag(@"[npv] 兜底弹药：store/缓存全空，用视频模型自建最小字典");
+                DYYYSpeedDiag(@"[npv] 兜底跳过(无缓存信息)");
+                return;
             }
             @try {
                 Class mpCls = NSClassFromString(@"MPNowPlayingInfoCenter");
@@ -13431,7 +13360,6 @@ static Class tabBarButtonClass = nil;
 
 - (void)viewDidLayoutSubviews {
     %orig;
-    dyyyLastMergeVC = self;   // 【v15.5】扩大兜底 KVC 探测面（与 Merge VC 同等候选）
     if (DYYYGetBool(@"DYYYEnableFullScreen")) {
         UIView *contentView = self.contentView;
         if (contentView && contentView.superview) {
@@ -13481,7 +13409,6 @@ static Class tabBarButtonClass = nil;
 
 - (void)viewDidLayoutSubviews {
     %orig;
-    dyyyLastMergeVC = self;   // 【v15.4】兜底自建字典的模型来源（最后布局的≈当前可见视频）
     if (DYYYGetBool(@"DYYYEnableFullScreen")) {
         UIView *contentView = self.contentView;
         if (contentView && contentView.superview) {
