@@ -1402,6 +1402,13 @@ static void DYYYNoteAwemeChangedFrom(id object, NSString *source) {
     dyyyCurrentAwemeTitle = title;
     DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 切视频候选 %@ → 当前=%@ | 系统侧=%@",
         source, title, DYYYCurrentSystemNPTitle() ?: @"-"]);
+
+    // ⭐【v18】切视频瞬间主动催一次原生发布。
+    // 实测（diag/v17_check.log）：切到新视频后，抖音要 1~2s 才把新信息发到系统侧，
+    // 这段窗口里控制中心挂的还是上一条 —— 正是老板说的"上下滑后直接打开控制中心看，
+    // 有时候没有滑到当前那一条"。催一次把窗口从 ~1.5s 压到 ~0.4s；函数自带节流，
+    // 因为 setIsAutoPlay 等挂点同一秒会连打 2 次。
+    DYYYCutVideoNudge();
 }
 
 // 运行时取系统当前 nowPlayingInfo 的键数。
@@ -1477,6 +1484,8 @@ static NSDictionary *dyyyLastGoodCurrentNPInfo = nil;
 static NSInteger DYYYReadDouyinPlayState(void);
 static NSDictionary *DYYYRateCorrectedNowPlayingInfo(NSDictionary *info, NSInteger state);
 static void DYYYDeclarePlaybackState(NSInteger state);
+// 前置声明（实现在 DYYYBoostNowPlayingAfterPause 之后，切视频留痕处调用）
+static void DYYYCutVideoNudge(void);
 
 // 【已移除】v15.4/v15.5 的"自建最小字典"兜底（DYYYBuildMinimalNPInfoFromPlayer）。
 // 四轮实机（2026-09-20 16:50~16:54）统计：该函数命中 0 次——v15.3 吞掉空 store 写入后，
@@ -1538,7 +1547,8 @@ static void DYYYBoostNowPlayingAfterPause(void) {
                 // 一旦被当成弹药缓存，兜底就会把它顶到控制中心 → 卡片显示别的视频。
                 if (DYYYNPInfoLooksComplete(live)) {
                     dyyyLastGoodCurrentNPInfo = live;
-                    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 缓存模块 store cnt=%lu", (unsigned long)live.count]);
+                    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 缓存模块 store cnt=%lu title=%@（当前视频=%@）",
+                        (unsigned long)live.count, live[@"title"] ?: @"-", dyyyCurrentAwemeTitle ?: @"-"]);
                 } else if ([live isKindOfClass:[NSDictionary class]] && live.count > 0) {
                     DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 拒收残缺弹药：store cnt=%lu title=%@",
                         (unsigned long)live.count, live[@"title"] ?: @"-"]);
@@ -1604,11 +1614,28 @@ static void DYYYBoostNowPlayingAfterPause(void) {
             // 派发，真正的发布常在快照之后才落地（v16 实测：补一轮与 PUB 同秒到达，上面那条复查
             // 0 命中、兜底照样跑掉 → 用旧缓存把新内容盖回去）。这里改读【此刻实时】的系统侧：
             // 只要它已经有内容，就说明抖音自己发过了，兜底的存在意义（原生闸门不开）不成立。
+            // ⭐⭐【v18 关键修正】v17 这里只判"系统侧非空"就收手，是【错的】——
+            // 实测 diag/v17_check.log：12 次兜底放弃里有 9 次系统侧挂的是【别的视频】（多为上一条）。
+            // 原因：切视频后抖音要 1~2s 才把新信息发到系统侧，窗口内系统侧仍是旧内容，却被我们
+            // 当成"已有实时内容"→ 放弃兜底 → 卡片停在旧视频。这正是老板报的
+            // "上下滑后直接打开控制中心看，有时候没有滑到当前那一条"。
+            // 改按【内容是否等于当前视频】判定：等于当前视频才放弃；空/不是当前视频 → 继续往下兜底。
             NSDictionary *sysLive = DYYYCurrentSystemNPInfo();
             NSString *sysLiveTitle = [sysLive[@"title"] isKindOfClass:[NSString class]] ? sysLive[@"title"] : nil;
-            if (sysLive.count > 0 && sysLiveTitle.length > 0) {
-                DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 兜底放弃：系统侧已有实时内容 title=%@", sysLiveTitle]);
+            BOOL sysHasContent = (sysLive.count > 0 && sysLiveTitle.length > 0);
+            if (sysHasContent && dyyyCurrentAwemeTitle.length > 0 &&
+                [sysLiveTitle isEqualToString:dyyyCurrentAwemeTitle]) {
+                DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 兜底放弃：系统侧已是当前视频 title=%@", sysLiveTitle]);
                 return;
+            }
+            if (sysHasContent && dyyyCurrentAwemeTitle.length == 0) {
+                // 当前视频未知（本轮没抓到切视频事件）→ 无从比对，保守收手，宁可不发也不发错。
+                DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 兜底放弃：系统侧有内容(当前视频未知) title=%@", sysLiveTitle]);
+                return;
+            }
+            if (sysHasContent) {
+                DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 系统侧≠当前视频(系统=%@ | 当前=%@) → 继续兜底",
+                    sysLiveTitle, dyyyCurrentAwemeTitle]);
             }
 
             // ② 【v15.1】原生链兜底单发。15:54 实测定案：抖音的
@@ -1661,6 +1688,133 @@ static void DYYYBoostNowPlayingAfterPause(void) {
                 }
             } @catch (NSException *e) {
                 DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 兜底单发 exception: %@", e.reason ?: @"unknown"]);
+            }
+        });
+    });
+}
+
+// ⭐【v18 新增】切视频瞬间主动催一次原生发布 —— 专治"上下滑切视频后，立刻打开控制中心
+// 看到的还是上一条"。
+//
+// 为什么需要它：实测 diag/v17_check.log，切到新视频（SWITCH 命中）到系统侧真正发出新信息
+// （PUB）之间稳定存在 1~2s 空窗，这段窗口里控制中心挂的仍是上一条。抖音自己不会立即发，
+// 只有"暂停检测 Boost"或"1.2s 补一轮"才把它催出来 —— 而用户切完视频马上就拉控制中心，
+// 正好落在这个空窗里，于是"有时候没有滑到当前那一条"。
+//
+// 做法：切视频留痕处调用，延迟 0.4s（等抖音内部把当前 aweme 换完）后走一遍已被实测定案的
+// 原生促发顺序（beginReceiving → updateNowPlayingInfoWhenResiginActive →
+// appWillResignActiveNotification），把被动等待变主动催发。0.9s 后再复查一次：若系统侧仍
+// 不是当前视频，就用模块 store / 缓存里【属于当前视频】的那一份直发系统侧（最后一道保险，
+// 只用当前视频的弹药，杜绝 v16 那种"用旧缓存盖新内容"）。
+//
+// 节流 1.0s：setIsAutoPlay / prepareForDisplay / setModel 等挂点同一秒会连打 2~4 次，不节流
+// 会重复催发。与暂停 Boost 的 1.5s 节流【各自独立】—— 否则切视频的催发会被后者吃掉
+//（v17 日志里 "Boost 节流跳过" 16 次，就是被吃掉的证据）。
+static void DYYYCutVideoNudge(void) {
+    if (!DYYYShouldHoldNowPlaying()) {
+        return;
+    }
+    static NSTimeInterval lastNudge = 0;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - lastNudge < 1.0) {
+        DYYYSpeedDiag(@"[npv] 切视频催发节流跳过");
+        return;
+    }
+    lastNudge = now;
+
+    NSString *expectTitle = dyyyCurrentAwemeTitle ?: @"";
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!DYYYShouldHoldNowPlaying()) {
+            return;
+        }
+        id m = dyyyBGPlayModuleInstance;
+        if (!m) {
+            return;
+        }
+        NSString *sysTitle0 = DYYYCurrentSystemNPTitle() ?: @"-";
+        if (expectTitle.length > 0 && [sysTitle0 isEqualToString:expectTitle]) {
+            DYYYSpeedDiag(@"[npv] 切视频催发:系统侧已跟上，跳过");
+            return;
+        }
+        SEL updateSel = NSSelectorFromString(@"updateNowPlayingInfoWhenResiginActive");
+        SEL resignSel = NSSelectorFromString(@"appWillResignActiveNotification");
+        @try {
+            DYYYForceBeginReceivingRemoteControlEvents();
+            BOOL didUpdate = [m respondsToSelector:updateSel];
+            BOOL didResign = [m respondsToSelector:resignSel];
+            if (didUpdate) {
+                ((void (*)(id, SEL))objc_msgSend)(m, updateSel);
+            }
+            if (didResign) {
+                ((void (*)(id, SEL))objc_msgSend)(m, resignSel);
+            }
+            DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 切视频催发 update=%d resign=%d | 期望=%@ | 催前系统侧=%@",
+                didUpdate, didResign, expectTitle, sysTitle0]);
+        } @catch (NSException *e) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 切视频催发 exception: %@", e.reason ?: @"unknown"]);
+        }
+
+        // 0.9s 后复查：系统侧还不是当前视频 → 用"属于当前视频"的弹药直发一次
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (!DYYYShouldHoldNowPlaying()) {
+                return;
+            }
+            NSString *sysTitle = DYYYCurrentSystemNPTitle() ?: @"";
+            if (expectTitle.length > 0 && [sysTitle isEqualToString:expectTitle]) {
+                DYYYSpeedDiag(@"[npv] 切视频复查：系统侧已跟上 ✓");
+                return;
+            }
+            id m2 = dyyyBGPlayModuleInstance;
+            NSDictionary *live = nil;
+            SEL getterSel = NSSelectorFromString(@"currentNowPlayingInfo");
+            @try {
+                if (m2 && [m2 respondsToSelector:getterSel]) {
+                    id v = ((id (*)(id, SEL))objc_msgSend)(m2, getterSel);
+                    if ([v isKindOfClass:[NSDictionary class]]) {
+                        live = (NSDictionary *)v;
+                    }
+                }
+            } @catch (__unused NSException *e) {
+            }
+            NSString *liveTitle = [live[@"title"] isKindOfClass:[NSString class]] ? live[@"title"] : nil;
+
+            NSDictionary *use = nil;
+            NSString *src = nil;
+            if (live && DYYYNPInfoLooksComplete(live) && expectTitle.length > 0 &&
+                liveTitle.length > 0 && [liveTitle isEqualToString:expectTitle]) {
+                use = live;
+                src = @"模块store";
+            } else if (dyyyLastGoodCurrentNPInfo.count > 0 && expectTitle.length > 0) {
+                NSString *ct = [dyyyLastGoodCurrentNPInfo[@"title"] isKindOfClass:[NSString class]]
+                             ? dyyyLastGoodCurrentNPInfo[@"title"] : nil;
+                if (ct.length > 0 && [ct isEqualToString:expectTitle]) {
+                    use = dyyyLastGoodCurrentNPInfo;
+                    src = @"缓存";
+                }
+            }
+            if (!use) {
+                DYYYSpeedDiag([NSString stringWithFormat:
+                    @"[npv] 切视频复查：未跟上且无当前视频弹药(系统=%@ | 期望=%@ | store=%@)",
+                    sysTitle.length ? sysTitle : @"-", expectTitle, liveTitle ?: @"-"]);
+                return;
+            }
+            @try {
+                Class mpCls = NSClassFromString(@"MPNowPlayingInfoCenter");
+                id center = mpCls ? ((id (*)(Class, SEL))objc_msgSend)(mpCls, @selector(defaultCenter)) : nil;
+                if (center && [center respondsToSelector:@selector(setNowPlayingInfo:)]) {
+                    NSInteger st = (DYYYReadDouyinPlayState() == 2) ? 2 : 1;
+                    NSDictionary *fixed = DYYYRateCorrectedNowPlayingInfo(use, st);
+                    ((void (*)(id, SEL, id))objc_msgSend)(center, @selector(setNowPlayingInfo:), fixed);
+                    DYYYDeclarePlaybackState(st);
+                    DYYYSpeedDiag([NSString stringWithFormat:
+                        @"[npv] 切视频复查补发(%@)：系统侧未跟上，直发当前视频信息 title=%@ | 态=%ld",
+                        src, expectTitle, (long)st]);
+                }
+            } @catch (NSException *e) {
+                DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 切视频复查补发 exception: %@", e.reason ?: @"unknown"]);
             }
         });
     });
