@@ -1682,7 +1682,8 @@ static void DYYYScheduleColdResume(void) {
     DYYYSpeedDiag(@"[cold-resume] 判定=续播冷拉起，事件驱动+有界重试启动（handler 注册即打；兜底 5/20/35/50/70/90s；120s 收工）");
 
     // 兜底重试：handler 若早已注册，首轮 5s 就能打中；没注册则等事件驱动主路径
-    for (NSInteger delay in @[@5, @20, @35, @50, @70, @90]) {
+    for (NSNumber *delayNum in @[@5, @20, @35, @50, @70, @90]) {
+        NSInteger delay = delayNum.integerValue;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (dyyyPendingColdResume) {
