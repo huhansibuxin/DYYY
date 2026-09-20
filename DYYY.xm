@@ -1369,11 +1369,76 @@ static BOOL dyyyNpPublishedSinceBoost = NO;   // Boost 后系统侧是否出现�
 // "回写拉锯"本质不同：不循环、只在原生发布链确认不动作时发一次、发布内容是暂停瞬间的
 // 最新缓存（不会出现"上一条视频"）、rate 按投票补齐。
 static NSDictionary *dyyyLastGoodCurrentNPInfo = nil;
+static __weak id dyyyLastMergeVC = nil;   // 【v15.4】AWEDPlayerViewController_Merge 实例（hook 里缓存），兜底自建字典用
 
 // 前置声明（实现在下方 v12 播放态镜像区，Boost 兜底单发要用）
 static NSInteger DYYYReadDouyinPlayState(void);
 static NSDictionary *DYYYRateCorrectedNowPlayingInfo(NSDictionary *info, NSInteger state);
 static void DYYYDeclarePlaybackState(NSInteger state);
+
+// 【v15.4】兜底最后手段：store 空 + 无缓存（原生发布链整场没跑过，如 16:27 第二轮重启会话：
+// 全场零次系统发布、store cnt=0、缓存 nil → 兜底彻底没弹药）时，从速度 hook 已捕获的
+// Merge VC 身上摸当前视频模型，自建最小字典（标题 + rate=0 + 时长）直发系统侧。
+// 全程 respondsToSelector 防御，摸不到就返回 nil——宁可不上卡片也不发错内容。
+// 这仍是【单发】：只在 Boost 1.2s 原生链不动作且投票=强暂停时执行一次，非循环回写。
+static NSDictionary *DYYYBuildMinimalNPInfoFromPlayer(void) {
+    id vc = dyyyLastMergeVC;
+    if (!vc) {
+        DYYYSpeedDiag(@"[npv] 自建字典跳过(无 Merge VC 实例)");
+        return nil;
+    }
+    @try {
+        id model = nil;
+        for (NSString *selName in @[@"awemeModel", @"currentAwemeModel", @"model"]) {
+            SEL sel = NSSelectorFromString(selName);
+            if ([vc respondsToSelector:sel]) {
+                id m = ((id (*)(id, SEL))objc_msgSend)(vc, sel);
+                if (m && [m respondsToSelector:NSSelectorFromString(@"desc")]) {
+                    model = m;
+                    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 模型探到 selector=%@ class=%@", selName, NSStringFromClass([m class])]);
+                    break;
+                }
+            }
+        }
+        if (!model) {
+            DYYYSpeedDiag(@"[npv] 自建字典跳过(VC 上摸不到视频模型)");
+            return nil;
+        }
+        NSString *title = nil;
+        for (NSString *selName in @[@"desc", @"title"]) {
+            SEL sel = NSSelectorFromString(selName);
+            if ([model respondsToSelector:sel]) {
+                id t = ((id (*)(id, SEL))objc_msgSend)(model, sel);
+                if ([t isKindOfClass:[NSString class]] && t.length > 0) {
+                    title = t;
+                    break;
+                }
+            }
+        }
+        if (!title) {
+            DYYYSpeedDiag(@"[npv] 自建字典跳过(模型无 desc/title)");
+            return nil;
+        }
+        double duration = 0;
+        SEL durSel = NSSelectorFromString(@"duration");
+        if ([model respondsToSelector:durSel]) {
+            duration = ((double (*)(id, SEL))objc_msgSend)(model, durSel);
+            if (!(duration > 0 && duration < 86400)) {
+                duration = 0;   // duration 可能是整型属性按 double 解出垃圾值，明显不合理就弃用
+            }
+        }
+        NSMutableDictionary *info = [NSMutableDictionary dictionary];
+        info[@"title"] = title;
+        info[@"rate"] = @0.0;   // 暂停态 → 控制中心画播放键
+        if (duration > 0) {
+            info[@"duration"] = @(duration);
+        }
+        return info;
+    } @catch (NSException *e) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 自建字典 exception: %@", e.reason ?: @"unknown"]);
+        return nil;
+    }
+}
 
 // 主动声明"本 App 继续接收远程控制"——抖音在拉控制中心时自己也会调这一步（实测 19 次）。
 // 该方法是幂等的（抖音自己反复调没事），且它内部就是 MRMediaRemoteSetCanBeNowPlayingApplication(1)。
@@ -1507,8 +1572,17 @@ static void DYYYBoostNowPlayingAfterPause(void) {
                 }
             }
             if (cached.count == 0) {
-                DYYYSpeedDiag(@"[npv] 兜底跳过(无缓存信息)");
-                return;
+                // 【v15.4】缓存/store 全空（原生发布链整场没跑过，如 16:27 第二轮重启会话：
+                // 全场零次系统发布 → store 永远没被填过）→ 从 Merge VC 的视频模型自建
+                // 最小字典（标题+rate=0+时长）作为最后弹药。
+                NSDictionary *built = DYYYBuildMinimalNPInfoFromPlayer();
+                if (built.count == 0) {
+                    DYYYSpeedDiag(@"[npv] 兜底跳过(无缓存信息且自建失败)");
+                    return;
+                }
+                cached = built;
+                dyyyLastGoodCurrentNPInfo = built;
+                DYYYSpeedDiag(@"[npv] 兜底弹药：store/缓存全空，用视频模型自建最小字典");
             }
             @try {
                 Class mpCls = NSClassFromString(@"MPNowPlayingInfoCenter");
@@ -13407,6 +13481,7 @@ static Class tabBarButtonClass = nil;
 
 - (void)viewDidLayoutSubviews {
     %orig;
+    dyyyLastMergeVC = self;   // 【v15.4】兜底自建字典的模型来源（最后布局的≈当前可见视频）
     if (DYYYGetBool(@"DYYYEnableFullScreen")) {
         UIView *contentView = self.contentView;
         if (contentView && contentView.superview) {
