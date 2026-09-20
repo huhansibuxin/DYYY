@@ -644,10 +644,30 @@ static void dyyyEngineSetSpeedThunkD(id self, SEL _cmd, double speed) {
     }
 }
 
+// ===== 【v14】冷启动续播：控制中心点播放 → 系统无感后台拉起抖音 → 系统不会把那次 play
+// 补发给新进程（MPRemoteCommand 只投递给已注册 handler 的活进程），抖音后台启动链也不自动开播
+//（老板实测：无头拉起后内存≈完整启动，feed/播放器栈都在，只差一个 play）。
+// 对策：判定"续播拉起"后替系统补发一次 play，全程只试一轮（5s→8s→20s 三个检查点），不做轮询。
+static BOOL dyyyPendingColdResume = NO;
+static BOOL dyyyColdResumeRunning = NO;
+static __weak id dyyyPlayCmdTarget = nil;      // 抖音注册在 playCommand 上的 target（addTarget hook 捕获）
+static SEL dyyyPlayCmdAction = NULL;
+static __weak id dyyyLastEngineInstance = nil; // 最后见到的 TTVideoEngine 实例（getter hook 捕获）
+
+static NSString * const kDYYYColdResumeStampKey = @"DYYYColdResumeStamp";
+
+// 卡片活跃时间戳：仅在我们补发/发布非空 nowPlayingInfo 时写一次（非轮询）。
+// 用途：冷启动时区分"控制中心续播拉起"和其他后台拉起源（推送/bg fetch 没有新鲜时间戳）。
+static void DYYYMarkNowPlayingCardAlive(void) {
+    [[NSUserDefaults standardUserDefaults] setDouble:[[NSDate date] timeIntervalSince1970]
+                                              forKey:kDYYYColdResumeStampKey];
+}
+
 // getter 只做状态记录（值变化才写），用于判断引擎真实速率何时回退。
 // 性能：getter 会被 UI/播放器高频轮询——热路径只做一次 double 比较，
 // 值没变直接返回，一个字符串都不建（旧版每次读都拼 3 个 NSString，白白烧 CPU）。
 static void DYYYReportEngineSpeedRead(id self, SEL _cmd, double value) {
+    dyyyLastEngineInstance = self;   // 冷启动续播路径 B 备用：最后见到的引擎实例
     static double dyyyLastEngineSpeedSeen = -999.0;
     if (fabs(value - dyyyLastEngineSpeedSeen) <= 0.001) {
         return;
@@ -1413,6 +1433,7 @@ static void DYYYBoostNowPlayingAfterPause(void) {
             if ([m respondsToSelector:resignSel]) {
                 ((void (*)(id, SEL))objc_msgSend)(m, resignSel);
             }
+            DYYYMarkNowPlayingCardAlive();   // 补发成功 → 卡片活跃时间戳刷新
         } @catch (__unused NSException *e) {
         }
     });
@@ -1545,6 +1566,91 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
     } @catch (__unused NSException *e) {
         dyyyNpSelfWrite = NO;
     }
+}
+
+// 判定 self 是否是命令中心的 playCommand（区别于 pause/toggle）
+static BOOL DYYYIsPlayCommand(id cmd) {
+    if (!cmd) {
+        return NO;
+    }
+    Class centerClass = NSClassFromString(@"MPRemoteCommandCenter");
+    if (!centerClass) {
+        return NO;
+    }
+    @try {
+        id center = ((id (*)(id, SEL))objc_msgSend)(centerClass, @selector(sharedCommandCenter));
+        return center && cmd == ((id (*)(id, SEL))objc_msgSend)(center, NSSelectorFromString(@"playCommand"));
+    } @catch (__unused NSException *e) {
+    }
+    return NO;
+}
+
+// 冷启动续播主流程：A=调抖音自己注册的 playCommand handler（等价系统补发 play 命令），
+// 8s 后投票检查，未在播则 B=对引擎实例直接调 play，20s 终检后无条件收工。
+static void DYYYScheduleColdResume(void) {
+    if (!DYYYShouldHoldNowPlaying() || dyyyPendingColdResume || dyyyColdResumeRunning) {
+        return;
+    }
+    dyyyPendingColdResume = YES;
+    DYYYSpeedDiag(@"[cold-resume] 判定=续播冷拉起，5s 后开始补发 play（A=抖音play handler → B=引擎play）");
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!dyyyPendingColdResume) {
+            return;
+        }
+        dyyyColdResumeRunning = YES;
+        @try {
+            id target = dyyyPlayCmdTarget;
+            Class eventCls = objc_getClass("MPRemoteCommandEvent");
+            id event = eventCls ? [[eventCls alloc] init] : nil;
+            if (target && dyyyPlayCmdAction && event) {
+                long ret = ((long (*)(id, SEL, id))objc_msgSend)(target, dyyyPlayCmdAction, event);
+                DYYYSpeedDiag([NSString stringWithFormat:@"[cold-resume] A(play handler) 已调 target=%@ ret=%ld",
+                    NSStringFromClass([target class]), ret]);
+            } else {
+                DYYYSpeedDiag([NSString stringWithFormat:@"[cold-resume] A 跳过 target=%@ event=%@（缺一不可）",
+                    target ? @"有" : @"无", event ? @"有" : @"无"]);
+            }
+        } @catch (__unused NSException *e) {
+            DYYYSpeedDiag(@"[cold-resume] A exception");
+        }
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (!dyyyPendingColdResume) {
+                return;
+            }
+            NSInteger st = DYYYReadDouyinPlayState();
+            if (st == 1) {
+                DYYYSpeedDiag(@"[cold-resume] ✓ 已在播（路径 A 生效），收工");
+                dyyyPendingColdResume = NO;
+                dyyyColdResumeRunning = NO;
+                [[NSUserDefaults standardUserDefaults] removeObjectForKey:kDYYYColdResumeStampKey];
+                return;
+            }
+            @try {
+                id eng = dyyyLastEngineInstance;
+                if (eng && [eng respondsToSelector:NSSelectorFromString(@"play")]) {
+                    ((void (*)(id, SEL))objc_msgSend)(eng, NSSelectorFromString(@"play"));
+                    DYYYSpeedDiag(@"[cold-resume] B(引擎 play) 已调");
+                } else {
+                    DYYYSpeedDiag(@"[cold-resume] B 跳过（无引擎实例或不响应 play）");
+                }
+            } @catch (__unused NSException *e) {
+                DYYYSpeedDiag(@"[cold-resume] B exception");
+            }
+
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                NSInteger st2 = DYYYReadDouyinPlayState();
+                DYYYSpeedDiag([NSString stringWithFormat:@"[cold-resume] 终检 playState=%ld，标志清除（%@）",
+                    (long)st2, st2 == 1 ? @"成功" : @"未播，放弃"]);
+                dyyyPendingColdResume = NO;
+                dyyyColdResumeRunning = NO;
+            });
+        });
+    });
 }
 
 // 【已移除】AWEAwemeBackgroundPlayModule / AWEFeedBackgroundPlayManager 两个 hook 块：
@@ -1709,6 +1815,10 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
         return;
     }
 
+    if (nowPlayingInfo.count > 0 && DYYYShouldHoldNowPlaying()) {
+        DYYYMarkNowPlayingCardAlive();   // 冷启动续播判据：卡片当前活跃
+    }
+
     // 【v12】非空发布 → 按抖音真实播放态补上 MPNowPlayingInfoPropertyPlaybackRate。
     // 这个键就是控制中心"画播放键还是暂停键"的开关（1.0=暂停键 / 0.0=播放键），抖音从不写它，
     // 所以卡片永远停在"暂停键"。我们只补这一个键，标题/封面/时长等内容一字不改。
@@ -1783,6 +1893,20 @@ static BOOL DYYYIsAmbientCategory(NSString *c) {
 // 抖音自己注册的 handler 因此还挂着，控制中心点播放直接回调抖音原生逻辑。
 // stop/close 一律放行（用户点卡片"关闭"要真能关）。
 %hook MPRemoteCommand
+
+// 【v14】记录抖音注册在 playCommand 上的 handler——冷启动续播时替系统补发 play 用
+- (void)addTarget:(id)target action:(SEL)action {
+    @try {
+        if (DYYYIsPlayCommand(self) && target) {
+            dyyyPlayCmdTarget = target;
+            dyyyPlayCmdAction = action;
+            DYYYSpeedDiag([NSString stringWithFormat:@"[cold-resume] 记录 play handler target=%@ sel=%@",
+                NSStringFromClass([target class]), NSStringFromSelector(action)]);
+        }
+    } @catch (__unused NSException *e) {
+    }
+    %orig;
+}
 
 - (void)removeTarget:(id)target action:(SEL)action {
     if (DYYYShouldHoldNowPlaying() && DYYYIsPreservedPlaybackCommand(self)) {
@@ -13455,6 +13579,23 @@ static void DYYYRemoveKeyboardObserver(void) {
     BOOL result = %orig;
     initTargetClassNames();
 
+    // 【v14】冷启动续播判定：didFinishLaunching 时 state==Background = 系统无感拉起
+    //（点图标冷启动是 Inactive/Active，不会命中），再叠加卡片时间戳 < 5 分钟，双重防误触。
+    @try {
+        UIApplicationState st = [UIApplication sharedApplication].applicationState;
+        if (st == UIApplicationStateBackground) {
+            double stamp = [[NSUserDefaults standardUserDefaults] doubleForKey:kDYYYColdResumeStampKey];
+            NSTimeInterval age = [[NSDate date] timeIntervalSince1970] - stamp;
+            if (stamp > 0 && age < 300) {
+                DYYYSpeedDiag([NSString stringWithFormat:@"[cold-resume] 启动时 state=Background，卡片时间戳距今 %.0fs", age]);
+                DYYYScheduleColdResume();
+            } else {
+                DYYYSpeedDiag([NSString stringWithFormat:@"[cold-resume] 后台拉起但无新鲜卡片时间戳（age=%.0fs），不续播", age]);
+            }
+        }
+    } @catch (__unused NSException *e) {
+    }
+
     updateGlobalTransparencyCache();
 
     [[NSUserDefaults standardUserDefaults] addObserver:(NSObject *)self forKeyPath:kDYYYGlobalTransparencyKey options:NSKeyValueObservingOptionNew context:DYYYGlobalTransparencyContext];
@@ -13475,6 +13616,10 @@ static void DYYYRemoveKeyboardObserver(void) {
                                                                              usingBlock:^(NSNotification *_Nonnull notification) {
                                                                                isAppActive = YES;
                                                                                reloadClearButtonConfiguration();
+                                                                               // 【v14】用户真打开了 App → 续播作废、卡片时间戳清掉
+                                                                               //（后台无感拉起不会走 didBecomeActive，不受影响）
+                                                                               dyyyPendingColdResume = NO;
+                                                                               [[NSUserDefaults standardUserDefaults] removeObjectForKey:kDYYYColdResumeStampKey];
                                                                              }];
 
     dyyyWillResignActiveToken = [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillResignActiveNotification
