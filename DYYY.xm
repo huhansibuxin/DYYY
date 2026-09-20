@@ -1391,6 +1391,11 @@ static BOOL DYYYShouldHoldNowPlaying(void) {
 // 的 aweme:currentIndexDidChange: 上，实测【0 命中】——抖音 8.0.37 划视频不走那里
 //（AwemeHeaders.h 里该类就是个空接口，方法名是早年猜的）。现在一次性挂四个候选，
 // 统一打 "切视频候选 <来源>"，一轮测试就能看出谁才是真正命中的那个。
+// 前置声明：切视频催发（实现在 DYYYBoostNowPlayingAfterPause 之后）。
+// ⚠️ 必须声明在 DYYYNoteAwemeChangedFrom 【之前】——声明放后面会报
+// "use of undeclared identifier"（CI run 35526845456 实测 exit code 2）。
+static void DYYYCutVideoNudge(void);
+
 static void DYYYNoteAwemeChangedFrom(id object, NSString *source) {
     if (!DYYYShouldHoldNowPlaying()) {
         return;
@@ -1484,8 +1489,6 @@ static NSDictionary *dyyyLastGoodCurrentNPInfo = nil;
 static NSInteger DYYYReadDouyinPlayState(void);
 static NSDictionary *DYYYRateCorrectedNowPlayingInfo(NSDictionary *info, NSInteger state);
 static void DYYYDeclarePlaybackState(NSInteger state);
-// 前置声明（实现在 DYYYBoostNowPlayingAfterPause 之后，切视频留痕处调用）
-static void DYYYCutVideoNudge(void);
 
 // 【已移除】v15.4/v15.5 的"自建最小字典"兜底（DYYYBuildMinimalNPInfoFromPlayer）。
 // 四轮实机（2026-09-20 16:50~16:54）统计：该函数命中 0 次——v15.3 吞掉空 store 写入后，
