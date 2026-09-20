@@ -1488,10 +1488,21 @@ static NSString *DYYYAwemeItemID(id aweme) {
 // 播放命令进栈发现模块空时把现场恢复 —— 事件驱动、只在用户点播放那一刻动作、零轮询。
 // ⚠️ 快照必须有时效窗：切视频很快时旧快照会指错条目，宁可不用（保守回退到补岗）。
 // ⚠️ 写回只用 object_setIvar（对象型 ivar，零强转）；不调 setter，避免触发抖音的连锁副作用。
+//
+// 【v27 时效窗 6s → 30s】依据 diag/v26_check.log：
+//   6 秒窗实测把快照机制【卡死】—— 25 次 play 里 17 次报「快照过期」
+//   （过期龄 7.1s / 8.4s / 12.1s / 47.1s / 52.9s …），而恢复成功的 6 次快照龄全是
+//   1.1~3.2s。老板的真实节奏是「暂停 → 上下滑 → 拉控制中心 → 点播放」，
+//   两三个动作之间就要 5~10 秒，6 秒窗必然错过。
+//   为什么放宽到 30s 不会显著增加"指错"：抖音每次「收下当前条目」都会覆盖快照
+//   （实测 19:12:06/11/15/18/22/26 连续 6 次划视频全部收下新条目），
+//   也就是说只要抖音的状态机是活的，快照永远跟着最新视频走；
+//   反之状态机不活时我们本来就无解，旧快照至少让落点从"空"变成"上一条"，
+//   而老板明确表示过「能每次命中播当前这条，文字不变也能接受」。
 static id             dyyyModuleModelSnap = nil;   // strong：抓住 aweme 模型本体
 static NSDictionary  *dyyyModuleInfoSnap  = nil;   // 配套的 NP 字典（写回 _currentNowPlayingInfo）
 static NSTimeInterval dyyyModuleSnapAt    = 0;
-#define DYYY_MODULE_SNAP_TTL 6.0                    // 秒；超过则视为过期，不用
+#define DYYY_MODULE_SNAP_TTL 30.0                   // 秒；超过则视为过期，不用（v27：6→30）
 
 static void DYYYCaptureModuleSnapshot(id mod) {
     id m = DYYYModuleAwemeModel(mod);
@@ -2642,6 +2653,41 @@ static void DYYYDumpAwemeSourceShapes(void) {
         DYYYAskDouyinRebuildNowPlaying(dyyyBGPlayModuleInstance, @"快照恢复后文字没跟上");
     } else if (!drove && sysBehind) {
         DYYYAskDouyinRebuildNowPlaying(dyyyBGPlayModuleInstance, @"播放命令后文字没跟上");
+    }
+
+    // ⭐⭐【v27】补岗后单次延迟复查 —— 补岗是【延迟生效】的，v26 读得太早才误判它无效。
+    // 实测规律（diag/v26_check.log，两处独立复现）：
+    //   19:12:03 补岗 becomePlayingPlayer: → 19:12:06 shouldEnterBackgroundPlayMode=1
+    //                                       + 「模块收下当前条目 cnt=2 title=剑馆来了个师姐」
+    //   19:12:09 补岗                     → 19:12:11 同样两连击（闸门=1 + 收下条目）
+    // 即：补岗是"通知抖音重新武装后台播放"的动作，抖音要 2~3 秒后才把当前条目交回模块。
+    // v26 在补岗后【立刻】读模块 → 30 次里 21 次读到空 → 误判"补岗无效"，押错了方向。
+    // 所以这里补一次收尾（单次 dispatch_after，非轮询、非定时器循环）：
+    //   模块自己握回来了 → 报喜（说明抖音状态机走通）；
+    //   还没握回来       → 用快照补位，保证老板下一次点播放时模块必有落点。
+    if (!player && fallback) {
+        __weak id weakMod = mod;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            id m2 = weakMod;
+            if (!m2 || !DYYYShouldHoldNowPlaying()) {
+                return;
+            }
+            NSString *t2 = DYYYModuleAwemeTitle(m2);
+            if (t2.length > 0) {
+                DYYYSpeedDiag([NSString stringWithFormat:
+                    @"[npv] ▶ 补岗后 2.5s：抖音已把条目交回模块 ✓ title=%@", t2]);
+                return;
+            }
+            NSString *d = nil;
+            if (DYYYRestoreModuleSnapshot(m2, &d)) {
+                DYYYSpeedDiag([NSString stringWithFormat:
+                    @"[npv] ▶ 补岗后 2.5s：模块仍空 → 快照补位 ✓ %@", d ?: @""]);
+            } else {
+                DYYYSpeedDiag([NSString stringWithFormat:
+                    @"[npv] ▶ 补岗后 2.5s：模块仍空且快照不可用（%@）", d ?: @"无快照"]);
+            }
+        });
     }
     return ret;
 }
