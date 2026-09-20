@@ -1349,7 +1349,9 @@ static void DYYYNpDumpClassMethods(void) {
     NSArray *names = @[@"AWENowPlayingInfoCenter", @"AWEFeedBackgroundPlayManager",
                        @"AWEAwemeBackgroundPlayModule", @"AWEAwemeBackgroundPlayManager",
                        @"AWENowPlayingInfoManager", @"AWEMediaPlayerManager",
-                       @"AWEAwemePlayManager", @"AWEPlayControlManager"];
+                       @"AWEAwemePlayManager", @"AWEPlayControlManager",
+                       // 系统类：看有没有我们没覆盖的私有 setter / 发布通道
+                       @"MPNowPlayingInfoCenter", @"MPNowPlayingSession"];
     for (NSString *n in names) {
         Class c = NSClassFromString(n);
         if (!c) {
@@ -1381,6 +1383,30 @@ static void DYYYNpDumpClassMethods(void) {
     }
     DYYYSpeedDiag([NSString stringWithFormat:@"[np2] MPNowPlayingSession 存在=%d",
                    (int)(NSClassFromString(@"MPNowPlayingSession") != nil)]);
+
+    // 【np3】探测 MediaRemote 私有发布通道：很多播放器（含腾讯系）绕开公开 setter，
+    // 直接走 MRMediaRemote* 私有 C API 给系统发布/清空 now playing。只 dlsym 探测，不 hook。
+    void *mr = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_NOW);
+    NSArray *mrSyms = @[@"MRMediaRemoteSetNowPlayingInfo",
+                        @"MRMediaRemoteSetNowPlayingInfoWithMergePolicy",
+                        @"MRMediaRemoteSetNowPlayingApplicationOverrideEnabled",
+                        @"MRMediaRemoteSetCanBeNowPlayingApplication",
+                        @"MRMediaRemoteSetNowPlayingInfoWithMergePolicyAndCompletion"];
+    NSMutableArray *mrFound = [NSMutableArray array];
+    NSMutableArray *mrMissing = [NSMutableArray array];
+    for (NSString *s in mrSyms) {
+        void *p = dlsym(RTLD_DEFAULT, s.UTF8String);
+        if (!p && mr) {
+            p = dlsym(mr, s.UTF8String);
+        }
+        if (p) {
+            [mrFound addObject:s];
+        } else {
+            [mrMissing addObject:s];
+        }
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] MediaRemote handle=%d 有=(%@) 无=(%@)",
+                   (int)(mr != NULL), mrFound, mrMissing]);
 }
 
 static BOOL DYYYShouldHoldNowPlaying(void) {
@@ -1547,6 +1573,77 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
     %orig;
 }
 
+// 【v4 定位+掐死】resignPlayingPlayer: = 显式"辞去正在播放身份"（动作方法，比属性 setter 更可能
+// 是抖音停播时真正走的那一步）。记录 + 托管中直接 return，不让它辞职。
+- (void)resignPlayingPlayer:(id)player {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] hit resignPlayingPlayer: %@",
+                   player ? NSStringFromClass([player class]) : @"(nil)"]);
+    if (DYYYShouldHoldNowPlaying()) {
+        DYYYSpeedDiag(@"[np3] 拦下 resignPlayingPlayer:");
+        DYYYScheduleNowPlayingReassert();
+        return;
+    }
+
+    %orig;
+}
+
+// 【v4】removeRemoteCommandTarget = 摘掉远程命令（播放/暂停按钮消失）。托管中不让摘。
+- (void)removeRemoteCommandTarget {
+    DYYYSpeedDiag(@"[np3] hit removeRemoteCommandTarget");
+    if (DYYYShouldHoldNowPlaying()) {
+        DYYYSpeedDiag(@"[np3] 拦下 removeRemoteCommandTarget");
+        return;
+    }
+
+    %orig;
+}
+
+%end
+
+// 【v4 真凶重点】AWEFeedBackgroundPlayManager 里有两个明确的"清空"方法：
+//   clearNowPlayingInfo / clearCommand —— 之前这个 hook 块因服务于已删的"信息流"开关被我整块删掉，
+//   结果真凶一直没被盖住。现在按老板思路：记录 + 直接 return，让它永远不主动清空。
+%hook AWEFeedBackgroundPlayManager
+
+// playingCenter 的参数类名是一锤定音的判定：抖音到底用 MPNowPlayingInfoCenter 还是
+// MPNowPlayingSession（或别的）来给系统发布信息 —— 决定了后续该往哪儿使劲。
+- (void)setPlayingCenter:(id)center {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] setPlayingCenter: 类=%@",
+                   center ? NSStringFromClass([center class]) : @"(nil)"]);
+    %orig;
+}
+
+- (void)clearNowPlayingInfo {
+    DYYYSpeedDiag(@"[np3] hit clearNowPlayingInfo");
+    if (DYYYShouldHoldNowPlaying()) {
+        DYYYSpeedDiag(@"[np3] 拦下 clearNowPlayingInfo（源头掐死）");
+        return;
+    }
+
+    %orig;
+}
+
+- (void)clearCommand {
+    DYYYSpeedDiag(@"[np3] hit clearCommand");
+    if (DYYYShouldHoldNowPlaying()) {
+        DYYYSpeedDiag(@"[np3] 拦下 clearCommand（源头掐死）");
+        return;
+    }
+
+    %orig;
+}
+
+- (void)resetNowPlayingInfo:(id)model {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] hit resetNowPlayingInfo: %@",
+                   model ? NSStringFromClass([model class]) : @"(nil)"]);
+    if (DYYYShouldHoldNowPlaying()) {
+        DYYYSpeedDiag(@"[np3] 拦下 resetNowPlayingInfo:");
+        return;
+    }
+
+    %orig;
+}
+
 %end
 
 // 耳机或系统媒体会话可能绕过抖音播放中心，最终都要写入 MPNowPlayingInfoCenter。
@@ -1619,8 +1716,20 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 // 【定位探针】iOS 16 的 MPNowPlayingSession：若抖音用它，卡片归系统自动管理，清空不走 setter
 %hook MPNowPlayingSession
 
+- (id)initWithPlayers:(NSArray *)players {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] MPNowPlayingSession initWithPlayers count=%lu 类=%@",
+                   (unsigned long)players.count, NSStringFromClass([self class])]);
+    return %orig;
+}
+
+- (instancetype)initWithActivePlayer:(id)player {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] MPNowPlayingSession initWithActivePlayer %@",
+                   player ? NSStringFromClass([player class]) : @"(nil)"]);
+    return %orig;
+}
+
 - (void)setAutomaticallyPublishesNowPlayingInfo:(BOOL)value {
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np2] SESSION autoPublish=%d | %@",
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] SESSION autoPublish=%d | %@",
                    (int)value, DYYYNPWhoCalled()]);
     %orig;
 }
