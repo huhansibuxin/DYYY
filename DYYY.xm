@@ -1498,6 +1498,89 @@ static NSInteger DYYYAppStateRaw(void) {
 
 // 判定函数：调用处统一用 `DYYYAppStateRaw() == 2` 表示"真正切走、该收摊了"。
 
+// ===== 【v11】补上"暂停后不拉控制中心就不上"的缺口 =====
+// 老板实测（2026-09-20）：暂停后【不切后台、直接把控制中心拉出来】→ 卡片会上；
+//   【不拉控制中心】→ 卡片不上。退一次桌面也能上。
+//
+// 根因（抖音方法表铁证，diag/v10.log 第 309~360 行 dump 出来的）：
+//   抖音的 now playing 发布**不是"暂停时"做的，而是由【App 失去活跃 resignActive】驱动** ——
+//   AWEAwemeBackgroundPlayModule 方法表里有:
+//       appWillResignActiveNotification       ← 收到"即将失去活跃"通知时的处理
+//       updateNowPlayingInfoWhenResiginActive ← 在 resignActive 时更新 now playing 信息
+//   于是：
+//     · 拉控制中心 → App 变 Inactive  → 这条链触发 → 抖音重新组装并发布当前视频信息 → 卡片出现 ✓
+//     · 不拉控制中心 → App 一直 Active → 这条链永不触发 → 没有新发布 → 卡片不上 ✗
+//     · 退到主界面也能上，同理（Background 之前也经过 resignActive）✓
+//
+// 对策：暂停那一刻，主动替抖音【补一次 resignActive 事件】，让它自己的原逻辑跑一遍。
+//   ⭐ 关键：仍然是**抖音自己**组装并发布（内容一定是当前视频），我们只换触发时机 ——
+//     不自造内容、不写系统侧 nowPlayingInfo，因此不违背老板定的"不要拦清空→回写拉锯"原则。
+//   ⭐ 前提已具备：AWENowPlayingInfoCenter.setPlayingPlayer:(nil) 一直被我们挡下，
+//     抖音内部的播放器引用还在 → 它的 update 仍能组装出完整信息（diag/v10.log 10:44:11 实证：
+//     清空 3 秒后抖音仍能发布《翻龙之下九门》cnt=6/7 的完整内容）。
+static __weak id dyyyBGPlayModuleInstance = nil;   // AWEAwemeBackgroundPlayModule 实例（hook 里缓存）
+
+// 主动声明"本 App 继续接收远程控制"——抖音在拉控制中心时自己也会调这一步（实测 19 次）。
+// 该方法是幂等的（抖音自己反复调没事），且它内部就是 MRMediaRemoteSetCanBeNowPlayingApplication(1)。
+static void DYYYForceBeginReceivingRemoteControlEvents(void) {
+    Class cls = NSClassFromString(@"UIApplication");
+    if (!cls) {
+        return;
+    }
+    id app = ((id (*)(Class, SEL))objc_msgSend)(cls, @selector(sharedApplication));
+    if (!app) {
+        return;
+    }
+    SEL sel = NSSelectorFromString(@"beginReceivingRemoteControlEvents");
+    if ([app respondsToSelector:sel]) {
+        ((void (*)(id, SEL))objc_msgSend)(app, sel);
+    }
+}
+
+// 暂停后补一次 resignActive：让抖音把"当前视频 + 暂停态"发布到控制中心，卡片当场挂上，
+// 不必等用户去拉控制中心。节流 1.5s，避免抖音那条链被重复触发成抖动。
+static void DYYYBoostNowPlayingAfterPause(void) {
+    static NSTimeInterval lastBoost = 0;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - lastBoost < 1.5) {
+        return;
+    }
+    lastBoost = now;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!DYYYShouldHoldNowPlaying()) {
+            return;
+        }
+        id m = dyyyBGPlayModuleInstance;
+        if (!m) {
+            DYYYSpeedDiag(@"[np6] Boost 跳过：还没捕获到 AWEAwemeBackgroundPlayModule 实例");
+            return;
+        }
+        SEL resignSel = NSSelectorFromString(@"appWillResignActiveNotification");
+        SEL updateSel = NSSelectorFromString(@"updateNowPlayingInfoWhenResiginActive");
+        DYYYSpeedDiag([NSString stringWithFormat:
+                       @"[np6] Boost 主动补 resignActive（hasResign=%d hasUpdate=%d 补前系统侧cnt=%ld）",
+                       [m respondsToSelector:resignSel], [m respondsToSelector:updateSel],
+                       (long)DYYYCurrentNowPlayingInfoCount()]);
+        @try {
+            // ① 先声明继续接收远程控制（拉控制中心时抖音走的第一步）
+            DYYYForceBeginReceivingRemoteControlEvents();
+            // ② 让抖音重新组装并发布当前视频的 now playing 信息
+            if ([m respondsToSelector:updateSel]) {
+                ((void (*)(id, SEL))objc_msgSend)(m, updateSel);
+            }
+            if ([m respondsToSelector:resignSel]) {
+                ((void (*)(id, SEL))objc_msgSend)(m, resignSel);
+            }
+        } @catch (__unused NSException *e) {
+            DYYYSpeedDiag(@"[np6] Boost 调用抛异常，已吞掉");
+        }
+        DYYYSpeedDiag([NSString stringWithFormat:@"[np6] Boost 完成，补后系统侧cnt=%ld",
+                       (long)DYYYCurrentNowPlayingInfoCount()]);
+    });
+}
+
 // 从一份 nowPlayingInfo 里取标题（探针用，拿不到就返回 "-"）
 static NSString *DYYYNpTitle(id info) {
     if (![info isKindOfClass:[NSDictionary class]]) {
@@ -1686,11 +1769,18 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 // 内容来源：抖音每次更新"当前播放信息"时暂存一份（比系统的 setNowPlayingInfo: 靠谱，
 // 实测系统那条通道抖音根本不走）
 - (void)setCurrentNowPlayingInfo:(id)info {
+    dyyyBGPlayModuleInstance = self;   // 缓存实例，供"暂停后补 resignActive"调用（v11）
     DYYYStashNowPlayingInfo(info);
+    BOOL isEmpty = (![info isKindOfClass:[NSDictionary class]] || [(NSDictionary *)info count] == 0);
     DYYYSpeedDiag([NSString stringWithFormat:@"[np3] setCurrentNowPlayingInfo cnt=%lu title=%@ cls=%@",
                    (unsigned long)([info isKindOfClass:[NSDictionary class]] ? [(NSDictionary *)info count] : 0),
                    DYYYNpTitle(info),
                    info ? NSStringFromClass([info class]) : @"(nil)"]);
+    // 【v11】抖音把"当前播放信息"清空 = 用户暂停了。它的发布链此刻还没跑（要等 resignActive），
+    // 我们主动替它补一次，让卡片当场挂上 —— 不必等用户去拉控制中心。
+    if (isEmpty && DYYYShouldHoldNowPlaying()) {
+        DYYYBoostNowPlayingAfterPause();
+    }
     %orig;
 }
 
@@ -1740,6 +1830,25 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 // v5 曾把它的 YES 强改 NO，理由是"让后台点播放真能续播"——纯推测，实测有害（本次日志命中 11 次）：
 // 抖音把它置 YES 是它自己状态机的决定，我们越权改写只会把控制中心的播放命令引到错误的恢复路径上
 //（老板实测"只播放记录的第一条视频"）。恢复原样，不再干预抖音的播放状态机。
+
+// ===== 【v11 探针】观测抖音自己在"拉控制中心/resignActive"时到底走哪条链 =====
+// 目的：验证"发布由 resignActive 驱动"这一推断，并确认我们 Boost 时该补哪一次调用。
+// 只留痕，不改行为。三个方法均无参（方法表 dump 里都没有冒号）。
+- (void)appWillResignActiveNotification {
+    DYYYSpeedDiag(@"[np6] hit appWillResignActiveNotification");
+    %orig;
+}
+
+- (void)updateNowPlayingInfoWhenResiginActive {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np6] hit updateNowPlayingInfoWhenResiginActive（系统侧cnt=%ld）",
+                   (long)DYYYCurrentNowPlayingInfoCount()]);
+    %orig;
+}
+
+- (void)updateNowPlayingInfoPlayback {
+    DYYYSpeedDiag(@"[np6] hit updateNowPlayingInfoPlayback");
+    %orig;
+}
 
 %end
 
