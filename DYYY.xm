@@ -1469,6 +1469,79 @@ static NSString *DYYYAwemeItemID(id aweme) {
     return nil;
 }
 
+// ⭐⭐【v26 定案】"模块条目快照" —— 十五轮失败的清洗结论，也是"准确命中"的唯一判据。
+//
+// diag/v25_check.log 的零反例数据（35 次 play 命令）：
+//   · 模块 _model 非空 → 命中 5/5，落点全部正确（模块条目 id == 系统侧视频）
+//   · 模块 _model 为空 → 失败 30/30，其中包括 21 次"补岗后模块仍然空"
+//   ⇒ play 落点正确 ⟺ play 那一刻模块 _model 非空。没有第二种情况。
+//
+// 而 _model 为什么会空（日志里的完整因果链）：
+//   ① 抖音切视频 → 走状态机 → 「模块收下当前条目」(setCurrentNowPlayingInfo: 非空)，此时 _model 有值；
+//   ② 同一秒内出现「放行 setCurrentNowPlayingInfo:nil(前台)」（v19/v22 为了让抖音走完切视频状态机
+//      而放行的）→ _model 被抹掉；实测 20 次「模块收下条目」里 19 次在 10 秒内被清掉，5 次同秒；
+//   ③ 抖音要重新填依赖 shouldEnterBackgroundPlayMode，而它 61 次里 43 次返回 0 → 长时间填不回来。
+//   ⇒ 「命中」其实是 play 恰好抢在 ②③ 之间的那 0~4 秒窗口里（19:02:16 收下 → 19:02:18 play ✓；
+//     19:02:20 被清 → 之后一连串 play 全空）。这就是老板体感"前面很多次不成功、后面几次基本都成功"。
+//
+// 所以：在「模块收下条目」那一刻把 _model 抓住（strong 引用住，防释放），
+// 播放命令进栈发现模块空时把现场恢复 —— 事件驱动、只在用户点播放那一刻动作、零轮询。
+// ⚠️ 快照必须有时效窗：切视频很快时旧快照会指错条目，宁可不用（保守回退到补岗）。
+// ⚠️ 写回只用 object_setIvar（对象型 ivar，零强转）；不调 setter，避免触发抖音的连锁副作用。
+static id             dyyyModuleModelSnap = nil;   // strong：抓住 aweme 模型本体
+static NSDictionary  *dyyyModuleInfoSnap  = nil;   // 配套的 NP 字典（写回 _currentNowPlayingInfo）
+static NSTimeInterval dyyyModuleSnapAt    = 0;
+#define DYYY_MODULE_SNAP_TTL 6.0                    // 秒；超过则视为过期，不用
+
+static void DYYYCaptureModuleSnapshot(id mod) {
+    id m = DYYYModuleAwemeModel(mod);
+    if (!m) {
+        return;
+    }
+    dyyyModuleModelSnap = m;
+    Ivar iv = class_getInstanceVariable([mod class], "_currentNowPlayingInfo");
+    id info = nil;
+    if (iv) {
+        @try { info = object_getIvar(mod, iv); } @catch (__unused NSException *e) { info = nil; }
+    }
+    dyyyModuleInfoSnap = [info isKindOfClass:[NSDictionary class]] ? [info copy] : nil;
+    dyyyModuleSnapAt = [[NSDate date] timeIntervalSince1970];
+}
+
+// 把快照写回模块（恢复"当前条目"现场）。YES = 确实写回了一个非空 _model。
+static BOOL DYYYRestoreModuleSnapshot(id mod, NSString **detail) {
+    if (!mod || !dyyyModuleModelSnap) {
+        if (detail) { *detail = @"无快照"; }
+        return NO;
+    }
+    NSTimeInterval age = [[NSDate date] timeIntervalSince1970] - dyyyModuleSnapAt;
+    if (age > DYYY_MODULE_SNAP_TTL) {
+        if (detail) { *detail = [NSString stringWithFormat:@"快照过期 %.1fs", age]; }
+        return NO;
+    }
+    Ivar mv = class_getInstanceVariable([mod class], "_model");
+    if (!mv) {
+        if (detail) { *detail = @"模块无 _model ivar"; }
+        return NO;
+    }
+    @try {
+        object_setIvar(mod, mv, dyyyModuleModelSnap);
+        Ivar iv = class_getInstanceVariable([mod class], "_currentNowPlayingInfo");
+        if (iv && dyyyModuleInfoSnap.count > 0) {
+            object_setIvar(mod, iv, [dyyyModuleInfoSnap mutableCopy]);
+        }
+    } @catch (__unused NSException *e) {
+        if (detail) { *detail = @"写回异常"; }
+        return NO;
+    }
+    if (detail) {
+        NSString *t = DYYYModuleAwemeTitle(mod) ?: @"?";
+        NSString *i = DYYYAwemeItemID(DYYYModuleAwemeModel(mod)) ?: @"-";
+        *detail = [NSString stringWithFormat:@"%@(id=%@,快照龄%.1fs)", t, i, age];
+    }
+    return YES;
+}
+
 // 【v25】把"抖音自己重建当前条目"这条原生路径催一下 —— 它是实测唯一有效的杠杆。
 // 实证（diag/v24_check.log 18:50:30 → 18:50:32）：模块重新上岗后 2 秒内，
 //   抖音打了「模块收下当前条目 cnt=2 title=稀有祖宗」，紧接着「系统发布 title=稀有祖宗」。
@@ -2523,16 +2596,32 @@ static void DYYYDumpAwemeSourceShapes(void) {
         modTitleBefore.length ? modTitleBefore : @"(未握条目)",
         modID ?: @"-", DYYYCurrentSystemNPTitle() ?: @"-"]);
 
+    // ⭐⭐【v26 分治】两个不同的问题，两条不同的路 —— 不再混为一谈：
+    //   问题一：playingPlayer 为空 → 抖音手上没有"代表它对外播放"的对象。
+    //           → 补岗 becomePlayingPlayer:（v21 机制，保留）。
+    //   问题二：模块 _model 为空 → 模块手里没有当前条目 = 播放命令没有落点。
+    //           → 补岗【治不了它】：v25 实测 30 次补岗里 21 次补完模块仍然空。
+    //             改用「模块条目快照」还原现场（见 DYYYRestoreModuleSnapshot 注释）。
     BOOL drove = NO;
-    if ((!player || modTitleBefore.length == 0) && fallback) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ %@ → 补岗 %@（让抖音把当前条目交回模块）",
+    BOOL restoredSnapshot = NO;
+    if ((!player || modTitleBefore.length == 0) && mod) {
+        NSString *detail = nil;
+        restoredSnapshot = DYYYRestoreModuleSnapshot(mod, &detail);
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ %@ → %@",
             !player ? @"playingPlayer 为空" : @"模块未握当前条目",
+            restoredSnapshot
+                ? [NSString stringWithFormat:@"恢复模块条目快照 ✓ %@", detail ?: @""]
+                : [NSString stringWithFormat:@"快照不可用（%@）", detail ?: @"无快照"]]);
+        drove = YES;
+    }
+    if (!player && fallback) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ playingPlayer 为空 → 补岗 %@",
             NSStringFromClass([fallback class]) ?: @"?"]);
         ((void (*)(id, SEL, id))objc_msgSend)(me, NSSelectorFromString(@"becomePlayingPlayer:"), fallback);
         id after = ((id (*)(id, SEL))objc_msgSend)(me, playingSel);
         DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ 补岗后 playingPlayer=%@ | 模块条目=%@",
             after ? NSStringFromClass([after class]) : @"(nil)，补岗未生效",
-            DYYYModuleAwemeTitle(fallback) ?: @"(仍未握条目)"]);
+            DYYYModuleAwemeTitle(mod) ?: @"(仍未握条目)"]);
         drove = YES;
     } else if (!player) {
         DYYYSpeedDiag(@"[npv] ▶ playingPlayer 为空且无可用模块（缓存未建立）→ 无法补岗");
@@ -2542,11 +2631,16 @@ static void DYYYDumpAwemeSourceShapes(void) {
     dyyyPlayCmdInFlight = NO;
     DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ play 命令处理完毕 ret=%ld（0=Success）", (long)ret]);
 
-    // 【v25】文字没跟上时催抖音用 _model 重建一次（只在没补岗过时做，避免同一命令驱动两次）。
+    // 【v26】快照恢复后，模块内部条目已修正，但系统侧 title 要抖音自己重发才算"文字也跟上"。
+    // 这正是老板要的"文字不变也能接受"之外的加分项：能跟上就一起跟上。
+    // 只在确有偏差时催一次（节流 1s），不做轮询、不加定时器。
     NSString *modTitleAfter = DYYYModuleAwemeTitle(dyyyBGPlayModuleInstance);
     NSString *sysTitleAfter = DYYYCurrentSystemNPTitle();
-    if (!drove && modTitleAfter.length > 0 && sysTitleAfter.length > 0 &&
-        ![modTitleAfter isEqualToString:sysTitleAfter]) {
+    BOOL sysBehind = (modTitleAfter.length > 0 &&
+                      (sysTitleAfter.length == 0 || ![modTitleAfter isEqualToString:sysTitleAfter]));
+    if (restoredSnapshot && sysBehind) {
+        DYYYAskDouyinRebuildNowPlaying(dyyyBGPlayModuleInstance, @"快照恢复后文字没跟上");
+    } else if (!drove && sysBehind) {
         DYYYAskDouyinRebuildNowPlaying(dyyyBGPlayModuleInstance, @"播放命令后文字没跟上");
     }
     return ret;
@@ -2657,7 +2751,10 @@ static void DYYYDumpAwemeSourceShapes(void) {
     //     · 全程 0 命中 = 抖音自己就不交，瓶颈在它的状态机上游（别再三轮改我们的兜底）
     if (!isEmpty && DYYYNPInfoLooksComplete((NSDictionary *)info)) {
         dyyyLastGoodCurrentNPInfo = info;   // 完整信息才刷新缓存（Boost 兜底单发用，v15.1）
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 模块收下当前条目 cnt=%lu title=%@",
+        // ⭐【v26】这一刻是"抖音亲口说出当前条目"的唯一时点 —— 立刻抓快照。
+        // 之后它大概率会（自己或我们放行地）把 _model 抹掉，快照是唯一能还原现场的凭据。
+        DYYYCaptureModuleSnapshot(self);
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 模块收下当前条目 cnt=%lu title=%@（已抓快照）",
             (unsigned long)[(NSDictionary *)info count],
             [(NSDictionary *)info[@"title"] description] ?: @"-"]);
     } else if (!isEmpty) {
