@@ -1297,8 +1297,102 @@ static void DYYYHandleCurrentSpeedAwemeChanged(id aweme) {
 // 重入标记：我们自己声明 playbackState 时置位，避免被自己的调用再次触发
 static BOOL dyyyNpSelfWrite = NO;
 
+// ===== 【v16】切视频同步 + 弹药卫生（修"暂停后划下一条，卡片还是上一条"）=====
+// 老板实测：暂停后划下一条，新视频会【自动播放】，但控制中心卡片内容不跟、点播放也恢复上一条。
+// 日志铁证（diag/v156_check.log）：
+//   ① 17:03:13「补一轮」当场触发了原生发布（PUB 穿高跟鞋 cnt=5），紧接着兜底单发照样执行
+//      → 用缓存把刚发布的新内容盖掉。根因：代码在补一轮之后【没有复查】dyyyNpPublishedSinceBoost，
+//      所以那句"原生链不发布"根本是假的。
+//   ② 17:03:08 从模块 store 读到 cnt=3 的残缺字典（无关发布链写进去的），被当弹药原样顶到系统侧。
+//   ③ AWEFeedBackgroundPlayManager.resetNowPlayingInfo:(id)model 带 model 参数（不是无参清空），
+//      当年和 clearNowPlayingInfo/clearCommand 一起被误归入"清空类"无条件拦死，且【没留任何日志】
+//      → v6~v156 全部九份日志里运行时命中 0 观测；它的语义 = "用这个 model 重设当前播放信息"。
+static NSString *dyyyCurrentAwemeTitle = nil;   // 当前视频标题（currentIndexDidChange: 时记录）
+
+// 从 aweme model 取标题：KVC 路线（速度功能实战验证可读抖音私有属性）
+static NSString *DYYYAwemeTitleText(id object) {
+    id model = object;
+    if (!model) {
+        return nil;
+    }
+    Class awemeClass = NSClassFromString(@"AWEAwemeModel");
+    if (awemeClass && ![model isKindOfClass:awemeClass]) {
+        for (NSString *key in @[ @"model", @"awemeModel", @"currentAweme" ]) {
+            @try {
+                id value = [model valueForKey:key];
+                if (awemeClass && [value isKindOfClass:awemeClass]) {
+                    model = value;
+                    break;
+                }
+            } @catch (__unused NSException *e) {
+            }
+        }
+    }
+    for (NSString *key in @[ @"desc", @"title", @"descriptionString" ]) {
+        @try {
+            id value = [model valueForKey:key];
+            if ([value isKindOfClass:[NSString class]] && [(NSString *)value length] > 0) {
+                return (NSString *)value;
+            }
+        } @catch (__unused NSException *e) {
+        }
+    }
+    return nil;
+}
+
+// 弹药完整性门槛：抖音真实发布恒为 5~7 键（title + 时长/封面等），
+// 而那条无关发布链塞进 store 的残缺字典固定只有 3 键 → 一律拒收，绝不拿去兜底。
+static BOOL DYYYNPInfoLooksComplete(NSDictionary *info) {
+    if (![info isKindOfClass:[NSDictionary class]] || info.count == 0) {
+        return NO;
+    }
+    id title = info[@"title"];
+    if (![title isKindOfClass:[NSString class]] || [(NSString *)title length] == 0) {
+        return NO;
+    }
+    if (info.count >= 5) {
+        return YES;
+    }
+    BOOL hasDuration = info[@"MPMediaItemPropertyPlaybackDuration"] != nil ||
+                       info[@"MPNowPlayingInfoPropertyElapsedPlaybackTime"] != nil;
+    BOOL hasArtist = info[@"artist"] != nil || info[@"albumTitle"] != nil;
+    return hasDuration || hasArtist;
+}
+
+// 读系统侧当前 nowPlayingInfo 的标题（切视频留痕用）
+static NSString *DYYYCurrentSystemNPTitle(void) {
+    Class npc = NSClassFromString(@"MPNowPlayingInfoCenter");
+    if (!npc) {
+        return nil;
+    }
+    id center = ((id (*)(id, SEL))objc_msgSend)(npc, NSSelectorFromString(@"defaultCenter"));
+    if (!center) {
+        return nil;
+    }
+    id info = ((id (*)(id, SEL))objc_msgSend)(center, NSSelectorFromString(@"nowPlayingInfo"));
+    if (![info isKindOfClass:[NSDictionary class]]) {
+        return nil;
+    }
+    id title = ((NSDictionary *)info)[@"title"];
+    return [title isKindOfClass:[NSString class]] ? (NSString *)title : nil;
+}
+
 static BOOL DYYYShouldHoldNowPlaying(void) {
     return DYYYGetBool(@"DYYYKeepNowPlayingInBackground");
+}
+
+// 切视频时留痕 + 记录当前视频标题（为"弹药到底属不属于当前视频"留证据）。
+// 本身不干预抖音 —— 修复在"补一轮后复查发布"和"弹药完整性门槛"两处。
+static void DYYYNoteAwemeChangedForNowPlaying(id aweme) {
+    if (!DYYYShouldHoldNowPlaying()) {
+        return;
+    }
+    NSString *title = DYYYAwemeTitleText(aweme);
+    if (title.length > 0) {
+        dyyyCurrentAwemeTitle = title;
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 切视频 → 当前=%@ | 系统侧=%@",
+        title.length > 0 ? title : @"-", DYYYCurrentSystemNPTitle() ?: @"-"]);
 }
 
 // 运行时取系统当前 nowPlayingInfo 的键数。
@@ -1431,9 +1525,14 @@ static void DYYYBoostNowPlayingAfterPause(void) {
         @try {
             if ([m respondsToSelector:getterSel]) {
                 NSDictionary *live = ((id (*)(id, SEL))objc_msgSend)(m, getterSel);
-                if ([live isKindOfClass:[NSDictionary class]] && live.count > 0) {
+                // 【v16】加完整性门槛：store 里混进来的 cnt=3 残缺字典（无关发布链写的）
+                // 一旦被当成弹药缓存，兜底就会把它顶到控制中心 → 卡片显示别的视频。
+                if (DYYYNPInfoLooksComplete(live)) {
                     dyyyLastGoodCurrentNPInfo = live;
                     DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 缓存模块 store cnt=%lu", (unsigned long)live.count]);
+                } else if ([live isKindOfClass:[NSDictionary class]] && live.count > 0) {
+                    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 拒收残缺弹药：store cnt=%lu title=%@",
+                        (unsigned long)live.count, live[@"title"] ?: @"-"]);
                 } else {
                     DYYYSpeedDiag(@"[npv] 模块 store 为空(cnt=0)，无缓存可用");
                 }
@@ -1481,6 +1580,15 @@ static void DYYYBoostNowPlayingAfterPause(void) {
                 }
             } @catch (NSException *e) {
                 DYYYSpeedDiag([NSString stringWithFormat:@"[npv] Boost 补发 exception: %@", e.reason ?: @"unknown"]);
+            }
+
+            // ⭐【v16 关键修正】补一轮是【同步】调用，很可能当场就触发了原生发布
+            //（日志实证 17:03:13：补一轮 → 同一秒 PUB 穿高跟鞋 cnt=5）。
+            // 之前这里直接往下走兜底单发 → 用缓存把刚发布的新视频内容【盖回旧内容】，
+            // 正是"暂停后划下一条，控制中心还是上一条"的直接原因。必须复查，已落地就收手。
+            if (dyyyNpPublishedSinceBoost) {
+                DYYYSpeedDiag(@"[npv] 补一轮已触发原生发布 → 放弃兜底单发（不覆盖新内容）");
+                return;
             }
 
             // ② 【v15.1】原生链兜底单发。15:54 实测定案：抖音的
@@ -1738,9 +1846,21 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
     %orig;
 }
 
+// 【v16 关键修正】resetNowPlayingInfo:(id)model —— 带 model 参数，语义是"用这个 model 重设/刷新
+// 当前播放信息"，**不是无参清空**（同块的 clearNowPlayingInfo / clearCommand 才是真清空，继续拦）。
+// 它当年被一起归入"清空类"无条件掐死，而且【没留任何日志】→ v6~v156 九份日志里运行时命中 0 观测，
+// 一直是个盲点。按 v9/v10 已确立的分流原则改：前台 = 切视频/切条目的交接，必须放行；
+// 后台 = 收摊，才拦（和 doExitBackgroundPlayMode / resignPlayingPlayer: 同一判据）。
 - (void)resetNowPlayingInfo:(id)model {
-    if (DYYYShouldHoldNowPlaying()) {
+    NSInteger st = DYYYAppStateRaw();
+    if (DYYYShouldHoldNowPlaying() && st == 2) {
+        DYYYSpeedDiag(@"[npv] 拦 resetNowPlayingInfo(后台)");
         return;
+    }
+    if (DYYYShouldHoldNowPlaying()) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 放行 resetNowPlayingInfo(前台) model=%@ title=%@",
+            model ? NSStringFromClass([model class]) : @"(nil)",
+            DYYYAwemeTitleText(model) ?: @"-"]);
     }
 
     %orig;
@@ -1761,8 +1881,12 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 - (void)setCurrentNowPlayingInfo:(id)info {
     dyyyBGPlayModuleInstance = self;   // 缓存实例，供"暂停后补 resignActive"调用（v11）
     BOOL isEmpty = (![info isKindOfClass:[NSDictionary class]] || [(NSDictionary *)info count] == 0);
-    if (!isEmpty) {
-        dyyyLastGoodCurrentNPInfo = info;   // 非空即刷新缓存（Boost 兜底单发用，v15.1）
+    // 【v16】非空也要过完整性门槛：切视频/暂停时 store 里可能混进 cnt=3 的残缺字典。
+    if (!isEmpty && DYYYNPInfoLooksComplete((NSDictionary *)info)) {
+        dyyyLastGoodCurrentNPInfo = info;   // 完整信息才刷新缓存（Boost 兜底单发用，v15.1）
+    } else if (!isEmpty) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 拒收残缺弹药：setCurrentNowPlayingInfo cnt=%lu",
+            (unsigned long)[(NSDictionary *)info count]]);
     }
     // 【v11】抖音把"当前播放信息"清空 = 用户暂停了。它的发布链此刻还没跑（要等 resignActive），
     // 我们主动替它补一次，让卡片当场挂上 —— 不必等用户去拉控制中心。
@@ -1845,7 +1969,8 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
     // 这个键就是控制中心"画播放键还是暂停键"的开关（1.0=暂停键 / 0.0=播放键），抖音从不写它，
     // 所以卡片永远停在"暂停键"。我们只补这一个键，标题/封面/时长等内容一字不改。
     // 重入保护：读抖音 getter 若又触发一次发布，那次直接放行、不做二次修正。
-    if (nowPlayingInfo.count > 0) {
+    // 【v16】只有完整信息才进弹药缓存（挡住那条发 cnt=3 残缺字典的无关发布链）。
+    if (DYYYNPInfoLooksComplete(nowPlayingInfo)) {
         dyyyLastGoodCurrentNPInfo = nowPlayingInfo;   // 【v15.2】系统侧非空发布也刷新兜底缓存
     }
     if (nowPlayingInfo.count > 0 && !dyyyNpRatePatching && DYYYShouldHoldNowPlaying()) {
@@ -13549,6 +13674,7 @@ static Class tabBarButtonClass = nil;
     }
     %orig;
     DYYYHandleCurrentSpeedAwemeChanged(arg1);
+    DYYYNoteAwemeChangedForNowPlaying(arg1);   // 【v16】切视频留痕（观测卡片有没有跟上）
 }
 
 - (void)viewWillLayoutSubviews {
