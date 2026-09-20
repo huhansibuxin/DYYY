@@ -751,40 +751,22 @@ static void dyyyEngineRateChangedThunkD(id self, SEL _cmd, id player, double rat
 
 static void DYYYProbeEngineSpeedEntry(void) {
     @try {
+        // 只列真正装 hook 的类（Internal/Abstrator 实测 class=nil；SpeedController 由 Logos hook 负责）
         NSArray *classNames = @[
             @"TTVideoEngine",
             @"TTVideoEngineOwnPlayer",
-            @"TTVideoEngineInternal",
-            @"TTVideoEngineAbstrator",
-            @"AWEDPlayerSpeedController",
             @"AWEDPlayerViewController_Merge"
         ];
         for (NSString *clsName in classNames) {
             Class cls = NSClassFromString(clsName);
             if (!cls) {
-                DYYYSpeedDiag([NSString stringWithFormat:@"[probe] %@ class=nil", clsName]);
                 continue;
             }
             unsigned int count = 0;
             Method *methods = class_copyMethodList(cls, &count);
-            NSMutableArray *hits = [NSMutableArray array];
-            for (unsigned int i = 0; i < count; i++) {
-                NSString *sel = NSStringFromSelector(method_getName(methods[i]));
-                NSString *lower = sel.lowercaseString;
-                if ([lower containsString:@"speed"] || [lower containsString:@"rate"]) {
-                    [hits addObject:sel];
-                }
-            }
-            DYYYSpeedDiag([NSString stringWithFormat:@"[probe] %@ methods=%@ (total %u)", clsName, hits, count]);
-
-            // 自动钩取作用类：两个引擎类 + Merge VC；控制器类由 Logos hook 负责
-            BOOL isHookable = [clsName isEqualToString:@"TTVideoEngine"] ||
-                              [clsName isEqualToString:@"TTVideoEngineOwnPlayer"] ||
-                              [clsName isEqualToString:@"AWEDPlayerViewController_Merge"];
-            if (!isHookable || !methods) {
-                if (methods) {
-                    free(methods);
-                }
+            //（方法清单 dump 探针已删：诊断使命完成——结论已固化在下方白名单注释里，
+            //  每次启动扫 5 个类 2300+ 方法拼日志纯属浪费）
+            if (!methods) {
                 continue;
             }
             for (unsigned int i = 0; i < count; i++) {
@@ -14662,7 +14644,10 @@ static void findTargetViewInView(UIView *view) {
 
     // 源头：扫描并批量拦截抖音"更新"相关类的动作方法（异步执行，不拖慢启动）
     if (DYYYGetBool(@"DYYYNoUpdates")) {
-        dispatch_async(dispatch_get_main_queue(), ^{
+        // 走 global queue 而非主队列：实测 objc_copyClassNamesForImage 返回 11 万+ 类名，
+        // 逐个 lowercase+containsString 在主队列会卡启动几十~几百 ms；MSHookMessageEx
+        // 钩 ObjC 方法不要求主线程，放后台跑。
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             DYYYBlockUpdateClassesOnce();
         });
     }
