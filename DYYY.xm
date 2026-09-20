@@ -1764,9 +1764,14 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
     }
     // 【v11】抖音把"当前播放信息"清空 = 用户暂停了。它的发布链此刻还没跑（要等 resignActive），
     // 我们主动替它补一次，让卡片当场挂上 —— 不必等用户去拉控制中心。
+    // 【v15.3】空信息写入【吞掉不落盘】：实测（16:15 重启会话）暂停时 %orig 会把模块 store
+    // 清成 cnt=0，Boost 读 getter 无弹药、兜底单发没货 → 重启后第一次暂停必失败
+    //（第一次能成功只因播放时退过后台、原生链闸门开过）。"决定清空"(setNeedClean=YES)
+    // 已吞，"执行清空"同步吞掉语义才一致；store 保留的正是暂停那一刻的当前视频信息。
     if (isEmpty && DYYYShouldHoldNowPlaying()) {
-        DYYYSpeedDiag(@"[npv] 暂停检测：setCurrentNowPlayingInfo 空信息");
+        DYYYSpeedDiag(@"[npv] 暂停检测：setCurrentNowPlayingInfo 空信息（吞掉，保 store 弹药）");
         DYYYBoostNowPlayingAfterPause();
+        return;
     }
     %orig;
 }
