@@ -1365,6 +1365,10 @@ static NSInteger DYYYAppStateRaw(void) {
 //     清空 3 秒后抖音仍能发布《翻龙之下九门》cnt=6/7 的完整内容）。
 static __weak id dyyyBGPlayModuleInstance = nil;   // AWEAwemeBackgroundPlayModule 实例（hook 里缓存）
 static BOOL dyyyNpPublishedSinceBoost = NO;   // Boost 后系统侧是否出现过非空发布（0 次重试的判据）
+// 抖音最后一次非空"当前播放信息"副本。仅用于 Boost 兜底【单发】一次——与 v7 被禁的
+// "回写拉锯"本质不同：不循环、只在原生发布链确认不动作时发一次、发布内容是暂停瞬间的
+// 最新缓存（不会出现"上一条视频"）、rate 按投票补齐。
+static NSDictionary *dyyyLastGoodCurrentNPInfo = nil;
 
 // 主动声明"本 App 继续接收远程控制"——抖音在拉控制中心时自己也会调这一步（实测 19 次）。
 // 该方法是幂等的（抖音自己反复调没事），且它内部就是 MRMediaRemoteSetCanBeNowPlayingApplication(1)。
@@ -1429,7 +1433,7 @@ static void DYYYBoostNowPlayingAfterPause(void) {
             DYYYSpeedDiag([NSString stringWithFormat:@"[npv] Boost exception: %@", e.reason ?: @"unknown"]);
         }
 
-        // 1.2s 后确认发布是否落地；没落地补一轮（有界一次）
+        // 1.2s 后确认发布是否落地；没落地先再催一轮原生链，仍无则【单发兜底】
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (!DYYYShouldHoldNowPlaying() || dyyyNpPublishedSinceBoost) {
@@ -1438,20 +1442,49 @@ static void DYYYBoostNowPlayingAfterPause(void) {
                 }
                 return;
             }
+            // ① 原生链再催一轮
             @try {
                 id m2 = dyyyBGPlayModuleInstance;
-                if (!m2) {
-                    return;
-                }
-                DYYYSpeedDiag(@"[npv] Boost 后 1.2s 未见发布，补一轮");
-                if ([m2 respondsToSelector:updateSel]) {
-                    ((void (*)(id, SEL))objc_msgSend)(m2, updateSel);
-                }
-                if ([m2 respondsToSelector:resignSel]) {
-                    ((void (*)(id, SEL))objc_msgSend)(m2, resignSel);
+                if (m2) {
+                    DYYYSpeedDiag(@"[npv] Boost 后 1.2s 未见发布，补一轮");
+                    if ([m2 respondsToSelector:updateSel]) {
+                        ((void (*)(id, SEL))objc_msgSend)(m2, updateSel);
+                    }
+                    if ([m2 respondsToSelector:resignSel]) {
+                        ((void (*)(id, SEL))objc_msgSend)(m2, resignSel);
+                    }
                 }
             } @catch (NSException *e) {
                 DYYYSpeedDiag([NSString stringWithFormat:@"[npv] Boost 补发 exception: %@", e.reason ?: @"unknown"]);
+            }
+
+            // ② 【v15.1】原生链兜底单发。15:54 实测定案：抖音的
+            //    updateNowPlayingInfoWhenResiginActive 内部有闸门——不在后台播放模式/没在播
+            //    就【自己决定不发布】，前台暂停时怎么催都没用（连续 4 次"已发→未见发布"），
+            //    只有"播放中退后台"的原生链才肯发 → 老板手感"非要在后台播放过音频才挂上"。
+            //    对策：用抖音自己刚缓存的当前信息单发一次系统侧。与 v7 被禁的"回写拉锯"区别：
+            //    只发一次（不循环）、信息是暂停瞬间的最新缓存、仅强证据"已暂停"(投票=2)才动作。
+            NSInteger vote = DYYYReadDouyinPlayState();
+            if (vote != 2) {
+                DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 兜底跳过(投票=%ld 非强暂停)", (long)vote]);
+                return;
+            }
+            NSDictionary *cached = dyyyLastGoodCurrentNPInfo;
+            if (cached.count == 0) {
+                DYYYSpeedDiag(@"[npv] 兜底跳过(无缓存信息)");
+                return;
+            }
+            @try {
+                Class mpCls = NSClassFromString(@"MPNowPlayingInfoCenter");
+                id center = mpCls ? ((id (*)(Class, SEL))objc_msgSend)(mpCls, @selector(defaultCenter)) : nil;
+                if (center && [center respondsToSelector:@selector(setNowPlayingInfo:)]) {
+                    NSDictionary *fixed = DYYYRateCorrectedNowPlayingInfo(cached, 2);
+                    ((void (*)(id, SEL, id))objc_msgSend)(center, @selector(setNowPlayingInfo:), fixed);
+                    DYYYDeclarePlaybackState(2);
+                    DYYYSpeedDiag(@"[npv] 兜底单发：原生链不发布，用抖音缓存信息直发系统侧(暂停态 rate=0)");
+                }
+            } @catch (NSException *e) {
+                DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 兜底单发 exception: %@", e.reason ?: @"unknown"]);
             }
         });
     });
@@ -1690,6 +1723,9 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 - (void)setCurrentNowPlayingInfo:(id)info {
     dyyyBGPlayModuleInstance = self;   // 缓存实例，供"暂停后补 resignActive"调用（v11）
     BOOL isEmpty = (![info isKindOfClass:[NSDictionary class]] || [(NSDictionary *)info count] == 0);
+    if (!isEmpty) {
+        dyyyLastGoodCurrentNPInfo = info;   // 非空即刷新缓存（Boost 兜底单发用，v15.1）
+    }
     // 【v11】抖音把"当前播放信息"清空 = 用户暂停了。它的发布链此刻还没跑（要等 resignActive），
     // 我们主动替它补一次，让卡片当场挂上 —— 不必等用户去拉控制中心。
     if (isEmpty && DYYYShouldHoldNowPlaying()) {
