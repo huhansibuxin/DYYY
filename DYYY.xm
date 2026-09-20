@@ -1982,6 +1982,16 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 // 播命令保护窗口：仅在 handlePlayCommand 执行栈内为真
 static BOOL dyyyPlayCmdInFlight = NO;
 
+// 【v21 核心修复用】最近一次"上岗"过的播放器对象（becomePlayingPlayer: / setPlayingPlayer: 非 nil
+// 时缓存，__weak 不持有）。
+// 为什么需要它 —— diag/v20_check.log 铁证：老板"暂停→划下一条→再划上一条"后连点 7 次播放，
+// 每一次日志都是【▶ 收到 play 命令 … 当前 playingPlayer=(nil)】+【处理完毕】：
+// 命令确实送到了抖音（链路全通），但抖音内部 _playingPlayer 是空的 → 命令执行了也没有落点。
+// nil 的来源正是 v19 我们的改动：前台放行 setPlayingPlayer:nil 让抖音完成"旧的下岗"，
+// 但暂停态下抖音**不一定**紧接着做"新的上岗"（becomePlayingPlayer: 会滞后几十秒才来）。
+// 修复：播命令窗口内若发现 playingPlayer 为空，用这个缓存把模块补回去，让命令有落点。
+static __weak id dyyyLastPlayingPlayer = nil;
+
 // 一次性打印远端方法签名（返回类型靠 method_getTypeEncoding 实证，绝不靠猜 —— 猜错返回类型
 // 会让调用方读到 x0 垃圾值）
 static void DYYYDumpRemoteControlSignatures(void) {
@@ -2053,6 +2063,7 @@ static void DYYYDumpRemoteControlSignatures(void) {
     }
     // 【v19 观测】非 nil 也要留痕：一轮就能确认"切视频后新播放器到底有没有上岗"。
     if (player && DYYYShouldHoldNowPlaying()) {
+        dyyyLastPlayingPlayer = player;   // 【v21】缓存"上岗过的模块"，供播命令空引用时补岗
         DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 收到 setPlayingPlayer:%@",
             NSStringFromClass([player class]) ?: @"?"]);
     }
@@ -2098,24 +2109,49 @@ static void DYYYDumpRemoteControlSignatures(void) {
     %orig;
 }
 
-// ⭐⭐【v20 靶心】控制中心「播放」命令的单一入口。命中 = 命令确实送到了抖音内部；
-// 若一轮下来它 0 命中，说明命令在系统层就没到抖音这里（那是另一条完全不同的路）。
-- (void)handlePlayCommand {
+// ⭐⭐【v20 靶心 / v21 修复】控制中心「播放」命令的单一入口。
+// 命中 = 命令确实送到了抖音内部（v20 实测 14 次命中，链路全通，不是系统层的问题）。
+// ⚠️ 返回类型实证 = `q16@0:8`（NSInteger = MPRemoteCommandHandlerStatus），**不是 void**：
+//    v20 声明成 void 会把返回值丢掉 → 调用方读到 x0 垃圾值，可能被判为 CommandFailed。
+//    v21 起按真值返回，并把 ret 打进日志。
+- (NSInteger)handlePlayCommand {
     DYYYDumpRemoteControlSignatures();
     dyyyPlayCmdInFlight = YES;
     id me = (id)self;
-    id player = ((id (*)(id, SEL))objc_msgSend)(me, NSSelectorFromString(@"playingPlayer"));
+    SEL playingSel = NSSelectorFromString(@"playingPlayer");
+    id player = ((id (*)(id, SEL))objc_msgSend)(me, playingSel);
     DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ 收到 play 命令（控制中心点了播放）→ 开续播保护窗口 | 当前 playingPlayer=%@",
                                              player ? NSStringFromClass([player class]) : @"(nil)"]);
-    %orig;
+
+    // ⭐【v21 关键修复】playingPlayer 为空 = 抖音手上没有可播对象 → 命令执行了也没落点。
+    // 用【最近上岗过的】模块补回去（它就是抖音自己的 playingPlayer，日志实测类名
+    // AWEAwemeBackgroundPlayModule），补完再让抖音走它原生的 playForRemoteControl。
+    // 严格限定在播命令窗口内 —— 其它任何时刻都不干预抖音的播放器生命周期。
+    id fallback = dyyyLastPlayingPlayer ? dyyyLastPlayingPlayer : dyyyBGPlayModuleInstance;
+    if (!player && fallback) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ playingPlayer 为空 → 补岗 %@（最近上岗过的模块）",
+            NSStringFromClass([fallback class]) ?: @"?"]);
+        ((void (*)(id, SEL, id))objc_msgSend)(me, NSSelectorFromString(@"becomePlayingPlayer:"), fallback);
+        id after = ((id (*)(id, SEL))objc_msgSend)(me, playingSel);
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ 补岗后 playingPlayer=%@",
+            after ? NSStringFromClass([after class]) : @"(nil)，补岗未生效"]);
+    } else if (!player) {
+        DYYYSpeedDiag(@"[npv] ▶ playingPlayer 为空且无可用模块（缓存未建立）→ 无法补岗");
+    }
+
+    NSInteger ret = %orig;
     dyyyPlayCmdInFlight = NO;
-    DYYYSpeedDiag(@"[npv] ▶ play 命令处理完毕");
+    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ play 命令处理完毕 ret=%ld（0=Success）", (long)ret]);
+    return ret;
 }
 
-// 暂停命令同样留痕（对照用：暂停一直好用，播放不好用，差异点就藏在这两条的尾链里）
-- (void)handlePauseCommand {
+// 暂停命令同样留痕（对照用：暂停一直好用，播放不好用，差异点就藏在这两条的尾链里）。
+// 返回类型同上 = NSInteger（q16@0:8）。
+- (NSInteger)handlePauseCommand {
     DYYYSpeedDiag(@"[npv] ⏸ 收到 pause 命令（控制中心点了暂停）");
-    %orig;
+    NSInteger ret = %orig;
+    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ⏸ pause 命令处理完毕 ret=%ld", (long)ret]);
+    return ret;
 }
 
 // becomePlayingPlayer: = "从现在起由这个对象代表抖音对外播放"，play 命令最终打到它身上
@@ -2123,6 +2159,9 @@ static void DYYYDumpRemoteControlSignatures(void) {
     DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 上岗 becomePlayingPlayer=%@ | 状态=%ld",
                                              player ? NSStringFromClass([player class]) : @"(nil)",
                                              (long)DYYYAppStateRaw()]);
+    if (player) {
+        dyyyLastPlayingPlayer = player;   // 【v21】缓存"上岗过的模块"，供播命令空引用时补岗
+    }
     %orig;
 }
 
