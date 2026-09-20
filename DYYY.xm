@@ -1339,6 +1339,10 @@ static BOOL DYYYShouldBlockFeedNowPlayingSystemInfoWrite(void) {
 // 不需要我们去猜它内部怎么恢复播放（等价于音乐 App "暂停后仍持有控制权"的模型）。
 // 回前台/恢复播放即解除托管，一切交还抖音；别的 App 要抢卡片就让它抢（不做抢占仲裁）。
 //
+// 【v2 补强】只挡清空不够（实测：暂停后抖音再没发布过非空信息，系统侧信息本来就是空的，
+// 而且 setPlaybackState: 从头到尾没被调用过）→ 收摊时还要主动把暂存的最后一份信息回写上去，
+// 并声明 playbackState=Paused。见下面 DYYYReassertNowPlayingState() 的说明。
+//
 // 判据：用 applicationState != Active（Inactive 即命中），**不依赖通知投递时序**——
 // block 形式的通知观察者挂 mainQueue 是异步投递，可能晚于抖音的清空动作；
 // 而系统在 applicationWillResignActive 回调之前就已经把 state 置成 Inactive，必定命中。
@@ -1351,19 +1355,103 @@ static BOOL DYYYShouldHoldNowPlaying(void) {
     return DYYYGetBool(@"DYYYKeepNowPlayingInBackground") && DYYYIsAppBackgrounded();
 }
 
-// 限流日志：抖音在后台可能反复重试 setEnabled:0，避免刷屏（2s 一条）
+// 日志：5 秒窗口内最多 24 条。退后台那一串收摊动作必须**全打出来**——
+// 之前用 2 秒限流，第①步之后的②③④全被吃掉，才导致"到底挡没挡住"看不清。
 static void DYYYNpHoldLog(NSString *fmt, ...) {
-    static NSTimeInterval lastLog = 0;
+    static NSTimeInterval windowStart = 0;
+    static int windowCount = 0;
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - lastLog < 2.0) {
+    if (now - windowStart > 5.0) {
+        windowStart = now;
+        windowCount = 0;
+    }
+    if (windowCount >= 24) {
         return;
     }
-    lastLog = now;
+    windowCount++;
     va_list ap;
     va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     DYYYSpeedDiag([NSString stringWithFormat:@"[np-hold] %@", msg]);
+}
+
+// ===== 卡片"重新挂上"的关键补充：光挡清空不够，必须回写 =====
+// 实测证据（探针版日志）：
+//   ① 播放中抖音会发布 6~7 键的真实信息（title/artist/时长/进度/封面），
+//      分别走 AWENowPlayingInfoCenter 和 MPNowPlayingInfoCenter 两个 setter；
+//   ② 一旦暂停，之后 20+ 次写入**全是 nil**，再没发布过任何非空信息；
+//   ③ 全日志里 MPNowPlayingInfoCenter 的 setPlaybackState: **一次都没被调用过**。
+// 结论：音乐 App 暂停后卡片还在，是因为它把「信息 + 播放态=Paused」都留在系统里；
+//       抖音暂停后既把信息清空、又从不声明暂停态 → 系统判定"没有活跃播放会话" → 撤卡片。
+//       所以只挡清空永远不够：必须在抖音收摊后替它**把最后一份有效信息重新发布上去，
+//       并显式声明 playbackState=Paused**，这才是音乐 App 的行为。
+static NSDictionary *dyyyLastGoodNowPlayingInfo = nil;
+
+// 暂存抖音发布过的最后一份非空信息（暂停前的那个视频的标题/时长/进度/封面）
+static void DYYYStashNowPlayingInfo(id info) {
+    if (![info isKindOfClass:[NSDictionary class]] || [(NSDictionary *)info count] == 0) {
+        return;
+    }
+    dyyyLastGoodNowPlayingInfo = [(NSDictionary *)info copy];
+}
+
+// 回写：把暂存的信息重新发布到系统播放中心，并把播放态标成"暂停"。
+// 效果 = 控制中心出现卡片且带播放键；点播放会走抖音自己注册的 handler 续播。
+static BOOL DYYYReassertNowPlayingState(void) {
+    Class cls = NSClassFromString(@"MPNowPlayingInfoCenter");
+    if (!cls) {
+        return NO;
+    }
+    id center = ((id (*)(Class, SEL))objc_msgSend)(cls, @selector(defaultCenter));
+    if (!center) {
+        return NO;
+    }
+    NSDictionary *keep = dyyyLastGoodNowPlayingInfo;
+    if (keep.count == 0) {
+        DYYYNpHoldLog(@"回写失败：无暂存信息（本会话抖音还没发布过非空信息）");
+        return NO;
+    }
+
+    NSMutableDictionary *pub = [keep mutableCopy];
+    pub[@"MPNowPlayingInfoPropertyPlaybackRate"] = @(0.0);
+
+    // 借 dyyyClearingFeedNowPlayingSystemInfo 绕过"信息流不显示播放信息"开关，
+    // 否则回写会被它当成抖音的写入直接吞掉。
+    dyyyClearingFeedNowPlayingSystemInfo = YES;
+    @try {
+        ((void (*)(id, SEL, id))objc_msgSend)(center, @selector(setNowPlayingInfo:), pub);
+        SEL stateSel = NSSelectorFromString(@"setPlaybackState:");
+        if ([center respondsToSelector:stateSel]) {
+            ((void (*)(id, SEL, NSInteger))objc_msgSend)(center, stateSel, 2); // 2 = Paused
+        }
+    } @catch (__unused NSException *e) {
+    } @finally {
+        dyyyClearingFeedNowPlayingSystemInfo = NO;
+    }
+    DYYYNpHoldLog(@"回写 nowPlayingInfo keys=%lu title=%@ + playbackState=Paused",
+                  (unsigned long)pub.count, pub[@"title"] ?: @"-");
+    return YES;
+}
+
+// 抖音收摊后连发三次（它偶尔会晚一步再清一次）。每次都要求"当下仍在后台"，
+// 回前台 / 恢复播放就自动放弃，一切交还抖音。
+static void DYYYScheduleNowPlayingReassert(void) {
+    static NSTimeInterval lastSchedule = 0;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - lastSchedule < 1.0) {
+        return; // 一次收摊只排一次队（②③④会连着来）
+    }
+    lastSchedule = now;
+    for (NSNumber *d in @[@(0.4), @(1.5), @(3.0)]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (!DYYYGetBool(@"DYYYKeepNowPlayingInBackground") || !DYYYIsAppBackgrounded()) {
+                return;
+            }
+            DYYYReassertNowPlayingState();
+        });
+    }
 }
 
 // 只保 play/pause/toggle 三条命令（用命令中心实例判等，最可靠）：
@@ -1496,6 +1584,8 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 - (void)setPlayingPlayer:(id)player {
     if (!player && DYYYShouldHoldNowPlaying()) {
         DYYYNpHoldLog(@"挡下 AWENowPlayingInfoCenter setPlayingPlayer:(nil)");
+        // 这是收摊第①步 = 抖音认为"我不在播了"。同时触发回写，把卡片重新挂上。
+        DYYYScheduleNowPlayingReassert();
         return;
     }
 
@@ -1503,9 +1593,12 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 }
 
 - (void)setNowPlayingInfo:(id)nowPlayingInfo {
+    // 暂存抖音发布的非空信息（暂停前的真实内容），回写时要用
+    DYYYStashNowPlayingInfo(nowPlayingInfo);
     // 退后台收摊第②步：清空抖音侧信息 → 托管窗口内吞掉
     if (!nowPlayingInfo && DYYYShouldHoldNowPlaying()) {
         DYYYNpHoldLog(@"挡下 AWENowPlayingInfoCenter setNowPlayingInfo:(nil)");
+        DYYYScheduleNowPlayingReassert();
         return;
     }
     if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
@@ -1531,9 +1624,12 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 %hook MPNowPlayingInfoCenter
 
 - (void)setNowPlayingInfo:(NSDictionary *)nowPlayingInfo {
+    // 暂存抖音发布到系统的非空信息（回写时的内容来源）
+    DYYYStashNowPlayingInfo(nowPlayingInfo);
     // 退后台收摊第③步：清空系统侧信息（卡片被撤的直接原因）→ 托管窗口内吞掉
     if (!nowPlayingInfo && DYYYShouldHoldNowPlaying()) {
         DYYYNpHoldLog(@"挡下系统 MPNowPlayingInfoCenter setNowPlayingInfo:(nil)");
+        DYYYScheduleNowPlayingReassert();
         return;
     }
     if (DYYYShouldBlockFeedNowPlayingSystemInfoWrite()) {
