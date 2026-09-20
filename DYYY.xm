@@ -1474,6 +1474,47 @@ static void DYYYStashNowPlayingInfo(id info) {
     dyyyLastGoodNowPlayingInfo = [(NSDictionary *)info copy];
 }
 
+// 【v9 关键判定】当前 App 是否在后台（UIApplicationStateActive = 0）。
+// 这是"同一条抖音方法、两种语义"的唯一可靠区分依据：
+//   前台 → 用户在抖音里滑视频，抖音走【退出旧的 → 进入新的 → 发布新信息】的交接链，必须放行；
+//   后台 → 用户退回桌面/切走，抖音走【收摊停播】链，此时才需要拦下保住卡片。
+// 用运行时取值（NSClassFromString + objc_msgSend），避免 [UIApplication sharedApplication]
+// 静态发消息带来的 _OBJC_CLASS_$_UIApplication 链接依赖（本工程未链接 MediaPlayer 的教训）。
+static BOOL DYYYAppIsBackground(void) {
+    Class cls = NSClassFromString(@"UIApplication");
+    if (!cls) {
+        return NO;
+    }
+    id app = ((id (*)(Class, SEL))objc_msgSend)(cls, @selector(sharedApplication));
+    if (!app) {
+        return NO;
+    }
+    NSInteger st = ((NSInteger (*)(id, SEL))objc_msgSend)(app, @selector(applicationState));
+    return st != 0; // 0 = UIApplicationStateActive
+}
+
+// 从一份 nowPlayingInfo 里取标题（探针用，拿不到就返回 "-"）
+static NSString *DYYYNpTitle(id info) {
+    if (![info isKindOfClass:[NSDictionary class]]) {
+        return @"-";
+    }
+    NSDictionary *d = (NSDictionary *)info;
+    NSString *t = d[@"title"] ?: d[@"kMPMediaItemPropertyTitle"];
+    if ([t isKindOfClass:[NSString class]] && t.length > 0) {
+        return t.length > 40 ? [t substringToIndex:40] : t;
+    }
+    for (id k in d) {
+        if ([k isKindOfClass:[NSString class]] && [k containsString:@"Title"]) {
+            id v = d[k];
+            if ([v isKindOfClass:[NSString class]] && [v length] > 0) {
+                NSString *s = v;
+                return s.length > 40 ? [s substringToIndex:40] : s;
+            }
+        }
+    }
+    return @"-";
+}
+
 // ===== ❌【v7 已整块移除】"回写/补发"机制（DYYYReassertNowPlayingState + ...Reassert）=====
 // 它曾在 v3 扮演"抖音清空后把暂存信息顶回系统"的角色，但那是【下游拉锯】。上游源头
 // （setNeedCleanNowPlayingInfo: / setNeedResignPlayingPlayer: / resignPlayingPlayer: /
@@ -1530,8 +1571,15 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 }
 
 - (void)setNowPlayingInfo:(id)nowPlayingInfo {
-    // 暂存抖音发布的非空信息（暂停前的真实内容：标题/作者/时长/进度/封面），回写时要用
+    // 暂存抖音发布的非空信息（暂停前的真实内容：标题/作者/时长/进度/封面）
     DYYYStashNowPlayingInfo(nowPlayingInfo);
+    // 【v9 探针】非空发布要留痕：这是判断"切视频后抖音到底有没有产生新内容"的唯一依据
+    if (nowPlayingInfo) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[np3] AWENPC setNowPlayingInfo cnt=%lu title=%@",
+                       (unsigned long)([nowPlayingInfo isKindOfClass:[NSDictionary class]]
+                                       ? [(NSDictionary *)nowPlayingInfo count] : 0),
+                       DYYYNpTitle(nowPlayingInfo)]);
+    }
     // 清空抖音侧信息（收摊第②步）→ 托管中吞掉。暂停那一刻就会来，必须挡。
     if (!nowPlayingInfo && DYYYShouldHoldNowPlaying()) {
         DYYYNpHoldLog(@"挡下 AWENowPlayingInfoCenter setNowPlayingInfo:(nil)");
@@ -1541,31 +1589,25 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
     %orig;
 }
 
-// 【v4 定位+掐死】resignPlayingPlayer: = 显式"辞去正在播放身份"（动作方法，比属性 setter 更可能
-// 是抖音停播时真正走的那一步）。记录 + 托管中直接 return，不让它辞职。
-// 【v8 关键修正】入参有三种（实测分布：Foreground 15 / nil 15 / AwemeBackgroundPlayModule 7），
-// 它们的语义完全不同，**绝不能无差别全拦**：
-//   AWEPlayVideoForegroundRemoteControlManager ← **前台切换视频时的正常交接**，必须放行！
-//   AWEAwemeBackgroundPlayModule                ← 后台播放模块收摊，拦
-//   (nil)                                       ← 通用清理，拦
-// 铁证（diag/v7.log）：10:15:17 老板在抖音滑到下一条视频，抖音调
-//   `resignPlayingPlayer:AWEPlayVideoForegroundRemoteControlManager` 交接前台远程控制 →
-//   被我们拦下后，`setCurrentNowPlayingInfo` 再没出现过非空值(cnt=0 一路到 10:16:20)、
-//   `SET info`（系统侧发布）彻底停摆 → 控制中心永远停在旧视频、点播放无响应。
-// 结论：拦"辞职"必须按对象区分——前台交接放行，只掐后台收摊。
+// 【v4 定位】resignPlayingPlayer: = "辞去正在播放身份"。
+// 【v8】入参有三种，实测分布：Foreground 15 / (nil) 15 / AwemeBackgroundPlayModule 7：
+//   AWEPlayVideoForegroundRemoteControlManager ← 前台远程控制管理器
+//   AWEAwemeBackgroundPlayModule              ← 后台播放模块
+//   (nil)                                     ← 通用清理
+// 【v9 定案】不再按"入参类名"分流，改为按【App 前后台】分流，与 doExitBackgroundPlayMode 同一判据：
+//   前台 = 用户在抖音里滑视频，抖音走【旧的下岗 → 新的上岗 → 发布新信息】的交接链，必须放行；
+//   后台 = 用户退回桌面，抖音走【收摊停播】链，此时才拦。
+// 反证：v8 只放行 Foreground、其余照拦，实测（diag/v8.log）滑视频后系统侧 SET info 仍彻底停摆
+// （最后一条 10:25:10），说明掐住"后台模块辞职"同样会打断前台交接。
+// 另：b8e4fdf 版日志显示拦下 51 次 resignPlayingPlayer 卡片依然照掉 → 拦它既无收益又有害。
 - (void)resignPlayingPlayer:(id)player {
     NSString *cls = player ? NSStringFromClass([player class]) : @"(nil)";
-    if ([cls containsString:@"Foreground"]) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[np3] 放行前台交接 resignPlayingPlayer: %@", cls]);
-        %orig;
+    BOOL bg = DYYYAppIsBackground();
+    if (DYYYShouldHoldNowPlaying() && bg) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[np3] 拦下 resignPlayingPlayer: %@（后台收摊）", cls]);
         return;
     }
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] hit resignPlayingPlayer: %@", cls]);
-    if (DYYYShouldHoldNowPlaying()) {
-        DYYYSpeedDiag(@"[np3] 拦下 resignPlayingPlayer:");
-        return;
-    }
-
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] 放行 resignPlayingPlayer: %@（前台=%d）", cls, (int)!bg]);
     %orig;
 }
 
@@ -1640,8 +1682,9 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 // 实测系统那条通道抖音根本不走）
 - (void)setCurrentNowPlayingInfo:(id)info {
     DYYYStashNowPlayingInfo(info);
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] setCurrentNowPlayingInfo cnt=%lu cls=%@",
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] setCurrentNowPlayingInfo cnt=%lu title=%@ cls=%@",
                    (unsigned long)([info isKindOfClass:[NSDictionary class]] ? [(NSDictionary *)info count] : 0),
+                   DYYYNpTitle(info),
                    info ? NSStringFromClass([info class]) : @"(nil)"]);
     %orig;
 }
@@ -1668,14 +1711,22 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
     %orig;
 }
 
-// 退出后台播放模式（会收起播放态）→ 托管中不让退
+// 【v9 关键修正】doExitBackgroundPlayMode：同一条方法、两种语义，必须按前后台区分。
+// 之前无差别拦下，把"切视频"这条链一起掐了 —— 铁证（diag/v8.log）：
+//   10:25:12 起老板每滑一条视频，抖音必调 doExitBackgroundPlayMode **连中 3 次**，全被我们拦；
+//   此后 setCurrentNowPlayingInfo 再没出现过非空值（cnt=0 一路到底）、MPNowPlayingInfoCenter
+//   的 SET info 彻底停摆（最后一条 10:25:10）→ 系统侧永远停在那条视频 → 老板实测
+//   "滑到下一条，控制中心还是上一个视频的文字、点击没反应"。
+// 抖音的滑视频流程是【退出旧视频的后台播放态 → 进入新视频的后台播放态 → 发布新信息】，
+// 我们把"退出"拦了，状态机卡住，"进入+发布"就再也不会执行。
+// 判定依据：前台 = 用户在抖音里滑视频（交接链，放行）；后台 = 用户退回桌面（收摊链，拦下保卡片）。
 - (void)doExitBackgroundPlayMode {
-    DYYYSpeedDiag(@"[np3] hit doExitBackgroundPlayMode");
-    if (DYYYShouldHoldNowPlaying()) {
-        DYYYSpeedDiag(@"[np3] 拦下 doExitBackgroundPlayMode");
+    BOOL bg = DYYYAppIsBackground();
+    if (DYYYShouldHoldNowPlaying() && bg) {
+        DYYYSpeedDiag(@"[np3] 拦下 doExitBackgroundPlayMode（后台收摊，保住卡片）");
         return;
     }
-
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] 放行 doExitBackgroundPlayMode（前台=%d，让抖音完成切视频交接）", (int)!bg]);
     %orig;
 }
 
@@ -1692,9 +1743,10 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 - (void)setNowPlayingInfo:(NSDictionary *)nowPlayingInfo {
     // 【定位探针】全量留痕：谁、什么时候、把系统播放信息写成什么
     if (!dyyyNpSelfWrite) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[np2] SET %@ cnt=%lu | %@",
+        DYYYSpeedDiag([NSString stringWithFormat:@"[np2] SET %@ cnt=%lu title=%@ | %@",
                        nowPlayingInfo ? @"info" : @"NIL",
-                       (unsigned long)nowPlayingInfo.count, DYYYNPWhoCalled()]);
+                       (unsigned long)nowPlayingInfo.count, DYYYNpTitle(nowPlayingInfo),
+                       DYYYNPWhoCalled()]);
     }
     // 暂存抖音发布到系统的非空信息（回写时的内容来源）
     DYYYStashNowPlayingInfo(nowPlayingInfo);
