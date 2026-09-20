@@ -9,7 +9,6 @@
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
-#import <execinfo.h>
 #import <float.h>
 #import <math.h>
 #import <objc/message.h>
@@ -1313,103 +1312,8 @@ static void DYYYHandleCurrentSpeedAwemeChanged(id aweme) {
 // 实测教训：抖音是【暂停那一刻、还在前台】就把 nowPlayingInfo 清成 nil 的
 //（日志统计：nil 写入 26 次 vs 非空写入 8 次），等退后台才开托管窗口，
 // 系统里早就是空的，回天乏术。目标 = 暂停前后控制中心卡片内容保持一致。
-// ===== 【定位探针】找出"到底是谁在清空系统播放信息" =====
-// 老板要求：不打"清空→回写→再清空"的拉锯战，直接找到清空那个函数掐死（让它永远不清）。
-// 本段**只记录、不改变任何行为**，定位完成后整段删除。
-// 判定思路：
-//   ① 系统层 setNowPlayingInfo:/setPlaybackState: 全量留痕 + 调用者画像（dladdr 取镜像名+偏移，
-//      release 包符号被剥也能看出是主二进制还是哪个 framework 在动手）；
-//   ② dump 抖音 Now Playing 相关类的全部方法名，直接找 clear/reset/stop 语义的函数名；
-//   ③ 检查 iOS 16 的 MPNowPlayingSession（若抖音用它，卡片由系统自动管理，清空不走 setter）。
-static BOOL dyyyNpSelfWrite = NO; // 标记我们自己的回写，避免自记噪音
-
-// 调用者画像：最多 4 帧，输出「符号名@镜像名」或「镜像名+偏移」
-static NSString *DYYYNPWhoCalled(void) {
-    void *frames[10];
-    int n = backtrace(frames, 10);
-    if (n <= 2) {
-        return @"(no-stack)";
-    }
-    NSMutableArray *arr = [NSMutableArray array];
-    for (int i = 2; i < n && arr.count < 4; i++) {
-        Dl_info info;
-        if (dladdr(frames[i], &info) && info.dli_fname) {
-            NSString *img = [[NSString stringWithUTF8String:info.dli_fname] lastPathComponent];
-            if (info.dli_sname) {
-                [arr addObject:[NSString stringWithFormat:@"%s@%@", info.dli_sname, img]];
-            } else {
-                unsigned long off = (unsigned long)frames[i] - (unsigned long)info.dli_fbase;
-                [arr addObject:[NSString stringWithFormat:@"%@+0x%lx", img, off]];
-            }
-        }
-    }
-    return arr.count ? [arr componentsJoinedByString:@" < "] : @"(unknown)";
-}
-
-// dump 抖音 Now Playing 相关类的全部方法名，挑出 clear/reset/stop 语义的可疑函数
-static void DYYYNpDumpClassMethods(void) {
-    NSArray *names = @[@"AWENowPlayingInfoCenter", @"AWEFeedBackgroundPlayManager",
-                       @"AWEAwemeBackgroundPlayModule", @"AWEAwemeBackgroundPlayManager",
-                       @"AWENowPlayingInfoManager", @"AWEMediaPlayerManager",
-                       @"AWEAwemePlayManager", @"AWEPlayControlManager",
-                       // 系统类：看有没有我们没覆盖的私有 setter / 发布通道
-                       @"MPNowPlayingInfoCenter", @"MPNowPlayingSession"];
-    for (NSString *n in names) {
-        Class c = NSClassFromString(n);
-        if (!c) {
-            DYYYSpeedDiag([NSString stringWithFormat:@"[np2] 类 %@ 不存在", n]);
-            continue;
-        }
-        NSMutableArray *all = [NSMutableArray array];
-        NSMutableArray *sus = [NSMutableArray array];
-        unsigned int cnt = 0;
-        Method *ms = class_copyMethodList(c, &cnt);
-        for (unsigned int i = 0; i < cnt; i++) {
-            NSString *s = NSStringFromSelector(method_getName(ms[i]));
-            if (all.count < 200) {
-                [all addObject:s];
-            }
-            NSString *ls = s.lowercaseString;
-            if ([ls containsString:@"clear"] || [ls containsString:@"reset"] ||
-                [ls containsString:@"remove"] || [ls containsString:@"stop"] ||
-                [ls containsString:@"invalid"] || [ls containsString:@"pause"] ||
-                [ls containsString:@"leave"] || [ls containsString:@"end"]) {
-                [sus addObject:s];
-            }
-        }
-        if (ms) {
-            free(ms);
-        }
-        DYYYSpeedDiag([NSString stringWithFormat:@"[np2] 类 %@ 方法数=%u 可疑=(%@)", n, cnt, sus]);
-        DYYYSpeedDiag([NSString stringWithFormat:@"[np2] 类 %@ 全部方法=(%@)", n, all]);
-    }
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np2] MPNowPlayingSession 存在=%d",
-                   (int)(NSClassFromString(@"MPNowPlayingSession") != nil)]);
-
-    // 【np3】探测 MediaRemote 私有发布通道：很多播放器（含腾讯系）绕开公开 setter，
-    // 直接走 MRMediaRemote* 私有 C API 给系统发布/清空 now playing。只 dlsym 探测，不 hook。
-    void *mr = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_NOW);
-    NSArray *mrSyms = @[@"MRMediaRemoteSetNowPlayingInfo",
-                        @"MRMediaRemoteSetNowPlayingInfoWithMergePolicy",
-                        @"MRMediaRemoteSetNowPlayingApplicationOverrideEnabled",
-                        @"MRMediaRemoteSetCanBeNowPlayingApplication",
-                        @"MRMediaRemoteSetNowPlayingInfoWithMergePolicyAndCompletion"];
-    NSMutableArray *mrFound = [NSMutableArray array];
-    NSMutableArray *mrMissing = [NSMutableArray array];
-    for (NSString *s in mrSyms) {
-        void *p = dlsym(RTLD_DEFAULT, s.UTF8String);
-        if (!p && mr) {
-            p = dlsym(mr, s.UTF8String);
-        }
-        if (p) {
-            [mrFound addObject:s];
-        } else {
-            [mrMissing addObject:s];
-        }
-    }
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] MediaRemote handle=%d 有=(%@) 无=(%@)",
-                   (int)(mr != NULL), mrFound, mrMissing]);
-}
+// 重入标记：我们自己声明 playbackState 时置位，避免被自己的调用再次触发
+static BOOL dyyyNpSelfWrite = NO;
 
 static BOOL DYYYShouldHoldNowPlaying(void) {
     return DYYYGetBool(@"DYYYKeepNowPlayingInBackground");
@@ -1431,47 +1335,6 @@ static NSInteger DYYYCurrentNowPlayingInfoCount(void) {
     }
     id info = ((id (*)(id, SEL))objc_msgSend)(center, NSSelectorFromString(@"nowPlayingInfo"));
     return [info isKindOfClass:[NSDictionary class]] ? (NSInteger)[info count] : 0;
-}
-
-// 日志：5 秒窗口内最多 24 条。退后台那一串收摊动作必须**全打出来**——
-// 之前用 2 秒限流，第①步之后的②③④全被吃掉，才导致"到底挡没挡住"看不清。
-static void DYYYNpHoldLog(NSString *fmt, ...) {
-    static NSTimeInterval windowStart = 0;
-    static int windowCount = 0;
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - windowStart > 5.0) {
-        windowStart = now;
-        windowCount = 0;
-    }
-    if (windowCount >= 24) {
-        return;
-    }
-    windowCount++;
-    va_list ap;
-    va_start(ap, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np-hold] %@", msg]);
-}
-
-// ===== 卡片"重新挂上"的关键补充：光挡清空不够，必须回写 =====
-// 实测证据（探针版日志）：
-//   ① 播放中抖音会发布 6~7 键的真实信息（title/artist/时长/进度/封面），
-//      分别走 AWENowPlayingInfoCenter 和 MPNowPlayingInfoCenter 两个 setter；
-//   ② 一旦暂停，之后 20+ 次写入**全是 nil**，再没发布过任何非空信息；
-//   ③ 全日志里 MPNowPlayingInfoCenter 的 setPlaybackState: **一次都没被调用过**。
-// 结论：音乐 App 暂停后卡片还在，是因为它把「信息 + 播放态=Paused」都留在系统里；
-//       抖音暂停后既把信息清空、又从不声明暂停态 → 系统判定"没有活跃播放会话" → 撤卡片。
-//       所以只挡清空永远不够：必须在抖音收摊后替它**把最后一份有效信息重新发布上去，
-//       并显式声明 playbackState=Paused**，这才是音乐 App 的行为。
-static NSDictionary *dyyyLastGoodNowPlayingInfo = nil;
-
-// 暂存抖音发布过的最后一份非空信息（暂停前的那个视频的标题/时长/进度/封面）
-static void DYYYStashNowPlayingInfo(id info) {
-    if (![info isKindOfClass:[NSDictionary class]] || [(NSDictionary *)info count] == 0) {
-        return;
-    }
-    dyyyLastGoodNowPlayingInfo = [(NSDictionary *)info copy];
 }
 
 // 【v10 关键判定】ApplicationState 有三个值，必须区分 Inactive 与 Background：
@@ -1554,15 +1417,10 @@ static void DYYYBoostNowPlayingAfterPause(void) {
         }
         id m = dyyyBGPlayModuleInstance;
         if (!m) {
-            DYYYSpeedDiag(@"[np6] Boost 跳过：还没捕获到 AWEAwemeBackgroundPlayModule 实例");
             return;
         }
         SEL resignSel = NSSelectorFromString(@"appWillResignActiveNotification");
         SEL updateSel = NSSelectorFromString(@"updateNowPlayingInfoWhenResiginActive");
-        DYYYSpeedDiag([NSString stringWithFormat:
-                       @"[np6] Boost 主动补 resignActive（hasResign=%d hasUpdate=%d 补前系统侧cnt=%ld）",
-                       [m respondsToSelector:resignSel], [m respondsToSelector:updateSel],
-                       (long)DYYYCurrentNowPlayingInfoCount()]);
         @try {
             // ① 先声明继续接收远程控制（拉控制中心时抖音走的第一步）
             DYYYForceBeginReceivingRemoteControlEvents();
@@ -1574,33 +1432,8 @@ static void DYYYBoostNowPlayingAfterPause(void) {
                 ((void (*)(id, SEL))objc_msgSend)(m, resignSel);
             }
         } @catch (__unused NSException *e) {
-            DYYYSpeedDiag(@"[np6] Boost 调用抛异常，已吞掉");
         }
-        DYYYSpeedDiag([NSString stringWithFormat:@"[np6] Boost 完成，补后系统侧cnt=%ld",
-                       (long)DYYYCurrentNowPlayingInfoCount()]);
     });
-}
-
-// 从一份 nowPlayingInfo 里取标题（探针用，拿不到就返回 "-"）
-static NSString *DYYYNpTitle(id info) {
-    if (![info isKindOfClass:[NSDictionary class]]) {
-        return @"-";
-    }
-    NSDictionary *d = (NSDictionary *)info;
-    NSString *t = d[@"title"] ?: d[@"kMPMediaItemPropertyTitle"];
-    if ([t isKindOfClass:[NSString class]] && t.length > 0) {
-        return t.length > 40 ? [t substringToIndex:40] : t;
-    }
-    for (id k in d) {
-        if ([k isKindOfClass:[NSString class]] && [k containsString:@"Title"]) {
-            id v = d[k];
-            if ([v isKindOfClass:[NSString class]] && [v length] > 0) {
-                NSString *s = v;
-                return s.length > 40 ? [s substringToIndex:40] : s;
-            }
-        }
-    }
-    return @"-";
 }
 
 // ===== ❌【v7 已整块移除】"回写/补发"机制（DYYYReassertNowPlayingState + ...Reassert）=====
@@ -1614,7 +1447,7 @@ static NSString *DYYYNpTitle(id info) {
 //      切到下一条视频后系统侧仍是旧内容 → 控制中心"又是上一条，只播放记录的第一条视频"；
 //   ③ 强行把 playbackState 写成 Paused，覆盖抖音真实播放态。
 // 老板定的原则："不要拦清空→回写拉锯，要在源头让它 return"。现在源头已 return，回写删除。
-// 保留 DYYYStashNowPlayingInfo 仅作留痕用（不再有任何回写动作）。
+//（DYYYStashNowPlayingInfo / dyyyLastGoodNowPlayingInfo 已随本机制一并删除，无任何引用）
 
 // 只保 play/pause/toggle 三条命令（用命令中心实例判等，最可靠）：
 // stop/close 必须放行——用户点卡片上的"关闭"是明确要关，不能也被挡住。
@@ -1654,24 +1487,6 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 //   canPauseForRemoteControl = 现在允许暂停 → 说明在播
 //   canPlayForRemoteControl  = 现在允许播放 → 说明已暂停
 static BOOL dyyyNpRatePatching = NO;   // 重入保护：读 getter 若又触发发布，不二次修正
-
-// 把抖音模块的播放态 getter 打成一行（探针用；缺某个 selector 打 "-"）
-static NSString *DYYYPlayStateDesc(id m) {
-    if (!m) {
-        return @"(nil)";
-    }
-    NSMutableString *s = [NSMutableString string];
-    for (NSString *name in @[@"backgroundIsPlaying", @"canPlayForRemoteControl", @"canPauseForRemoteControl"]) {
-        SEL sel = NSSelectorFromString(name);
-        if ([m respondsToSelector:sel]) {
-            BOOL v = ((BOOL (*)(id, SEL))objc_msgSend)(m, sel);
-            [s appendFormat:@"%@=%d ", name, (int)v];
-        } else {
-            [s appendFormat:@"%@=- ", name];
-        }
-    }
-    return s;
-}
 
 // 返回：1 = 正在播放，2 = 已暂停，0 = 证据不足（此时绝不改动字典，保持抖音原样）
 // 阈值 |score| >= 2 是刻意的"保守档"：证据打架时一律判"不确定"→ 不动作、不产生回归。
@@ -1721,9 +1536,6 @@ static NSDictionary *DYYYRateCorrectedNowPlayingInfo(NSDictionary *info, NSInteg
     if (!d[@"MPNowPlayingInfoPropertyDefaultPlaybackRate"]) {
         d[@"MPNowPlayingInfoPropertyDefaultPlaybackRate"] = @(1.0f);
     }
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np7] 修正 rate → %.1f（抖音状态=%ld，rate 原值=%@）",
-                   playing ? 1.0 : 0.0, (long)state,
-                   [cur isKindOfClass:[NSNumber class]] ? [NSString stringWithFormat:@"%.2f", [cur floatValue]] : @"无此键"]);
     return d;
 }
 
@@ -1748,7 +1560,6 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
         dyyyNpSelfWrite = YES;
         ((void (*)(id, SEL, NSInteger))objc_msgSend)(center, NSSelectorFromString(@"setPlaybackState:"), state);
         dyyyNpSelfWrite = NO;
-        DYYYSpeedDiag([NSString stringWithFormat:@"[np7] 声明 playbackState %ld → %ld", (long)cur, (long)state]);
     } @catch (__unused NSException *e) {
         dyyyNpSelfWrite = NO;
     }
@@ -1765,7 +1576,6 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 // 所以判据不能要求"非前台"，否则永远晚一步。
 - (void)setPlayingPlayer:(id)player {
     if (!player && DYYYShouldHoldNowPlaying()) {
-        DYYYNpHoldLog(@"挡下 AWENowPlayingInfoCenter setPlayingPlayer:(nil)");
         return;
     }
 
@@ -1773,18 +1583,8 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 }
 
 - (void)setNowPlayingInfo:(id)nowPlayingInfo {
-    // 暂存抖音发布的非空信息（暂停前的真实内容：标题/作者/时长/进度/封面）
-    DYYYStashNowPlayingInfo(nowPlayingInfo);
-    // 【v9 探针】非空发布要留痕：这是判断"切视频后抖音到底有没有产生新内容"的唯一依据
-    if (nowPlayingInfo) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[np3] AWENPC setNowPlayingInfo cnt=%lu title=%@",
-                       (unsigned long)([nowPlayingInfo isKindOfClass:[NSDictionary class]]
-                                       ? [(NSDictionary *)nowPlayingInfo count] : 0),
-                       DYYYNpTitle(nowPlayingInfo)]);
-    }
     // 清空抖音侧信息（收摊第②步）→ 托管中吞掉。暂停那一刻就会来，必须挡。
     if (!nowPlayingInfo && DYYYShouldHoldNowPlaying()) {
-        DYYYNpHoldLog(@"挡下 AWENowPlayingInfoCenter setNowPlayingInfo:(nil)");
         return;
     }
 
@@ -1803,21 +1603,15 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 // （最后一条 10:25:10），说明掐住"后台模块辞职"同样会打断前台交接。
 // 另：b8e4fdf 版日志显示拦下 51 次 resignPlayingPlayer 卡片依然照掉 → 拦它既无收益又有害。
 - (void)resignPlayingPlayer:(id)player {
-    NSString *cls = player ? NSStringFromClass([player class]) : @"(nil)";
-    NSInteger st = DYYYAppStateRaw();
-    if (DYYYShouldHoldNowPlaying() && st == 2) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[np3] 拦下 resignPlayingPlayer: %@（Background 收摊）", cls]);
+    if (DYYYShouldHoldNowPlaying() && DYYYAppStateRaw() == 2) {
         return;
     }
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] 放行 resignPlayingPlayer: %@（state=%ld）", cls, (long)st]);
     %orig;
 }
 
 // 【v4】removeRemoteCommandTarget = 摘掉远程命令（播放/暂停按钮消失）。托管中不让摘。
 - (void)removeRemoteCommandTarget {
-    DYYYSpeedDiag(@"[np3] hit removeRemoteCommandTarget");
     if (DYYYShouldHoldNowPlaying()) {
-        DYYYSpeedDiag(@"[np3] 拦下 removeRemoteCommandTarget");
         return;
     }
 
@@ -1831,18 +1625,8 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 //   结果真凶一直没被盖住。现在按老板思路：记录 + 直接 return，让它永远不主动清空。
 %hook AWEFeedBackgroundPlayManager
 
-// playingCenter 的参数类名是一锤定音的判定：抖音到底用 MPNowPlayingInfoCenter 还是
-// MPNowPlayingSession（或别的）来给系统发布信息 —— 决定了后续该往哪儿使劲。
-- (void)setPlayingCenter:(id)center {
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] setPlayingCenter: 类=%@",
-                   center ? NSStringFromClass([center class]) : @"(nil)"]);
-    %orig;
-}
-
 - (void)clearNowPlayingInfo {
-    DYYYSpeedDiag(@"[np3] hit clearNowPlayingInfo");
     if (DYYYShouldHoldNowPlaying()) {
-        DYYYSpeedDiag(@"[np3] 拦下 clearNowPlayingInfo（源头掐死）");
         return;
     }
 
@@ -1850,9 +1634,7 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 }
 
 - (void)clearCommand {
-    DYYYSpeedDiag(@"[np3] hit clearCommand");
     if (DYYYShouldHoldNowPlaying()) {
-        DYYYSpeedDiag(@"[np3] 拦下 clearCommand（源头掐死）");
         return;
     }
 
@@ -1860,10 +1642,7 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 }
 
 - (void)resetNowPlayingInfo:(id)model {
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] hit resetNowPlayingInfo: %@",
-                   model ? NSStringFromClass([model class]) : @"(nil)"]);
     if (DYYYShouldHoldNowPlaying()) {
-        DYYYSpeedDiag(@"[np3] 拦下 resetNowPlayingInfo:");
         return;
     }
 
@@ -1884,12 +1663,7 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 // 实测系统那条通道抖音根本不走）
 - (void)setCurrentNowPlayingInfo:(id)info {
     dyyyBGPlayModuleInstance = self;   // 缓存实例，供"暂停后补 resignActive"调用（v11）
-    DYYYStashNowPlayingInfo(info);
     BOOL isEmpty = (![info isKindOfClass:[NSDictionary class]] || [(NSDictionary *)info count] == 0);
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] setCurrentNowPlayingInfo cnt=%lu title=%@ cls=%@",
-                   (unsigned long)([info isKindOfClass:[NSDictionary class]] ? [(NSDictionary *)info count] : 0),
-                   DYYYNpTitle(info),
-                   info ? NSStringFromClass([info class]) : @"(nil)"]);
     // 【v11】抖音把"当前播放信息"清空 = 用户暂停了。它的发布链此刻还没跑（要等 resignActive），
     // 我们主动替它补一次，让卡片当场挂上 —— 不必等用户去拉控制中心。
     if (isEmpty && DYYYShouldHoldNowPlaying()) {
@@ -1900,9 +1674,7 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 
 // "决定清空"：YES 时吞掉 → 抖音永远不会决定清空
 - (void)setNeedCleanNowPlayingInfo:(BOOL)value {
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] setNeedCleanNowPlayingInfo:%d", (int)value]);
     if (value && DYYYShouldHoldNowPlaying()) {
-        DYYYSpeedDiag(@"[np3] 拦下 setNeedCleanNowPlayingInfo:YES（源头掐死）");
         return;
     }
 
@@ -1911,9 +1683,7 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 
 // "决定辞去播放身份"：YES 时吞掉
 - (void)setNeedResignPlayingPlayer:(BOOL)value {
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] setNeedResignPlayingPlayer:%d", (int)value]);
     if (value && DYYYShouldHoldNowPlaying()) {
-        DYYYSpeedDiag(@"[np3] 拦下 setNeedResignPlayingPlayer:YES（源头掐死）");
         return;
     }
 
@@ -1933,40 +1703,15 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 - (void)doExitBackgroundPlayMode {
     NSInteger st = DYYYAppStateRaw();
     if (DYYYShouldHoldNowPlaying() && st == 2) {
-        DYYYSpeedDiag(@"[np3] 拦下 doExitBackgroundPlayMode（Background 收摊，保住卡片）");
         return;
     }
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] 放行 doExitBackgroundPlayMode（state=%ld，让抖音完成交接）", (long)st]);
     %orig;
 }
 
 // 【v7 已移除】forbidResumePlayFromBackground 的强制改写。
-// v5 曾把它的 YES 强改 NO，理由是"让后台点播放真能续播"——纯推测，实测有害（本次日志命中 11 次）：
+// v5 曾把它的 YES 强改 NO，理由是"让后台点播放真能续播"——纯推测，实测有害：
 // 抖音把它置 YES 是它自己状态机的决定，我们越权改写只会把控制中心的播放命令引到错误的恢复路径上
 //（老板实测"只播放记录的第一条视频"）。恢复原样，不再干预抖音的播放状态机。
-
-// ===== 【v11 探针】观测抖音自己在"拉控制中心/resignActive"时到底走哪条链 =====
-// 目的：验证"发布由 resignActive 驱动"这一推断，并确认我们 Boost 时该补哪一次调用。
-// 只留痕，不改行为。三个方法均无参（方法表 dump 里都没有冒号）。
-- (void)appWillResignActiveNotification {
-    DYYYSpeedDiag(@"[np6] hit appWillResignActiveNotification");
-    %orig;
-}
-
-- (void)updateNowPlayingInfoWhenResiginActive {
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np6] hit updateNowPlayingInfoWhenResiginActive（系统侧cnt=%ld）",
-                   (long)DYYYCurrentNowPlayingInfoCount()]);
-    %orig;
-}
-
-- (void)updateNowPlayingInfoPlayback {
-    // 【v12 探针】这个方法是"播放心跳"（播放中约每 1-2 秒一次）。把三个状态 getter 的真实值
-    // 和我们的投票结果一起打出来 —— 下一版日志可直接核对"暂停时 getter 是不是真的翻过来了"，
-    // 若翻不过来，说明 backgroundIsPlaying 语义不是"是否在播"，照日志换权重即可。
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np7] updateNowPlayingInfoPlayback 抖音态: %@| 判定=%ld",
-                   DYYYPlayStateDesc(self), (long)DYYYReadDouyinPlayState()]);
-    %orig;
-}
 
 %end
 
@@ -1974,22 +1719,11 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 %hook MPNowPlayingInfoCenter
 
 - (void)setNowPlayingInfo:(NSDictionary *)nowPlayingInfo {
-    // 【定位探针】全量留痕：谁、什么时候、把系统播放信息写成什么
-    if (!dyyyNpSelfWrite) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[np2] SET %@ cnt=%lu title=%@ | %@",
-                       nowPlayingInfo ? @"info" : @"NIL",
-                       (unsigned long)nowPlayingInfo.count, DYYYNpTitle(nowPlayingInfo),
-                       DYYYNPWhoCalled()]);
-    }
-    // 暂存抖音发布到系统的非空信息（回写时的内容来源）
-    DYYYStashNowPlayingInfo(nowPlayingInfo);
-
     // 清空系统侧信息 = 卡片被撤的直接原因。托管中【直接吞掉】不调 %orig，
     // 但**不再做"将暂存信息顶回"的下游拉锯**——那正是导致"控制中心控制的是上一条视频 /
     // 播放态被强行写成 Paused / 时好时坏"的根源（详见上方 v7 移除说明）。
     // 上游源头已经全部 return，这里只需安静地不让清空落地。
     if (nowPlayingInfo.count == 0 && DYYYShouldHoldNowPlaying()) {
-        DYYYNpHoldLog(@"挡下 MPNowPlayingInfoCenter setNowPlayingInfo:(nil)");
         return;
     }
 
@@ -2012,15 +1746,6 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
     %orig;
 }
 
-// 【定位探针】播放态声明：音乐 App 暂停时会置 Paused，看抖音/系统到底有没有动过
-- (void)setPlaybackState:(NSInteger)playbackState {
-    if (!dyyyNpSelfWrite) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[np2] STATE %ld | %@",
-                       (long)playbackState, DYYYNPWhoCalled()]);
-    }
-    %orig;
-}
-
 %end
 
 // 【v5】环境音类判定：Ambient / SoloAmbient 表示"我不打算当主音频"，
@@ -2030,20 +1755,7 @@ static BOOL DYYYIsAmbientCategory(NSString *c) {
            [c isEqualToString:AVAudioSessionCategorySoloAmbient];
 }
 
-// 【定位探针】会话层：确认卡片消失是不是因为 AVAudioSession 被置为 inactive
 %hook AVAudioSession
-
-- (BOOL)setActive:(BOOL)active error:(NSError **)outError {
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np2] SESSION setActive:%d cat=%@ | %@",
-                   (int)active, [self category], DYYYNPWhoCalled()]);
-    return %orig;
-}
-
-- (BOOL)setActive:(BOOL)active withOptions:(AVAudioSessionSetActiveOptions)options error:(NSError **)outError {
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np2] SESSION setActive:%d opts=%lu | %@",
-                   (int)active, (unsigned long)options, DYYYNPWhoCalled()]);
-    return %orig;
-}
 
 // ===== 【v5 定位+保护】audio session 类别层 =====
 // WWDC2019-501 原话：App 成为 Now Playing App 有两个硬条件——① 至少支持一条远程命令
@@ -2056,9 +1768,7 @@ static BOOL DYYYIsAmbientCategory(NSString *c) {
 - (BOOL)setCategory:(AVAudioSessionCategory)category error:(NSError **)outError {
     NSString *cur = [self category];
     BOOL downgrade = [cur isEqualToString:AVAudioSessionCategoryPlayback] && DYYYIsAmbientCategory(category);
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np5] setCategory=%@ (当前=%@) | %@", category, cur, DYYYNPWhoCalled()]);
     if (downgrade && DYYYShouldHoldNowPlaying()) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[np5] 拦下 setCategory=%@（会失去 Now Playing 资格）→ 强制 Playback", category]);
         return %orig(AVAudioSessionCategoryPlayback, outError);
     }
     return %orig;
@@ -2068,11 +1778,7 @@ static BOOL DYYYIsAmbientCategory(NSString *c) {
     NSString *cur = [self category];
     BOOL downgrade = [cur isEqualToString:AVAudioSessionCategoryPlayback] && DYYYIsAmbientCategory(category);
     AVAudioSessionCategoryOptions clean = options & ~AVAudioSessionCategoryOptionMixWithOthers;
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np5] setCategory=%@ opts=%lu (当前=%@) | %@",
-                   category, (unsigned long)options, cur, DYYYNPWhoCalled()]);
     if (DYYYShouldHoldNowPlaying() && (downgrade || clean != options)) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[np5] 拦下并修正 setCategory（downgrade=%d opts %lu→%lu）",
-                       (int)downgrade, (unsigned long)options, (unsigned long)clean]);
         return %orig(downgrade ? AVAudioSessionCategoryPlayback : category, clean, outError);
     }
     return %orig;
@@ -2082,44 +1788,10 @@ static BOOL DYYYIsAmbientCategory(NSString *c) {
     NSString *cur = [self category];
     BOOL downgrade = [cur isEqualToString:AVAudioSessionCategoryPlayback] && DYYYIsAmbientCategory(category);
     AVAudioSessionCategoryOptions clean = options & ~AVAudioSessionCategoryOptionMixWithOthers;
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np5] setCategory=%@ mode=%@ opts=%lu (当前=%@) | %@",
-                   category, mode, (unsigned long)options, cur, DYYYNPWhoCalled()]);
     if (DYYYShouldHoldNowPlaying() && (downgrade || clean != options)) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[np5] 拦下并修正 setCategory:mode:options:（downgrade=%d opts %lu→%lu）",
-                       (int)downgrade, (unsigned long)options, (unsigned long)clean]);
         return %orig(downgrade ? AVAudioSessionCategoryPlayback : category, mode, clean, outError);
     }
     return %orig;
-}
-
-- (BOOL)setMode:(AVAudioSessionMode)mode error:(NSError **)outError {
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np5] setMode=%@ | %@", mode, DYYYNPWhoCalled()]);
-    return %orig;
-}
-
-%end
-
-// 【定位探针】iOS 16 的 MPNowPlayingSession：若抖音用它，卡片归系统自动管理，清空不走 setter
-%hook MPNowPlayingSession
-
-// [np3] 注意：不要在这里写 [self class] —— Logos 生成代码里 MPNowPlayingSession 是前向声明，
-// 对该类型发消息会报 "receiver type for instance message is a forward declaration" 并让 clang 段错误。
-- (id)initWithPlayers:(NSArray *)players {
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] MPNowPlayingSession initWithPlayers count=%lu",
-                   (unsigned long)players.count]);
-    return %orig;
-}
-
-- (id)initWithActivePlayer:(id)player {
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] MPNowPlayingSession initWithActivePlayer %@",
-                   player ? NSStringFromClass([player class]) : @"(nil)"]);
-    return %orig;
-}
-
-- (void)setAutomaticallyPublishesNowPlayingInfo:(BOOL)value {
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] SESSION autoPublish=%d | %@",
-                   (int)value, DYYYNPWhoCalled()]);
-    %orig;
 }
 
 %end
@@ -2132,7 +1804,6 @@ static BOOL DYYYIsAmbientCategory(NSString *c) {
 
 - (void)removeTarget:(id)target action:(SEL)action {
     if (DYYYShouldHoldNowPlaying() && DYYYIsPreservedPlaybackCommand(self)) {
-        DYYYNpHoldLog(@"挡下 removeTarget:action: (%@)", NSStringFromClass([self class]));
         return;
     }
 
@@ -2141,7 +1812,6 @@ static BOOL DYYYIsAmbientCategory(NSString *c) {
 
 - (void)removeTarget:(id)target {
     if (DYYYShouldHoldNowPlaying() && DYYYIsPreservedPlaybackCommand(self)) {
-        DYYYNpHoldLog(@"挡下 removeTarget: (%@)", NSStringFromClass([self class]));
         return;
     }
 
@@ -2150,7 +1820,6 @@ static BOOL DYYYIsAmbientCategory(NSString *c) {
 
 - (void)setEnabled:(BOOL)enabled {
     if (!enabled && DYYYShouldHoldNowPlaying() && DYYYIsPreservedPlaybackCommand(self)) {
-        DYYYNpHoldLog(@"挡下 setEnabled:0 (%@)", NSStringFromClass([self class]));
         return;
     }
 
@@ -5214,17 +4883,9 @@ static void DYYYBlockUpdateClassesOnce(void) {
 // 置 0 = 自愿退出 now playing → 系统立刻撤卡片。这条路径完全在 UIKit 内部，绕过抖音自有类、
 // 绕过所有 MPNowPlayingInfoCenter setter，所以之前怎么拦都拦不住。
 // 托管中不调 %orig，等于【永远不主动辞去 Now Playing 身份】。纯 ObjC，无 inline patch 风险。
-- (void)beginReceivingRemoteControlEvents {
-    DYYYSpeedDiag(@"[np5] beginReceivingRemoteControlEvents");
-    %orig;
-}
-
+// 仅当确实挂着播放信息时才拦，避免干扰抖音冷启动期的正常初始化（那时尚无卡片）
 - (void)endReceivingRemoteControlEvents {
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np5] endReceivingRemoteControlEvents | %@",
-                   DYYYNPWhoCalled()]);
-    // 仅当确实挂着播放信息时才拦，避免干扰抖音冷启动期的正常初始化（那时尚无卡片）
     if (DYYYShouldHoldNowPlaying() && DYYYCurrentNowPlayingInfoCount() > 0) {
-        DYYYSpeedDiag(@"[np5] 拦下 endReceivingRemoteControlEvents（托管中不撤 Now Playing 身份）");
         return;
     }
     %orig;
@@ -15007,13 +14668,6 @@ static void findTargetViewInView(UIView *view) {
     }
 
     DYYYMigrateCombinedHDRModeIfNeeded();
-
-    // 【定位探针】延迟 dump 抖音 Now Playing 相关类的方法清单（异步、只读、一次性），
-    // 用来直接找出"清空"那个函数名。定位完成后连同 [np2] 探针一起删除。
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
-        DYYYNpDumpClassMethods();
-    });
 
     Class interactionBaseLabelClass = objc_getClass("AWECommentSwiftBizUI.CommentInteractionBaseLabel");
     if (interactionBaseLabelClass) {
