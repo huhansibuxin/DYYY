@@ -13579,19 +13579,20 @@ static void DYYYRemoveKeyboardObserver(void) {
     BOOL result = %orig;
     initTargetClassNames();
 
-    // 【v14】冷启动续播判定：didFinishLaunching 时 state==Background = 系统无感拉起
-    //（点图标冷启动是 Inactive/Active，不会命中），再叠加卡片时间戳 < 5 分钟，双重防误触。
+    // 【v14.1】冷启动续播判定：didFinishLaunching 时 state==Background = 系统无感拉起
+    //（点图标冷启动是 Inactive/Active，不会命中）。系统愿意拉起我们本身就说明卡片归属是我们
+    //（实测 15:00:23：装包 17s 内没播放过、时间戳为空，系统照样按遗留卡片拉起），所以时间戳
+    // 降级为参考日志，真正的排除项用 launchOptions——推送/bg fetch/VoIP 拉起都带对应 key。
     @try {
         UIApplicationState st = [UIApplication sharedApplication].applicationState;
-        if (st == UIApplicationStateBackground) {
+        BOOL pulledByPush = launchOptions[UIApplicationLaunchOptionsRemoteNotificationKey] != nil ||
+                            launchOptions[UIApplicationLaunchOptionsBackgroundFetchingKey] != nil;
+        if (st == UIApplicationStateBackground && !pulledByPush) {
             double stamp = [[NSUserDefaults standardUserDefaults] doubleForKey:kDYYYColdResumeStampKey];
-            NSTimeInterval age = [[NSDate date] timeIntervalSince1970] - stamp;
-            if (stamp > 0 && age < 300) {
-                DYYYSpeedDiag([NSString stringWithFormat:@"[cold-resume] 启动时 state=Background，卡片时间戳距今 %.0fs", age]);
-                DYYYScheduleColdResume();
-            } else {
-                DYYYSpeedDiag([NSString stringWithFormat:@"[cold-resume] 后台拉起但无新鲜卡片时间戳（age=%.0fs），不续播", age]);
-            }
+            NSTimeInterval age = stamp > 0 ? [[NSDate date] timeIntervalSince1970] - stamp : -1;
+            DYYYSpeedDiag([NSString stringWithFormat:@"[cold-resume] 启动时 state=Background（非推送拉起），卡片时间戳 %@",
+                age >= 0 ? [NSString stringWithFormat:@"距今 %.0fs", age] : @"无"]);
+            DYYYScheduleColdResume();
         }
     } @catch (__unused NSException *e) {
     }
