@@ -1396,6 +1396,14 @@ static BOOL DYYYShouldHoldNowPlaying(void) {
 // "use of undeclared identifier"（CI run 35526845456 实测 exit code 2）。
 static void DYYYCutVideoNudge(void);
 
+// 【v24】前置声明：探针实现在 DYYYDumpRemoteControlSignatures 之后。
+// ⚠️ 同样必须声明在前面 —— v18 就是在这一点上翻过车（use of undeclared identifier）。
+static void DYYYProbeAwemeHolder(id host, NSString *tag);
+
+// 【v24】从原 Boost 区上移到此处：DYYYNoteAwemeChangedFrom 里的切视频探针也要用它，
+// 定义留在下面（原 1534 行位置）会报 undeclared identifier。
+static __weak id dyyyBGPlayModuleInstance = nil;   // AWEAwemeBackgroundPlayModule 实例（hook 里缓存）
+
 // ⭐【v23 探针】判定"这个 VC 是不是用户此刻真正在看的那一页"。
 // 必要性（diag/v22_check.log 铁证）：18:30:08 与 18:30:29，「最后一条候选」报的是
 // 《一天过了一天…》，而系统侧稳定停在《丈母娘的客栈-5》—— 说明 setIsAutoPlay:YES 在 feed 里
@@ -1443,6 +1451,19 @@ static void DYYYNoteAwemeChangedFrom(id object, NSString *source, id host) {
     dyyyCurrentAwemeTitle = title;
     DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 切视频候选 %@%@ → 当前=%@ | 系统侧=%@",
         source, DYYYViewOnScreenMark(host), title, DYYYCurrentSystemNPTitle() ?: @"-"]);
+
+    // ⭐【v24 探针】切视频这一刻，抖音的"真身"换人了没？——节流 1s，
+    // 因为 setIsAutoPlay/prepareForDisplay/setModel 同一秒会连打 2~4 次。
+    // 判读：若模块手上的标题【始终不跟】候选走，说明模块不参与 feed 切页，
+    // 那"控制中心点播放打谁"就得换个对象；若跟随，则模块就是权威源，可直接拿它当期望。
+    {
+        static NSTimeInterval lastHolderProbe = 0;
+        NSTimeInterval nowTs = [[NSDate date] timeIntervalSince1970];
+        if (nowTs - lastHolderProbe >= 1.0) {
+            lastHolderProbe = nowTs;
+            DYYYProbeAwemeHolder(dyyyBGPlayModuleInstance, @"切@背景播放模块");
+        }
+    }
 
     // ⭐【v18】切视频瞬间主动催一次原生发布。
     // 实测（diag/v17_check.log）：切到新视频后，抖音要 1~2s 才把新信息发到系统侧，
@@ -1514,7 +1535,6 @@ static NSInteger DYYYAppStateRaw(void) {
 //   ⭐ 前提已具备：AWENowPlayingInfoCenter.setPlayingPlayer:(nil) 一直被我们挡下，
 //     抖音内部的播放器引用还在 → 它的 update 仍能组装出完整信息（diag/v10.log 10:44:11 实证：
 //     清空 3 秒后抖音仍能发布《翻龙之下九门》cnt=6/7 的完整内容）。
-static __weak id dyyyBGPlayModuleInstance = nil;   // AWEAwemeBackgroundPlayModule 实例（hook 里缓存）
 static BOOL dyyyNpPublishedSinceBoost = NO;   // Boost 后系统侧是否出现过非空发布（0 次重试的判据）
 // 抖音最后一次非空"当前播放信息"副本。仅用于 Boost 兜底【单发】一次——与 v7 被禁的
 // "回写拉锯"本质不同：不循环、只在原生发布链确认不动作时发一次、发布内容是暂停瞬间的
@@ -2063,6 +2083,155 @@ static void DYYYDumpRemoteControlSignatures(void) {
     }
 }
 
+// ===== 【v24】不再"猜"当前视频 —— 直接把抖音内部握着当前 aweme 的字段挖出来 =====
+//
+// v23 实测（diag/v23_check.log，4438 行）把上一条路彻底堵死，三条铁证：
+//   ① 「屏上」判据【失效】：setIsAutoPlay 的宿主 VC 是全屏复用的，convertRect 转出来
+//      永远覆盖窗口中点 → 45 次全判「屏上」且横跨 4 个不同标题，判据不区分任何东西。
+//   ② 催发 73 次里 46 次（63%）连一次系统发布都催不出来；且「期望」自身会【滞后】系统侧
+//      （18:29~18:31 系统侧早已是《客栈》，dyyyCurrentAwemeTitle 仍停在《一天过了一天》），
+//      还会在两条视频间【交替】（18:27:34~18:28:42 期望在《一天过了一天》/《#高颜值美女dj》
+//      之间来回跳）→ 拿它当期望从根上就是错的。
+//   ③ 兜底补发依旧 0 发射；「模块收下当前条目」全轮仅 6 次 → 抖音几乎不把条目交回模块。
+//
+// 结论：任何"从挂点反推当前视频"的路都不可靠（挂点会被预加载触发、VC 会复用）。
+// 唯一还站得住的来源 = 抖音自己"正在播"的那个对象（背景播放模块 / 播放器 VC）——
+// 控制中心点播放最终打的正是它（handlePlayCommand → playingPlayer.playForRemoteControl）。
+// 本轮纯探针、零行为变更：把候选宿主的 ivar 与 getter 全扫出来，
+// 让数据告诉我们【哪个字段握着当前 aweme】，以及它和系统侧文字差在哪。
+
+// 只对【对象型】ivar 取值（非对象型用 object_getIvar 会崩），返回一行摘要。
+static NSString *DYYYIvarSummary(id obj, Ivar iv) {
+    const char *enc = ivar_getTypeEncoding(iv);
+    const char *name = ivar_getName(iv);
+    if (!enc || !name) {
+        return nil;
+    }
+    if (enc[0] != '@') {
+        return nil;              // 只读对象型
+    }
+    if (enc[1] == '?') {
+        return nil;              // block 跳过
+    }
+    id v = nil;
+    @try {
+        v = object_getIvar(obj, iv);
+    } @catch (__unused NSException *e) {
+        return nil;
+    }
+    if (!v) {
+        return nil;
+    }
+    NSString *cls = NSStringFromClass([v class]) ?: @"?";
+    NSString *t = DYYYAwemeTitleText(v);
+    if (t.length > 0) {
+        return [NSString stringWithFormat:@"%s=<%@> 标题=%@", name, cls,
+            [t substringToIndex:MIN(t.length, (NSUInteger)26)]];
+    }
+    if ([v isKindOfClass:[NSString class]]) {
+        NSString *s = (NSString *)v;
+        return [NSString stringWithFormat:@"%s=<%@> %@", name, cls,
+            [s substringToIndex:MIN(s.length, (NSUInteger)26)]];
+    }
+    return [NSString stringWithFormat:@"%s=<%@>", name, cls];
+}
+
+// 一次性把类的 ivar 清单打出来（名字+类型），供我们判断该读哪个字段。
+static void DYYYDumpClassIvars(Class cls, NSString *label) {
+    if (!cls) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv-shape] 类 %@ 未加载", label]);
+        return;
+    }
+    unsigned int n = 0;
+    Ivar *ivars = class_copyIvarList(cls, &n);
+    if (!ivars) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv-shape] %@ ivar 不可读", label]);
+        return;
+    }
+    NSMutableArray *names = [NSMutableArray array];
+    for (unsigned int i = 0; i < n; i++) {
+        const char *nm = ivar_getName(ivars[i]);
+        const char *en = ivar_getTypeEncoding(ivars[i]);
+        if (nm) {
+            [names addObject:[NSString stringWithFormat:@"%s:%s", nm, en ? en : "?"]];
+        }
+    }
+    free(ivars);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[npv-shape] %@ ivar(%u) = %@", label, n,
+        [names componentsJoinedByString:@", "]]);
+}
+
+// 扫一个实例：所有对象型 ivar + 一批候选 getter，只打印"有值/能取到标题"的。
+// getter 严格按 method_getReturnType 过滤，只调【返回对象】的 —— 防止把 NSInteger 强转 id。
+static void DYYYProbeAwemeHolder(id host, NSString *tag) {
+    if (!host) {
+        return;
+    }
+    Class cls = [host class];
+    unsigned int n = 0;
+    Ivar *ivars = class_copyIvarList(cls, &n);
+    NSMutableArray *hits = [NSMutableArray array];
+    if (ivars) {
+        for (unsigned int i = 0; i < n; i++) {
+            NSString *s = DYYYIvarSummary(host, ivars[i]);
+            if (s) {
+                [hits addObject:s];
+            }
+        }
+        free(ivars);
+    }
+    NSArray<NSString *> *getters = @[
+        @"currentAweme", @"aweme", @"awemeModel", @"currentAwemeModel", @"currentItem",
+        @"item", @"model", @"playingPlayer", @"player", @"currentPlayer", @"videoModel",
+        @"currentNowPlayingInfo", @"nowPlayingInfo", @"fromAweme", @"moreModel"
+    ];
+    for (NSString *g in getters) {
+        SEL sel = NSSelectorFromString(g);
+        if (![host respondsToSelector:sel]) {
+            continue;
+        }
+        Method mm = class_getInstanceMethod(cls, sel);
+        if (!mm) {
+            continue;
+        }
+        char rt[16] = {0};
+        method_getReturnType(mm, rt, sizeof(rt));
+        if (rt[0] != '@' || rt[1] == '?') {
+            continue;            // 只要返回对象的
+        }
+        @try {
+            id v = ((id (*)(id, SEL))objc_msgSend)(host, sel);
+            if (!v) {
+                continue;
+            }
+            NSString *t = DYYYAwemeTitleText(v);
+            [hits addObject:[NSString stringWithFormat:@"getter %@=<%@>%@", g,
+                NSStringFromClass([v class]) ?: @"?", t.length > 0
+                    ? [NSString stringWithFormat:@" 标题=%@", [t substringToIndex:MIN(t.length, (NSUInteger)26)]]
+                    : @""]];
+        } @catch (__unused NSException *e) {
+        }
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[npv-shape] %@ 实例=%@ 取值(%lu) %@ | 系统侧=%@",
+        tag, NSStringFromClass(cls) ?: @"?", (unsigned long)hits.count,
+        hits.count ? [hits componentsJoinedByString:@" | "] : @"(无可读字段)",
+        DYYYCurrentSystemNPTitle() ?: @"-"]);
+}
+
+// 一次性打类结构（只在第一轮做，避免日志爆炸）。
+static void DYYYDumpAwemeSourceShapes(void) {
+    static BOOL done = NO;
+    if (done) {
+        return;
+    }
+    done = YES;
+    DYYYDumpClassIvars(NSClassFromString(@"AWEAwemeBackgroundPlayModule"), @"类:背景播放模块");
+    DYYYDumpClassIvars(NSClassFromString(@"AWENowPlayingInfoCenter"), @"类:播放信息中心");
+    DYYYDumpClassIvars(NSClassFromString(@"AWEFeedBackgroundPlayManager"), @"类:后台播放管理");
+    DYYYDumpClassIvars(NSClassFromString(@"AWEAwemeModel"), @"类:aweme模型");
+    DYYYDumpClassIvars(NSClassFromString(@"AWEDPlayerViewController_Merge"), @"类:播放器VC");
+}
+
 // 【已移除】AWEAwemeBackgroundPlayModule / AWEFeedBackgroundPlayManager 两个 hook 块：
 // 它们只服务于已删除的「信息流不显示播放信息」开关（清空系统 nowPlayingInfo），
 // 与保留卡片的目标冲突，整块删除。抖音的播放信息走 AWENowPlayingInfoCenter，
@@ -2152,12 +2321,22 @@ static void DYYYDumpRemoteControlSignatures(void) {
 //    v21 起按真值返回，并把 ret 打进日志。
 - (NSInteger)handlePlayCommand {
     DYYYDumpRemoteControlSignatures();
+    DYYYDumpAwemeSourceShapes();   // 【v24】一次性打类结构（只在首轮）
     dyyyPlayCmdInFlight = YES;
     id me = (id)self;
     SEL playingSel = NSSelectorFromString(@"playingPlayer");
     id player = ((id (*)(id, SEL))objc_msgSend)(me, playingSel);
     DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ 收到 play 命令（控制中心点了播放）→ 开续播保护窗口 | 当前 playingPlayer=%@",
                                              player ? NSStringFromClass([player class]) : @"(nil)"]);
+
+    // ⭐【v24 探针】点播放这一刻，把"抖音内部握着当前 aweme 的对象"全部摊开：
+    //   · 播放信息中心自己（self）—— playingPlayer 的真身住在这儿
+    //   · 背景播放模块 dyyyBGPlayModuleInstance —— 控制中心命令最终打在它身上
+    //   · 最近上岗过的对象 dyyyLastPlayingPlayer
+    // 对照它们取到的标题 vs 系统侧文字，就能一次判定"文字不对"到底错在哪一层。
+    DYYYProbeAwemeHolder(me, @"play@播放信息中心");
+    DYYYProbeAwemeHolder(dyyyBGPlayModuleInstance, @"play@背景播放模块");
+    DYYYProbeAwemeHolder(player, @"play@playingPlayer");
 
     // ⭐【v21 关键修复】playingPlayer 为空 = 抖音手上没有可播对象 → 命令执行了也没落点。
     // 用【最近上岗过的】模块补回去（它就是抖音自己的 playingPlayer，日志实测类名
