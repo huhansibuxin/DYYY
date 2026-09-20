@@ -1297,377 +1297,8 @@ static void DYYYHandleCurrentSpeedAwemeChanged(id aweme) {
 // 重入标记：我们自己声明 playbackState 时置位，避免被自己的调用再次触发
 static BOOL dyyyNpSelfWrite = NO;
 
-// ===== 【v16】切视频同步 + 弹药卫生（修"暂停后划下一条，卡片还是上一条"）=====
-// 老板实测：暂停后划下一条，新视频会【自动播放】，但控制中心卡片内容不跟、点播放也恢复上一条。
-// 日志铁证（diag/v156_check.log）：
-//   ① 17:03:13「补一轮」当场触发了原生发布（PUB 穿高跟鞋 cnt=5），紧接着兜底单发照样执行
-//      → 用缓存把刚发布的新内容盖掉。根因：代码在补一轮之后【没有复查】dyyyNpPublishedSinceBoost，
-//      所以那句"原生链不发布"根本是假的。
-//   ② 17:03:08 从模块 store 读到 cnt=3 的残缺字典（无关发布链写进去的），被当弹药原样顶到系统侧。
-//   ③ AWEFeedBackgroundPlayManager.resetNowPlayingInfo:(id)model 带 model 参数（不是无参清空），
-//      当年和 clearNowPlayingInfo/clearCommand 一起被误归入"清空类"无条件拦死，且【没留任何日志】
-//      → v6~v156 全部九份日志里运行时命中 0 观测；它的语义 = "用这个 model 重设当前播放信息"。
-static NSString *dyyyCurrentAwemeTitle = nil;   // 当前视频标题（【v17】多候选切视频挂点记录，兜底一致性校验用）
-
-// 从 aweme model 取标题：KVC 路线（速度功能实战验证可读抖音私有属性）
-static NSString *DYYYAwemeTitleText(id object) {
-    id model = object;
-    if (!model) {
-        return nil;
-    }
-    Class awemeClass = NSClassFromString(@"AWEAwemeModel");
-    if (awemeClass && ![model isKindOfClass:awemeClass]) {
-        for (NSString *key in @[ @"model", @"awemeModel", @"currentAweme" ]) {
-            @try {
-                id value = [model valueForKey:key];
-                if (awemeClass && [value isKindOfClass:awemeClass]) {
-                    model = value;
-                    break;
-                }
-            } @catch (__unused NSException *e) {
-            }
-        }
-    }
-    for (NSString *key in @[ @"desc", @"title", @"descriptionString" ]) {
-        @try {
-            id value = [model valueForKey:key];
-            if ([value isKindOfClass:[NSString class]] && [(NSString *)value length] > 0) {
-                return (NSString *)value;
-            }
-        } @catch (__unused NSException *e) {
-        }
-    }
-    return nil;
-}
-
-// 弹药完整性门槛：抖音真实发布恒为 5~7 键（title + 时长/封面等），
-// 而那条无关发布链塞进 store 的残缺字典固定只有 3 键 → 一律拒收，绝不拿去兜底。
-static BOOL DYYYNPInfoLooksComplete(NSDictionary *info) {
-    if (![info isKindOfClass:[NSDictionary class]] || info.count == 0) {
-        return NO;
-    }
-    id title = info[@"title"];
-    if (![title isKindOfClass:[NSString class]] || [(NSString *)title length] == 0) {
-        return NO;
-    }
-    if (info.count >= 5) {
-        return YES;
-    }
-    BOOL hasDuration = info[@"MPMediaItemPropertyPlaybackDuration"] != nil ||
-                       info[@"MPNowPlayingInfoPropertyElapsedPlaybackTime"] != nil;
-    BOOL hasArtist = info[@"artist"] != nil || info[@"albumTitle"] != nil;
-    return hasDuration || hasArtist;
-}
-
-// 读系统侧【此刻实时】的 nowPlayingInfo —— 控制中心当前内容的就是它。
-// 与 dyyyNpPublishedSinceBoost 的关键区别：后者只是 Boost 后 1.2s 那一刻的**快照**，
-// 而抖音 update/resign 内部是 async 派发，真正的发布常在快照之后才落地（v16 实测：
-// 「补一轮已触发原生发布」0 命中、兜底照样跑掉）。这个读的是**此刻真值**，拿来当兜底门槛。
-static NSDictionary *DYYYCurrentSystemNPInfo(void) {
-    Class npc = NSClassFromString(@"MPNowPlayingInfoCenter");
-    if (!npc) {
-        return nil;
-    }
-    id center = ((id (*)(id, SEL))objc_msgSend)(npc, NSSelectorFromString(@"defaultCenter"));
-    if (!center) {
-        return nil;
-    }
-    id info = ((id (*)(id, SEL))objc_msgSend)(center, NSSelectorFromString(@"nowPlayingInfo"));
-    return [info isKindOfClass:[NSDictionary class]] ? (NSDictionary *)info : nil;
-}
-
-// 读系统侧当前 nowPlayingInfo 的标题（切视频留痕用）
-static NSString *DYYYCurrentSystemNPTitle(void) {
-    id title = DYYYCurrentSystemNPInfo()[@"title"];
-    return [title isKindOfClass:[NSString class]] ? (NSString *)title : nil;
-}
-
 static BOOL DYYYShouldHoldNowPlaying(void) {
     return DYYYGetBool(@"DYYYKeepNowPlayingInBackground");
-}
-
-// ===== ⭐⭐【v25 判据换源】"当前视频是谁"正式改用【抖音自己握着的 aweme】 =====
-// 依据 diag/v24_check.log 的决定性读数（11 次模块条目可读）：
-//   · 7 次与系统侧一致、4 次是"模块已换新条目而系统侧仍挂旧文字"、**0 次落后**
-//     → 模块的 _model 只会领先、绝不指错，是唯一可信的"当前视频"。
-//   · 而我们用了一整轮（v17~v24）的 dyyyCurrentAwemeTitle 取自 _delegate（那个
-//     复用的 AWEPlayVideoViewController），实测准度【只有 15%（17/112）】——
-//     整套兜底链"0 发射"、"63% 催发白发"的根因就在这里：期望值本身是错的。
-//   · ivar 清单（类:背景播放模块 ivar(18)）给出了字段名：_model:AWEAwemeModel、
-//     _currentNowPlayingInfo:NSMutableDictionary、_fromID:NSString。
-// 读 _model 只走 object_getIvar（对象型），不做任何 KVC/强转，零崩溃风险。
-static id DYYYModuleAwemeModel(id mod) {
-    if (!mod || [mod isKindOfClass:[NSNull class]]) {
-        return nil;
-    }
-    @try {
-        Ivar iv = class_getInstanceVariable([mod class], "_model");
-        if (!iv) {
-            return nil;
-        }
-        const char *enc = ivar_getTypeEncoding(iv);
-        if (!enc || enc[0] != '@' || enc[1] == '?') {
-            return nil;
-        }
-        return object_getIvar(mod, iv);
-    } @catch (__unused NSException *e) {
-        return nil;
-    }
-}
-
-// 模块握着的当前视频标题（没握着 = 模块此刻没有可播条目 → 控制中心点播放会没有落点）
-static NSString *DYYYModuleAwemeTitle(id mod) {
-    return DYYYAwemeTitleText(DYYYModuleAwemeModel(mod));
-}
-
-// aweme 的唯一 id —— 用 id 比对落点比标题可靠（标题会被话题/长度截断）。
-// 按"先 getter（严格校验返回类型）再 ivar"的顺序取，取不到就返回 nil（不猜）。
-static NSString *DYYYAwemeItemID(id aweme) {
-    if (!aweme) {
-        return nil;
-    }
-    Class cls = [aweme class];
-    for (NSString *g in @[@"itemID", @"awemeID", @"awemeId", @"itemId", @"aid"]) {
-        SEL sel = NSSelectorFromString(g);
-        if (![aweme respondsToSelector:sel]) {
-            continue;
-        }
-        Method mm = class_getInstanceMethod(cls, sel);
-        if (!mm) {
-            continue;
-        }
-        char rt[8] = {0};
-        method_getReturnType(mm, rt, sizeof(rt));
-        if (rt[0] != '@') {
-            continue;                    // 只要返回对象的，防 NSInteger 强转 id
-        }
-        @try {
-            id v = ((id (*)(id, SEL))objc_msgSend)(aweme, sel);
-            if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) {
-                return (NSString *)v;
-            }
-        } @catch (__unused NSException *e) {
-        }
-    }
-    for (NSString *ivn in @[@"_itemID", @"_awemeID", @"_aid"]) {
-        Ivar iv = class_getInstanceVariable(cls, ivn.UTF8String);
-        if (!iv) {
-            continue;
-        }
-        const char *enc = ivar_getTypeEncoding(iv);
-        if (!enc || enc[0] != '@') {
-            continue;
-        }
-        @try {
-            id v = object_getIvar(aweme, iv);
-            if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) {
-                return (NSString *)v;
-            }
-        } @catch (__unused NSException *e) {
-        }
-    }
-    return nil;
-}
-
-// ⭐⭐【v26 定案】"模块条目快照" —— 十五轮失败的清洗结论，也是"准确命中"的唯一判据。
-//
-// diag/v25_check.log 的零反例数据（35 次 play 命令）：
-//   · 模块 _model 非空 → 命中 5/5，落点全部正确（模块条目 id == 系统侧视频）
-//   · 模块 _model 为空 → 失败 30/30，其中包括 21 次"补岗后模块仍然空"
-//   ⇒ play 落点正确 ⟺ play 那一刻模块 _model 非空。没有第二种情况。
-//
-// 而 _model 为什么会空（日志里的完整因果链）：
-//   ① 抖音切视频 → 走状态机 → 「模块收下当前条目」(setCurrentNowPlayingInfo: 非空)，此时 _model 有值；
-//   ② 同一秒内出现「放行 setCurrentNowPlayingInfo:nil(前台)」（v19/v22 为了让抖音走完切视频状态机
-//      而放行的）→ _model 被抹掉；实测 20 次「模块收下条目」里 19 次在 10 秒内被清掉，5 次同秒；
-//   ③ 抖音要重新填依赖 shouldEnterBackgroundPlayMode，而它 61 次里 43 次返回 0 → 长时间填不回来。
-//   ⇒ 「命中」其实是 play 恰好抢在 ②③ 之间的那 0~4 秒窗口里（19:02:16 收下 → 19:02:18 play ✓；
-//     19:02:20 被清 → 之后一连串 play 全空）。这就是老板体感"前面很多次不成功、后面几次基本都成功"。
-//
-// 所以：在「模块收下条目」那一刻把 _model 抓住（strong 引用住，防释放），
-// 播放命令进栈发现模块空时把现场恢复 —— 事件驱动、只在用户点播放那一刻动作、零轮询。
-// ⚠️ 快照必须有时效窗：切视频很快时旧快照会指错条目，宁可不用（保守回退到补岗）。
-// ⚠️ 写回只用 object_setIvar（对象型 ivar，零强转）；不调 setter，避免触发抖音的连锁副作用。
-//
-// 【v27 时效窗 6s → 30s】依据 diag/v26_check.log：
-//   6 秒窗实测把快照机制【卡死】—— 25 次 play 里 17 次报「快照过期」
-//   （过期龄 7.1s / 8.4s / 12.1s / 47.1s / 52.9s …），而恢复成功的 6 次快照龄全是
-//   1.1~3.2s。老板的真实节奏是「暂停 → 上下滑 → 拉控制中心 → 点播放」，
-//   两三个动作之间就要 5~10 秒，6 秒窗必然错过。
-//   为什么放宽到 30s 不会显著增加"指错"：抖音每次「收下当前条目」都会覆盖快照
-//   （实测 19:12:06/11/15/18/22/26 连续 6 次划视频全部收下新条目），
-//   也就是说只要抖音的状态机是活的，快照永远跟着最新视频走；
-//   反之状态机不活时我们本来就无解，旧快照至少让落点从"空"变成"上一条"，
-//   而老板明确表示过「能每次命中播当前这条，文字不变也能接受」。
-static id             dyyyModuleModelSnap = nil;   // strong：抓住 aweme 模型本体
-static NSDictionary  *dyyyModuleInfoSnap  = nil;   // 配套的 NP 字典（写回 _currentNowPlayingInfo）
-static NSTimeInterval dyyyModuleSnapAt    = 0;
-#define DYYY_MODULE_SNAP_TTL 30.0                   // 秒；超过则视为过期，不用（v27：6→30）
-
-static void DYYYCaptureModuleSnapshot(id mod) {
-    id m = DYYYModuleAwemeModel(mod);
-    if (!m) {
-        return;
-    }
-    dyyyModuleModelSnap = m;
-    Ivar iv = class_getInstanceVariable([mod class], "_currentNowPlayingInfo");
-    id info = nil;
-    if (iv) {
-        @try { info = object_getIvar(mod, iv); } @catch (__unused NSException *e) { info = nil; }
-    }
-    dyyyModuleInfoSnap = [info isKindOfClass:[NSDictionary class]] ? [info copy] : nil;
-    dyyyModuleSnapAt = [[NSDate date] timeIntervalSince1970];
-}
-
-// 把快照写回模块（恢复"当前条目"现场）。YES = 确实写回了一个非空 _model。
-static BOOL DYYYRestoreModuleSnapshot(id mod, NSString **detail) {
-    if (!mod || !dyyyModuleModelSnap) {
-        if (detail) { *detail = @"无快照"; }
-        return NO;
-    }
-    NSTimeInterval age = [[NSDate date] timeIntervalSince1970] - dyyyModuleSnapAt;
-    if (age > DYYY_MODULE_SNAP_TTL) {
-        if (detail) { *detail = [NSString stringWithFormat:@"快照过期 %.1fs", age]; }
-        return NO;
-    }
-    Ivar mv = class_getInstanceVariable([mod class], "_model");
-    if (!mv) {
-        if (detail) { *detail = @"模块无 _model ivar"; }
-        return NO;
-    }
-    @try {
-        object_setIvar(mod, mv, dyyyModuleModelSnap);
-        Ivar iv = class_getInstanceVariable([mod class], "_currentNowPlayingInfo");
-        if (iv && dyyyModuleInfoSnap.count > 0) {
-            object_setIvar(mod, iv, [dyyyModuleInfoSnap mutableCopy]);
-        }
-    } @catch (__unused NSException *e) {
-        if (detail) { *detail = @"写回异常"; }
-        return NO;
-    }
-    if (detail) {
-        NSString *t = DYYYModuleAwemeTitle(mod) ?: @"?";
-        NSString *i = DYYYAwemeItemID(DYYYModuleAwemeModel(mod)) ?: @"-";
-        *detail = [NSString stringWithFormat:@"%@(id=%@,快照龄%.1fs)", t, i, age];
-    }
-    return YES;
-}
-
-// 【v25】把"抖音自己重建当前条目"这条原生路径催一下 —— 它是实测唯一有效的杠杆。
-// 实证（diag/v24_check.log 18:50:30 → 18:50:32）：模块重新上岗后 2 秒内，
-//   抖音打了「模块收下当前条目 cnt=2 title=稀有祖宗」，紧接着「系统发布 title=稀有祖宗」。
-// 用的方法是模块自己的 updateNowPlayingInfoWhenResiginActive（催发链已在用，不是新发明），
-// 会依据 _model 重建 _currentNowPlayingInfo 并重新发布 → 控制中心文字跟着走。
-// 只在"确有新条目且系统侧没跟上"时调用，节流 1s，不做轮询、不加定时器。
-static void DYYYAskDouyinRebuildNowPlaying(id mod, NSString *why) {
-    if (!mod) {
-        return;
-    }
-    static NSTimeInterval lastAsk = 0;
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - lastAsk < 1.0) {
-        return;
-    }
-    lastAsk = now;
-    SEL updateSel = NSSelectorFromString(@"updateNowPlayingInfoWhenResiginActive");
-    if (![mod respondsToSelector:updateSel]) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ↻ 重建当前条目(%@)：模块无 updateNowPlayingInfoWhenResiginActive", why]);
-        return;
-    }
-    @try {
-        ((void (*)(id, SEL))objc_msgSend)(mod, updateSel);
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ↻ 重建当前条目(%@)：已催抖音按 _model 重发（催前系统侧=%@）",
-            why, DYYYCurrentSystemNPTitle() ?: @"-"]);
-    } @catch (__unused NSException *e) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ↻ 重建当前条目(%@)：exception（已忽略）", why]);
-    }
-}
-
-// 切视频留痕 + 记录"当前视频是谁"（兜底前的一致性校验靠它）。
-// 【v17】改成带来源参数的多候选挂点：v16 只挂在 AWEFeedContainerViewController
-// 的 aweme:currentIndexDidChange: 上，实测【0 命中】——抖音 8.0.37 划视频不走那里
-//（AwemeHeaders.h 里该类就是个空接口，方法名是早年猜的）。现在一次性挂四个候选，
-// 统一打 "切视频候选 <来源>"，一轮测试就能看出谁才是真正命中的那个。
-// 前置声明：切视频催发（实现在 DYYYBoostNowPlayingAfterPause 之后）。
-// ⚠️ 必须声明在 DYYYNoteAwemeChangedFrom 【之前】——声明放后面会报
-// "use of undeclared identifier"（CI run 35526845456 实测 exit code 2）。
-static void DYYYCutVideoNudge(void);
-
-// 【v24】前置声明：探针实现在 DYYYDumpRemoteControlSignatures 之后。
-// ⚠️ 同样必须声明在前面 —— v18 就是在这一点上翻过车（use of undeclared identifier）。
-static void DYYYProbeAwemeHolder(id host, NSString *tag);
-
-// 【v24】从原 Boost 区上移到此处：DYYYNoteAwemeChangedFrom 里的切视频探针也要用它，
-// 定义留在下面（原 1534 行位置）会报 undeclared identifier。
-static __weak id dyyyBGPlayModuleInstance = nil;   // AWEAwemeBackgroundPlayModule 实例（hook 里缓存）
-
-// ⭐【v23 探针】判定"这个 VC 是不是用户此刻真正在看的那一页"。
-// 必要性（diag/v22_check.log 铁证）：18:30:08 与 18:30:29，「最后一条候选」报的是
-// 《一天过了一天…》，而系统侧稳定停在《丈母娘的客栈-5》—— 说明 setIsAutoPlay:YES 在 feed 里
-// 会被【相邻 cell 的预加载】触发（抖音会给下一页预先 arm autoplay），
-// 于是 dyyyCurrentAwemeTitle 被邻页标题污染，我们兜底链的「期望」成了错的 →
-// 43 次复查结论是「未跟上且无当前视频弹药」（拿邻页标题去 store 里找，永远找不到），
-// 「切视频复查补发」全轮 0 发射。本轮先把"谁才是当前视频"变成可读数据，再决定怎么修。
-// 判据为什么不能简单用 view.window != nil：feed 是纵向分页的 scroll view，
-// 相邻页同样是 window 的子视图 → window 非空区分不了"在屏"与"预加载"。
-// 用"窗口竖向中点是否落在本 VC 的可见矩形内"才真正等于"这一页正在屏上"。
-static NSString *DYYYViewOnScreenMark(id host) {
-    if (!host) {
-        return @"[无宿主]";
-    }
-    @try {
-        id v = ((id (*)(id, SEL))objc_msgSend)(host, NSSelectorFromString(@"viewIfLoaded"));
-        if (!v) {
-            return @"[无view]";
-        }
-        id win = ((id (*)(id, SEL))objc_msgSend)(v, NSSelectorFromString(@"window"));
-        if (!win) {
-            return @"[不在窗]";
-        }
-        CGRect winBounds = ((CGRect (*)(id, SEL))objc_msgSend)(win, NSSelectorFromString(@"bounds"));
-        CGRect r = ((CGRect (*)(id, SEL, CGRect, id))objc_msgSend)(v,
-                        NSSelectorFromString(@"convertRect:toView:"),
-                        ((CGRect (*)(id, SEL))objc_msgSend)(v, NSSelectorFromString(@"bounds")), nil);
-        CGPoint c = CGPointMake(CGRectGetMidX(winBounds), CGRectGetMidY(winBounds));
-        return CGRectContainsPoint(r, c) ? @"[屏上]" : @"[屏外]";
-    } @catch (__unused NSException *e) {
-        return @"[异常]";
-    }
-}
-
-// 【v23】补 host 参数：object 是 aweme model（取标题用），host 是发起挂点的 VC（判"在屏"用）。
-// host 传 nil 表示该挂点没有可比对的宿主（Interaction.setModel 之外的旧调用点已全部补上）。
-static void DYYYNoteAwemeChangedFrom(id object, NSString *source, id host) {
-    if (!DYYYShouldHoldNowPlaying()) {
-        return;
-    }
-    NSString *title = DYYYAwemeTitleText(object);
-    if (title.length == 0) {
-        return;
-    }
-    dyyyCurrentAwemeTitle = title;
-    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 切视频候选 %@%@ → 当前=%@ | 系统侧=%@",
-        source, DYYYViewOnScreenMark(host), title, DYYYCurrentSystemNPTitle() ?: @"-"]);
-
-    // ⭐【v24 探针】切视频这一刻，抖音的"真身"换人了没？——节流 1s，
-    // 因为 setIsAutoPlay/prepareForDisplay/setModel 同一秒会连打 2~4 次。
-    // 判读：若模块手上的标题【始终不跟】候选走，说明模块不参与 feed 切页，
-    // 那"控制中心点播放打谁"就得换个对象；若跟随，则模块就是权威源，可直接拿它当期望。
-    {
-        static NSTimeInterval lastHolderProbe = 0;
-        NSTimeInterval nowTs = [[NSDate date] timeIntervalSince1970];
-        if (nowTs - lastHolderProbe >= 1.0) {
-            lastHolderProbe = nowTs;
-            DYYYProbeAwemeHolder(dyyyBGPlayModuleInstance, @"切@背景播放模块");
-        }
-    }
-
-    // ⭐【v18】切视频瞬间主动催一次原生发布。
-    // 实测（diag/v17_check.log）：切到新视频后，抖音要 1~2s 才把新信息发到系统侧，
-    // 这段窗口里控制中心挂的还是上一条 —— 正是老板说的"上下滑后直接打开控制中心看，
-    // 有时候没有滑到当前那一条"。催一次把窗口从 ~1.5s 压到 ~0.4s；函数自带节流，
-    // 因为 setIsAutoPlay 等挂点同一秒会连打 2 次。
-    DYYYCutVideoNudge();
 }
 
 // 运行时取系统当前 nowPlayingInfo 的键数。
@@ -1732,6 +1363,7 @@ static NSInteger DYYYAppStateRaw(void) {
 //   ⭐ 前提已具备：AWENowPlayingInfoCenter.setPlayingPlayer:(nil) 一直被我们挡下，
 //     抖音内部的播放器引用还在 → 它的 update 仍能组装出完整信息（diag/v10.log 10:44:11 实证：
 //     清空 3 秒后抖音仍能发布《翻龙之下九门》cnt=6/7 的完整内容）。
+static __weak id dyyyBGPlayModuleInstance = nil;   // AWEAwemeBackgroundPlayModule 实例（hook 里缓存）
 static BOOL dyyyNpPublishedSinceBoost = NO;   // Boost 后系统侧是否出现过非空发布（0 次重试的判据）
 // 抖音最后一次非空"当前播放信息"副本。仅用于 Boost 兜底【单发】一次——与 v7 被禁的
 // "回写拉锯"本质不同：不循环、只在原生发布链确认不动作时发一次、发布内容是暂停瞬间的
@@ -1799,15 +1431,9 @@ static void DYYYBoostNowPlayingAfterPause(void) {
         @try {
             if ([m respondsToSelector:getterSel]) {
                 NSDictionary *live = ((id (*)(id, SEL))objc_msgSend)(m, getterSel);
-                // 【v16】加完整性门槛：store 里混进来的 cnt=3 残缺字典（无关发布链写的）
-                // 一旦被当成弹药缓存，兜底就会把它顶到控制中心 → 卡片显示别的视频。
-                if (DYYYNPInfoLooksComplete(live)) {
+                if ([live isKindOfClass:[NSDictionary class]] && live.count > 0) {
                     dyyyLastGoodCurrentNPInfo = live;
-                    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 缓存模块 store cnt=%lu title=%@（当前视频=%@）",
-                        (unsigned long)live.count, live[@"title"] ?: @"-", dyyyCurrentAwemeTitle ?: @"-"]);
-                } else if ([live isKindOfClass:[NSDictionary class]] && live.count > 0) {
-                    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 拒收残缺弹药：store cnt=%lu title=%@",
-                        (unsigned long)live.count, live[@"title"] ?: @"-"]);
+                    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 缓存模块 store cnt=%lu", (unsigned long)live.count]);
                 } else {
                     DYYYSpeedDiag(@"[npv] 模块 store 为空(cnt=0)，无缓存可用");
                 }
@@ -1857,47 +1483,6 @@ static void DYYYBoostNowPlayingAfterPause(void) {
                 DYYYSpeedDiag([NSString stringWithFormat:@"[npv] Boost 补发 exception: %@", e.reason ?: @"unknown"]);
             }
 
-            // ⭐【v16 关键修正】补一轮是【同步】调用，很可能当场就触发了原生发布
-            //（日志实证 17:03:13：补一轮 → 同一秒 PUB 穿高跟鞋 cnt=5）。
-            // 之前这里直接往下走兜底单发 → 用缓存把刚发布的新视频内容【盖回旧内容】，
-            // 正是"暂停后划下一条，控制中心还是上一条"的直接原因。必须复查，已落地就收手。
-            if (dyyyNpPublishedSinceBoost) {
-                DYYYSpeedDiag(@"[npv] 补一轮已触发原生发布 → 放弃兜底单发（不覆盖新内容）");
-                return;
-            }
-
-            // ⭐【v17 治本】别再只信"1.2s 那一刻的快照标志"了。抖音 update/resign 内部是 async
-            // 派发，真正的发布常在快照之后才落地（v16 实测：补一轮与 PUB 同秒到达，上面那条复查
-            // 0 命中、兜底照样跑掉 → 用旧缓存把新内容盖回去）。这里改读【此刻实时】的系统侧：
-            // 只要它已经有内容，就说明抖音自己发过了，兜底的存在意义（原生闸门不开）不成立。
-            // ⭐⭐【v18 关键修正】v17 这里只判"系统侧非空"就收手，是【错的】——
-            // 实测 diag/v17_check.log：12 次兜底放弃里有 9 次系统侧挂的是【别的视频】（多为上一条）。
-            // 原因：切视频后抖音要 1~2s 才把新信息发到系统侧，窗口内系统侧仍是旧内容，却被我们
-            // 当成"已有实时内容"→ 放弃兜底 → 卡片停在旧视频。这正是老板报的
-            // "上下滑后直接打开控制中心看，有时候没有滑到当前那一条"。
-            // 改按【内容是否等于当前视频】判定：等于当前视频才放弃；空/不是当前视频 → 继续往下兜底。
-            NSDictionary *sysLive = DYYYCurrentSystemNPInfo();
-            NSString *sysLiveTitle = [sysLive[@"title"] isKindOfClass:[NSString class]] ? sysLive[@"title"] : nil;
-            BOOL sysHasContent = (sysLive.count > 0 && sysLiveTitle.length > 0);
-            // ⭐⭐【v25 判据换源】"当前视频"改用模块自己握的 _model（权威、只领先不落后），
-            // 不再用 dyyyCurrentAwemeTitle（取自复用的 _delegate，实测 15% 准）。
-            // 这是"兜底拒绝：缓存不属于当前视频"屡屡误判的根因 —— 以前拿邻页标题去比对。
-            NSString *truthTitle = DYYYModuleAwemeTitle(dyyyBGPlayModuleInstance) ?: @"";
-            if (sysHasContent && truthTitle.length > 0 && [sysLiveTitle isEqualToString:truthTitle]) {
-                DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 兜底放弃：系统侧已是当前视频 title=%@", sysLiveTitle]);
-                return;
-            }
-            if (sysHasContent && truthTitle.length == 0) {
-                // 模块此刻没握当前条目（抖音尚未交回）→ 无从比对，保守收手，宁可不发也不发错。
-                DYYYSpeedDiag([NSString stringWithFormat:
-                    @"[npv] 兜底放弃：系统侧有内容且模块未握条目 title=%@", sysLiveTitle]);
-                return;
-            }
-            if (sysHasContent) {
-                DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 系统侧≠当前视频(系统=%@ | 当前=%@) → 继续兜底",
-                    sysLiveTitle, truthTitle]);
-            }
-
             // ② 【v15.1】原生链兜底单发。15:54 实测定案：抖音的
             //    updateNowPlayingInfoWhenResiginActive 内部有闸门——不在后台播放模式/没在播
             //    就【自己决定不发布】，前台暂停时怎么催都没用（连续 4 次"已发→未见发布"），
@@ -1927,16 +1512,6 @@ static void DYYYBoostNowPlayingAfterPause(void) {
                 DYYYSpeedDiag(@"[npv] 兜底跳过(无缓存信息)");
                 return;
             }
-            // 【v17】宁可不发也不发错的：缓存内容若明确【不属于当前视频】，直接放弃兜底。
-            // 治的正是"退回后台/暂停后卡片还是上一条"——根因就是兜底把旧缓存顶上去了。
-            // 只在两边都有明确标题时才判定，避免数据缺失时误伤（缺任一就按原逻辑走）。
-            NSString *cachedTitle = [cached[@"title"] isKindOfClass:[NSString class]] ? cached[@"title"] : nil;
-            if (cachedTitle.length > 0 && truthTitle.length > 0 &&
-                ![cachedTitle isEqualToString:truthTitle]) {
-                DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 兜底拒绝：缓存(%@)不属于当前视频(%@)",
-                    cachedTitle, truthTitle]);
-                return;
-            }
             @try {
                 Class mpCls = NSClassFromString(@"MPNowPlayingInfoCenter");
                 id center = mpCls ? ((id (*)(Class, SEL))objc_msgSend)(mpCls, @selector(defaultCenter)) : nil;
@@ -1948,145 +1523,6 @@ static void DYYYBoostNowPlayingAfterPause(void) {
                 }
             } @catch (NSException *e) {
                 DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 兜底单发 exception: %@", e.reason ?: @"unknown"]);
-            }
-        });
-    });
-}
-
-// ⭐【v18 新增】切视频瞬间主动催一次原生发布 —— 专治"上下滑切视频后，立刻打开控制中心
-// 看到的还是上一条"。
-//
-// 为什么需要它：实测 diag/v17_check.log，切到新视频（SWITCH 命中）到系统侧真正发出新信息
-// （PUB）之间稳定存在 1~2s 空窗，这段窗口里控制中心挂的仍是上一条。抖音自己不会立即发，
-// 只有"暂停检测 Boost"或"1.2s 补一轮"才把它催出来 —— 而用户切完视频马上就拉控制中心，
-// 正好落在这个空窗里，于是"有时候没有滑到当前那一条"。
-//
-// 做法：切视频留痕处调用，延迟 0.4s（等抖音内部把当前 aweme 换完）后走一遍已被实测定案的
-// 原生促发顺序（beginReceiving → updateNowPlayingInfoWhenResiginActive →
-// appWillResignActiveNotification），把被动等待变主动催发。0.9s 后再复查一次：若系统侧仍
-// 不是当前视频，就用模块 store / 缓存里【属于当前视频】的那一份直发系统侧（最后一道保险，
-// 只用当前视频的弹药，杜绝 v16 那种"用旧缓存盖新内容"）。
-//
-// 节流 1.0s：setIsAutoPlay / prepareForDisplay / setModel 等挂点同一秒会连打 2~4 次，不节流
-// 会重复催发。与暂停 Boost 的 1.5s 节流【各自独立】—— 否则切视频的催发会被后者吃掉
-//（v17 日志里 "Boost 节流跳过" 16 次，就是被吃掉的证据）。
-static void DYYYCutVideoNudge(void) {
-    if (!DYYYShouldHoldNowPlaying()) {
-        return;
-    }
-    static NSTimeInterval lastNudge = 0;
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - lastNudge < 1.0) {
-        DYYYSpeedDiag(@"[npv] 切视频催发节流跳过");
-        return;
-    }
-    lastNudge = now;
-
-    // ⭐⭐【v25 判据换源】期望 = 模块自己握着的当前条目（_model），
-    // 不再用 dyyyCurrentAwemeTitle（来自复用的 _delegate，实测只有 15% 准）。
-    // 模块没握条目 = 抖音此刻没有可播的当前视频 → 直接不催，不再空转打日志。
-    __block NSString *expectTitle = DYYYModuleAwemeTitle(dyyyBGPlayModuleInstance) ?: @"";
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (!DYYYShouldHoldNowPlaying()) {
-            return;
-        }
-        id m = dyyyBGPlayModuleInstance;
-        if (!m) {
-            return;
-        }
-        // 【v25】模块没握条目 → 催也没意义（它自己都不知道当前是哪条）。
-        NSString *modTitleNow = DYYYModuleAwemeTitle(m);
-        if (modTitleNow.length == 0) {
-            DYYYSpeedDiag(@"[npv] 切视频催发跳过：模块此刻未握当前条目(_model 为空)");
-            return;
-        }
-        NSString *sysTitle0 = DYYYCurrentSystemNPTitle() ?: @"-";
-        if (expectTitle.length == 0) {
-            expectTitle = modTitleNow;      // 0.4s 前还没握、现在握上了 → 用实时值
-        }
-        if (expectTitle.length > 0 && [sysTitle0 isEqualToString:expectTitle]) {
-            DYYYSpeedDiag(@"[npv] 切视频催发:系统侧已跟上，跳过");
-            return;
-        }
-        SEL updateSel = NSSelectorFromString(@"updateNowPlayingInfoWhenResiginActive");
-        SEL resignSel = NSSelectorFromString(@"appWillResignActiveNotification");
-        @try {
-            DYYYForceBeginReceivingRemoteControlEvents();
-            BOOL didUpdate = [m respondsToSelector:updateSel];
-            BOOL didResign = [m respondsToSelector:resignSel];
-            if (didUpdate) {
-                ((void (*)(id, SEL))objc_msgSend)(m, updateSel);
-            }
-            if (didResign) {
-                ((void (*)(id, SEL))objc_msgSend)(m, resignSel);
-            }
-            DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 切视频催发 update=%d resign=%d | 期望=%@ | 催前系统侧=%@",
-                didUpdate, didResign, expectTitle, sysTitle0]);
-        } @catch (NSException *e) {
-            DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 切视频催发 exception: %@", e.reason ?: @"unknown"]);
-        }
-
-        // 0.9s 后复查：系统侧还不是当前视频 → 用"属于当前视频"的弹药直发一次
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (!DYYYShouldHoldNowPlaying()) {
-                return;
-            }
-            NSString *sysTitle = DYYYCurrentSystemNPTitle() ?: @"";
-            if (expectTitle.length > 0 && [sysTitle isEqualToString:expectTitle]) {
-                DYYYSpeedDiag(@"[npv] 切视频复查：系统侧已跟上 ✓");
-                return;
-            }
-            id m2 = dyyyBGPlayModuleInstance;
-            NSDictionary *live = nil;
-            SEL getterSel = NSSelectorFromString(@"currentNowPlayingInfo");
-            @try {
-                if (m2 && [m2 respondsToSelector:getterSel]) {
-                    id v = ((id (*)(id, SEL))objc_msgSend)(m2, getterSel);
-                    if ([v isKindOfClass:[NSDictionary class]]) {
-                        live = (NSDictionary *)v;
-                    }
-                }
-            } @catch (__unused NSException *e) {
-            }
-            NSString *liveTitle = [live[@"title"] isKindOfClass:[NSString class]] ? live[@"title"] : nil;
-
-            NSDictionary *use = nil;
-            NSString *src = nil;
-            if (live && DYYYNPInfoLooksComplete(live) && expectTitle.length > 0 &&
-                liveTitle.length > 0 && [liveTitle isEqualToString:expectTitle]) {
-                use = live;
-                src = @"模块store";
-            } else if (dyyyLastGoodCurrentNPInfo.count > 0 && expectTitle.length > 0) {
-                NSString *ct = [dyyyLastGoodCurrentNPInfo[@"title"] isKindOfClass:[NSString class]]
-                             ? dyyyLastGoodCurrentNPInfo[@"title"] : nil;
-                if (ct.length > 0 && [ct isEqualToString:expectTitle]) {
-                    use = dyyyLastGoodCurrentNPInfo;
-                    src = @"缓存";
-                }
-            }
-            if (!use) {
-                DYYYSpeedDiag([NSString stringWithFormat:
-                    @"[npv] 切视频复查：未跟上且无当前视频弹药(系统=%@ | 期望=%@ | store=%@)",
-                    sysTitle.length ? sysTitle : @"-", expectTitle, liveTitle ?: @"-"]);
-                return;
-            }
-            @try {
-                Class mpCls = NSClassFromString(@"MPNowPlayingInfoCenter");
-                id center = mpCls ? ((id (*)(Class, SEL))objc_msgSend)(mpCls, @selector(defaultCenter)) : nil;
-                if (center && [center respondsToSelector:@selector(setNowPlayingInfo:)]) {
-                    NSInteger st = (DYYYReadDouyinPlayState() == 2) ? 2 : 1;
-                    NSDictionary *fixed = DYYYRateCorrectedNowPlayingInfo(use, st);
-                    ((void (*)(id, SEL, id))objc_msgSend)(center, @selector(setNowPlayingInfo:), fixed);
-                    DYYYDeclarePlaybackState(st);
-                    DYYYSpeedDiag([NSString stringWithFormat:
-                        @"[npv] 切视频复查补发(%@)：系统侧未跟上，直发当前视频信息 title=%@ | 态=%ld",
-                        src, expectTitle, (long)st]);
-                }
-            } @catch (NSException *e) {
-                DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 切视频复查补发 exception: %@", e.reason ?: @"unknown"]);
             }
         });
     });
@@ -2105,39 +1541,28 @@ static void DYYYCutVideoNudge(void) {
 // 老板定的原则："不要拦清空→回写拉锯，要在源头让它 return"。现在源头已 return，回写删除。
 //（DYYYStashNowPlayingInfo / dyyyLastGoodNowPlayingInfo 已随本机制一并删除，无任何引用）
 
-// 【v20】把命令对象映射成短标签（play/pause/toggle），让日志能一眼看出是哪条命令的事件。
-// 只有这三条播放类命令会被"保住可用"，stop/close 一律放行。
-static NSString *DYYYRemoteCommandTag(id cmd) {
+// 只保 play/pause/toggle 三条命令（用命令中心实例判等，最可靠）：
+// stop/close 必须放行——用户点卡片上的"关闭"是明确要关，不能也被挡住。
+static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
     if (!cmd) {
-        return nil;
+        return NO;
     }
     Class centerClass = NSClassFromString(@"MPRemoteCommandCenter");
     if (!centerClass) {
-        return nil;
+        return NO;
     }
     @try {
         id center = ((id (*)(id, SEL))objc_msgSend)(centerClass, @selector(sharedCommandCenter));
         if (!center) {
-            return nil;
+            return NO;
         }
-        if (cmd == ((id (*)(id, SEL))objc_msgSend)(center, NSSelectorFromString(@"playCommand"))) {
-            return @"play";
-        }
-        if (cmd == ((id (*)(id, SEL))objc_msgSend)(center, NSSelectorFromString(@"pauseCommand"))) {
-            return @"pause";
-        }
-        if (cmd == ((id (*)(id, SEL))objc_msgSend)(center, NSSelectorFromString(@"togglePlayPauseCommand"))) {
-            return @"toggle";
-        }
+        id play = ((id (*)(id, SEL))objc_msgSend)(center, NSSelectorFromString(@"playCommand"));
+        id pause = ((id (*)(id, SEL))objc_msgSend)(center, NSSelectorFromString(@"pauseCommand"));
+        id toggle = ((id (*)(id, SEL))objc_msgSend)(center, NSSelectorFromString(@"togglePlayPauseCommand"));
+        return (cmd == play || cmd == pause || cmd == toggle);
     } @catch (__unused NSException *e) {
     }
-    return nil;
-}
-
-// 只保 play/pause/toggle 三条命令（用命令中心实例判等，最可靠）：
-// stop/close 必须放行——用户点卡片上的"关闭"是明确要关，不能也被挡住。
-static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
-    return DYYYRemoteCommandTag(cmd) != nil;
+    return NO;
 }
 
 // ===== 【v12】播放态镜像：让控制中心知道"抖音现在到底是播放还是暂停" =====
@@ -2232,318 +1657,28 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
     }
 }
 
-// ===== 【v20】控制中心「点播放」链路照亮 + 精准放行 =====
-// 老板口径（v19 实测两轮仍不行）："文字不会跟，主要是会卡住播放"。
-// → 卡片文字可以不跟，但【点控制中心的播放/暂停必须作用到当前这条】，这是本轮靶心。
-//
-// 抖音的远程播命令链路（方法表 dump 实证，不是猜的）：
-//   MPRemoteCommandCenter.playCommand → AWENowPlayingInfoCenter.handlePlayCommand
-//     → playingPlayer（实测类名 = AWEAwemeBackgroundPlayModule）.playForRemoteControl
-//   模块上另有 forbidResumePlayFromBackground / shouldforbidResumePlayFromBackground
-//   （字面 = 禁止从后台恢复播放）、canPlay / canPauseForRemoteControl（决定按钮可用性）。
-//
-// v5 的历史实证很关键：当年【无条件】把 forbidResume 改判 NO 后，老板反馈"点播放确实开始播了，
-// 只是播了记录里的第一条"。⇒ **它就是"点播放没反应/卡住"的那道闸门**；当年"只播第一条"是同期
-// 其它硬拦（setPlayingPlayer:nil 等）把播放器引用钉死在旧对象上造成的，而那些在 v19 已改为
-// 前台放行。本轮据此做【精准窗口】放行，不再全局越权：
-//   只在 handlePlayCommand 的执行栈内改判 → 后台自动续播等其它路径一概不受影响。
-
-// 播命令保护窗口：仅在 handlePlayCommand 执行栈内为真
-static BOOL dyyyPlayCmdInFlight = NO;
-
-// 【v21 核心修复用】最近一次"上岗"过的播放器对象（becomePlayingPlayer: / setPlayingPlayer: 非 nil
-// 时缓存，__weak 不持有）。
-// 为什么需要它 —— diag/v20_check.log 铁证：老板"暂停→划下一条→再划上一条"后连点 7 次播放，
-// 每一次日志都是【▶ 收到 play 命令 … 当前 playingPlayer=(nil)】+【处理完毕】：
-// 命令确实送到了抖音（链路全通），但抖音内部 _playingPlayer 是空的 → 命令执行了也没有落点。
-// nil 的来源正是 v19 我们的改动：前台放行 setPlayingPlayer:nil 让抖音完成"旧的下岗"，
-// 但暂停态下抖音**不一定**紧接着做"新的上岗"（becomePlayingPlayer: 会滞后几十秒才来）。
-// 修复：播命令窗口内若发现 playingPlayer 为空，用这个缓存把模块补回去，让命令有落点。
-static __weak id dyyyLastPlayingPlayer = nil;
-
-// 一次性打印远端方法签名（返回类型靠 method_getTypeEncoding 实证，绝不靠猜 —— 猜错返回类型
-// 会让调用方读到 x0 垃圾值）
-static void DYYYDumpRemoteControlSignatures(void) {
-    static BOOL done = NO;
-    if (done) {
-        return;
-    }
-    done = YES;
-    NSArray<NSString *> *classNames = @[ @"AWEAwemeBackgroundPlayModule", @"AWENowPlayingInfoCenter",
-                                         @"AWEFeedBackgroundPlayManager" ];
-    NSArray<NSString *> *selectorNames = @[
-        @"playForRemoteControl", @"pauseForRemoteControl", @"canPlayForRemoteControl",
-        @"canPauseForRemoteControl", @"forbidResumePlayFromBackground",
-        @"setForbidResumePlayFromBackground:", @"shouldforbidResumePlayFromBackground",
-        @"handlePlayCommand", @"handlePauseCommand", @"becomePlayingPlayer:", @"setPlayingPlayer:",
-        @"resignPlayingPlayer:", @"playingPlayer", @"updateNowPlayingInfoWhenResiginActive",
-        @"setNeedResignPlayingPlayer:"
-    ];
-    for (NSString *className in classNames) {
-        Class cls = NSClassFromString(className);
-        if (!cls) {
-            DYYYSpeedDiag([NSString stringWithFormat:@"[npv-sig] 类 %@ 未加载", className]);
-            continue;
-        }
-        for (NSString *selectorName in selectorNames) {
-            Method m = class_getInstanceMethod(cls, NSSelectorFromString(selectorName));
-            if (!m) {
-                continue;
-            }
-            DYYYSpeedDiag([NSString stringWithFormat:@"[npv-sig] %@ %@ → %s", className, selectorName,
-                                                     method_getTypeEncoding(m)]);
-        }
-    }
-}
-
-// ===== 【v24】不再"猜"当前视频 —— 直接把抖音内部握着当前 aweme 的字段挖出来 =====
-//
-// v23 实测（diag/v23_check.log，4438 行）把上一条路彻底堵死，三条铁证：
-//   ① 「屏上」判据【失效】：setIsAutoPlay 的宿主 VC 是全屏复用的，convertRect 转出来
-//      永远覆盖窗口中点 → 45 次全判「屏上」且横跨 4 个不同标题，判据不区分任何东西。
-//   ② 催发 73 次里 46 次（63%）连一次系统发布都催不出来；且「期望」自身会【滞后】系统侧
-//      （18:29~18:31 系统侧早已是《客栈》，dyyyCurrentAwemeTitle 仍停在《一天过了一天》），
-//      还会在两条视频间【交替】（18:27:34~18:28:42 期望在《一天过了一天》/《#高颜值美女dj》
-//      之间来回跳）→ 拿它当期望从根上就是错的。
-//   ③ 兜底补发依旧 0 发射；「模块收下当前条目」全轮仅 6 次 → 抖音几乎不把条目交回模块。
-//
-// 结论：任何"从挂点反推当前视频"的路都不可靠（挂点会被预加载触发、VC 会复用）。
-// 唯一还站得住的来源 = 抖音自己"正在播"的那个对象（背景播放模块 / 播放器 VC）——
-// 控制中心点播放最终打的正是它（handlePlayCommand → playingPlayer.playForRemoteControl）。
-// 本轮纯探针、零行为变更：把候选宿主的 ivar 与 getter 全扫出来，
-// 让数据告诉我们【哪个字段握着当前 aweme】，以及它和系统侧文字差在哪。
-
-// 只对【对象型】ivar 取值（非对象型用 object_getIvar 会崩），返回一行摘要。
-static NSString *DYYYIvarSummary(id obj, Ivar iv) {
-    const char *enc = ivar_getTypeEncoding(iv);
-    const char *name = ivar_getName(iv);
-    if (!enc || !name) {
-        return nil;
-    }
-    if (enc[0] != '@') {
-        return nil;              // 只读对象型
-    }
-    if (enc[1] == '?') {
-        return nil;              // block 跳过
-    }
-    id v = nil;
-    @try {
-        v = object_getIvar(obj, iv);
-    } @catch (__unused NSException *e) {
-        return nil;
-    }
-    if (!v) {
-        return nil;
-    }
-    NSString *cls = NSStringFromClass([v class]) ?: @"?";
-    NSString *t = DYYYAwemeTitleText(v);
-    if (t.length > 0) {
-        return [NSString stringWithFormat:@"%s=<%@> 标题=%@", name, cls,
-            [t substringToIndex:MIN(t.length, (NSUInteger)26)]];
-    }
-    if ([v isKindOfClass:[NSDictionary class]]) {
-        // 【v25】字典型 ivar 打键名 —— _currentNowPlayingInfo 里"哪个键装标题"一直是黑盒，
-        // 有了键名才能在需要时精确补键（催发链里已见 title 键，这里做全量确认）。
-        NSArray *keys = [(NSDictionary *)v allKeys];
-        NSString *ks = [[keys sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@","];
-        return [NSString stringWithFormat:@"%s=<%@> 键(%lu)=[%@]", name, cls,
-            (unsigned long)keys.count, [ks substringToIndex:MIN(ks.length, (NSUInteger)140)]];
-    }
-    if ([v isKindOfClass:[NSString class]]) {
-        NSString *s = (NSString *)v;
-        return [NSString stringWithFormat:@"%s=<%@> %@", name, cls,
-            [s substringToIndex:MIN(s.length, (NSUInteger)26)]];
-    }
-    return [NSString stringWithFormat:@"%s=<%@>", name, cls];
-}
-
-// 【v25】一次性打类的方法清单（可只挑名字含关键字的），用来定位"抖音自己怎么重建当前条目"。
-static void DYYYDumpMethodNames(Class cls, NSString *label, NSString *filter) {
-    if (!cls) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv-shape] 方法 %@ 类未加载", label]);
-        return;
-    }
-    unsigned int n = 0;
-    Method *ms = class_copyMethodList(cls, &n);
-    if (!ms) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv-shape] 方法 %@ 不可读", label]);
-        return;
-    }
-    NSMutableArray *names = [NSMutableArray array];
-    for (unsigned int i = 0; i < n; i++) {
-        NSString *sn = NSStringFromSelector(method_getName(ms[i])) ?: @"";
-        if (filter.length > 0 && [sn rangeOfString:filter options:NSCaseInsensitiveSearch].location == NSNotFound) {
-            continue;
-        }
-        char rt[16] = {0};
-        method_getReturnType(ms[i], rt, sizeof(rt));
-        [names addObject:[NSString stringWithFormat:@"%s(%s)", sn.UTF8String, rt[0] ? rt : "?"]];
-    }
-    free(ms);
-    DYYYSpeedDiag([NSString stringWithFormat:@"[npv-shape] 方法 %@ 共%u条 命中%lu条 = %@",
-        label, n, (unsigned long)names.count,
-        names.count ? [names componentsJoinedByString:@" "] : @"(无命中)"]);
-}
-
-// 一次性把类的 ivar 清单打出来（名字+类型），供我们判断该读哪个字段。
-static void DYYYDumpClassIvars(Class cls, NSString *label) {
-    if (!cls) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv-shape] 类 %@ 未加载", label]);
-        return;
-    }
-    unsigned int n = 0;
-    Ivar *ivars = class_copyIvarList(cls, &n);
-    if (!ivars) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv-shape] %@ ivar 不可读", label]);
-        return;
-    }
-    NSMutableArray *names = [NSMutableArray array];
-    for (unsigned int i = 0; i < n; i++) {
-        const char *nm = ivar_getName(ivars[i]);
-        const char *en = ivar_getTypeEncoding(ivars[i]);
-        if (nm) {
-            [names addObject:[NSString stringWithFormat:@"%s:%s", nm, en ? en : "?"]];
-        }
-    }
-    free(ivars);
-    DYYYSpeedDiag([NSString stringWithFormat:@"[npv-shape] %@ ivar(%u) = %@", label, n,
-        [names componentsJoinedByString:@", "]]);
-}
-
-// 扫一个实例：所有对象型 ivar + 一批候选 getter，只打印"有值/能取到标题"的。
-// getter 严格按 method_getReturnType 过滤，只调【返回对象】的 —— 防止把 NSInteger 强转 id。
-static void DYYYProbeAwemeHolder(id host, NSString *tag) {
-    if (!host) {
-        return;
-    }
-    Class cls = [host class];
-    unsigned int n = 0;
-    Ivar *ivars = class_copyIvarList(cls, &n);
-    NSMutableArray *hits = [NSMutableArray array];
-    if (ivars) {
-        for (unsigned int i = 0; i < n; i++) {
-            NSString *s = DYYYIvarSummary(host, ivars[i]);
-            if (s) {
-                [hits addObject:s];
-            }
-        }
-        free(ivars);
-    }
-    NSArray<NSString *> *getters = @[
-        @"currentAweme", @"aweme", @"awemeModel", @"currentAwemeModel", @"currentItem",
-        @"item", @"model", @"playingPlayer", @"player", @"currentPlayer", @"videoModel",
-        @"currentNowPlayingInfo", @"nowPlayingInfo", @"fromAweme", @"moreModel"
-    ];
-    for (NSString *g in getters) {
-        SEL sel = NSSelectorFromString(g);
-        if (![host respondsToSelector:sel]) {
-            continue;
-        }
-        Method mm = class_getInstanceMethod(cls, sel);
-        if (!mm) {
-            continue;
-        }
-        char rt[16] = {0};
-        method_getReturnType(mm, rt, sizeof(rt));
-        if (rt[0] != '@' || rt[1] == '?') {
-            continue;            // 只要返回对象的
-        }
-        @try {
-            id v = ((id (*)(id, SEL))objc_msgSend)(host, sel);
-            if (!v) {
-                continue;
-            }
-            NSString *t = DYYYAwemeTitleText(v);
-            [hits addObject:[NSString stringWithFormat:@"getter %@=<%@>%@", g,
-                NSStringFromClass([v class]) ?: @"?", t.length > 0
-                    ? [NSString stringWithFormat:@" 标题=%@", [t substringToIndex:MIN(t.length, (NSUInteger)26)]]
-                    : @""]];
-        } @catch (__unused NSException *e) {
-        }
-    }
-    DYYYSpeedDiag([NSString stringWithFormat:@"[npv-shape] %@ 实例=%@ 取值(%lu) %@ | 系统侧=%@",
-        tag, NSStringFromClass(cls) ?: @"?", (unsigned long)hits.count,
-        hits.count ? [hits componentsJoinedByString:@" | "] : @"(无可读字段)",
-        DYYYCurrentSystemNPTitle() ?: @"-"]);
-}
-
-// 一次性打类结构（只在第一轮做，避免日志爆炸）。
-static void DYYYDumpAwemeSourceShapes(void) {
-    static BOOL done = NO;
-    if (done) {
-        return;
-    }
-    done = YES;
-    DYYYDumpClassIvars(NSClassFromString(@"AWEAwemeBackgroundPlayModule"), @"类:背景播放模块");
-    DYYYDumpClassIvars(NSClassFromString(@"AWENowPlayingInfoCenter"), @"类:播放信息中心");
-    DYYYDumpClassIvars(NSClassFromString(@"AWEFeedBackgroundPlayManager"), @"类:后台播放管理");
-    DYYYDumpClassIvars(NSClassFromString(@"AWEAwemeModel"), @"类:aweme模型");
-    DYYYDumpClassIvars(NSClassFromString(@"AWEDPlayerViewController_Merge"), @"类:播放器VC");
-    // 【v25】方法清单：v24 已证实模块的 _model 是权威源，本轮要看的是
-    // "抖音自己用什么方法按 _model 重建 _currentNowPlayingInfo"（催发链已见
-    // updateNowPlayingInfoWhenResiginActive，这里把家族全列出来，选最正的那一个）。
-    DYYYDumpMethodNames(NSClassFromString(@"AWEAwemeBackgroundPlayModule"), @"方法:背景播放模块", @"NowPlaying");
-    DYYYDumpMethodNames(NSClassFromString(@"AWENowPlayingInfoCenter"), @"方法:播放信息中心", nil);
-    DYYYDumpMethodNames(NSClassFromString(@"AWEFeedBackgroundPlayManager"), @"方法:后台播放管理", @"NowPlaying");
-}
-
 // 【已移除】AWEAwemeBackgroundPlayModule / AWEFeedBackgroundPlayManager 两个 hook 块：
 // 它们只服务于已删除的「信息流不显示播放信息」开关（清空系统 nowPlayingInfo），
 // 与保留卡片的目标冲突，整块删除。抖音的播放信息走 AWENowPlayingInfoCenter，
 // 下面的托管逻辑直接在那里接管。
 %hook AWENowPlayingInfoCenter
 
-// ⭐⭐【v19 关键修正】playingPlayer 被置 nil = 抖音放弃"正在播放"角色。
-// v4 起这里【无条件】吞掉，这就是老板当前症状的直接原因：
-//   "控制中心文字不更新 → 点暂停/播放不生效、播不了当前这一条"。
-//
-// 依据（本文件自己的历史定案，同一个坑第二次踩）：
-//   `doExitBackgroundPlayMode` 当初也是无条件拦，v9 铁证（diag/v8.log）——老板"每滑一条视频抖音
-//   必调 3 次、全被拦 → 此后系统侧 SET info 彻底停摆 → 滑到下一条控制中心还是上一个视频的
-//   文字、点击没反应"，与本轮症状【逐字相同】；v10 改成"只有 ApplicationState==2 才拦、
-//   Active/Inactive 放行"后即修复。
-//   AWENowPlayingInfoCenter 这两个"旧的下岗"钩子属同一类"两义方法"，却一直没跟着改。
-//   日志实证（diag/v18_check.log）：每切一条视频必来一次 setPlayingPlayer:nil，32 次【全被拦】，
-//   setNowPlayingInfo:nil 与它 1:1 配对（也 32 次全拦）→ 抖音内部 _playingPlayer 永远停在
-//   【旧播放器】→ 控制中心的 play 命令被引到旧播放器 → 文字不更新 + 点播放播不了当前这条。
-//
-// 卡片安全（放行不会掉卡）：系统侧清空已在 `MPNowPlayingInfoCenter setNowPlayingInfo:` 层
-// 被吞掉，`endReceivingRemoteControlEvents` 也在 UIApplication 层拦着，两处双重保险。
+// playingPlayer 被置 nil = 抖音主动放弃"正在播放"角色（收摊第①步）→ 托管中吞掉。
+// 关键：这一步在【前台点暂停】时同样发生（老板实测：不退界面卡片就没了），
+// 所以判据不能要求"非前台"，否则永远晚一步。
 - (void)setPlayingPlayer:(id)player {
     if (!player && DYYYShouldHoldNowPlaying()) {
-        NSInteger st = DYYYAppStateRaw();
-        if (st == 2) {
-            DYYYSpeedDiag(@"[npv] 拦 setPlayingPlayer:nil(后台)");
-            return;
-        }
-        DYYYSpeedDiag([NSString stringWithFormat:
-            @"[npv] 放行 setPlayingPlayer:nil(前台 st=%ld) → 让抖音完成旧播放器下岗", (long)st]);
-        %orig;
+        DYYYSpeedDiag(@"[npv] 拦 setPlayingPlayer:nil");
         return;
-    }
-    // 【v19 观测】非 nil 也要留痕：一轮就能确认"切视频后新播放器到底有没有上岗"。
-    if (player && DYYYShouldHoldNowPlaying()) {
-        dyyyLastPlayingPlayer = player;   // 【v21】缓存"上岗过的模块"，供播命令空引用时补岗
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 收到 setPlayingPlayer:%@",
-            NSStringFromClass([player class]) ?: @"?"]);
     }
 
     %orig;
 }
 
 - (void)setNowPlayingInfo:(id)nowPlayingInfo {
-    // 清空 AWENPC 侧信息（收摊第②步）。同 setPlayingPlayer: —— v19 起按前后台分流，
-    // 前台放行让抖音走完"旧的下岗 → 新的上岗 → 发布新信息"的交接链；
-    // 真正落到系统侧的那次清空由 MPNowPlayingInfoCenter 层吞掉（卡片不会掉）。
+    // 清空抖音侧信息（收摊第②步）→ 托管中吞掉。暂停那一刻就会来，必须挡。
     if (!nowPlayingInfo && DYYYShouldHoldNowPlaying()) {
-        NSInteger st = DYYYAppStateRaw();
-        if (st == 2) {
-            DYYYSpeedDiag(@"[npv] 拦 AWENPC setNowPlayingInfo:nil(后台)");
-            return;
-        }
-        DYYYSpeedDiag([NSString stringWithFormat:
-            @"[npv] 放行 AWENPC setNowPlayingInfo:nil(前台 st=%ld)", (long)st]);
-        %orig;
+        DYYYSpeedDiag(@"[npv] 拦 AWENPC setNowPlayingInfo:nil");
         return;
     }
 
@@ -2565,149 +1700,6 @@ static void DYYYDumpAwemeSourceShapes(void) {
     if (DYYYShouldHoldNowPlaying() && DYYYAppStateRaw() == 2) {
         DYYYSpeedDiag(@"[npv] 拦 resignPlayingPlayer(后台)");
         return;
-    }
-    %orig;
-}
-
-// ⭐⭐【v20 靶心 / v21 修复】控制中心「播放」命令的单一入口。
-// 命中 = 命令确实送到了抖音内部（v20 实测 14 次命中，链路全通，不是系统层的问题）。
-// ⚠️ 返回类型实证 = `q16@0:8`（NSInteger = MPRemoteCommandHandlerStatus），**不是 void**：
-//    v20 声明成 void 会把返回值丢掉 → 调用方读到 x0 垃圾值，可能被判为 CommandFailed。
-//    v21 起按真值返回，并把 ret 打进日志。
-- (NSInteger)handlePlayCommand {
-    DYYYDumpRemoteControlSignatures();
-    DYYYDumpAwemeSourceShapes();   // 【v24】一次性打类结构（只在首轮）
-    dyyyPlayCmdInFlight = YES;
-    id me = (id)self;
-    SEL playingSel = NSSelectorFromString(@"playingPlayer");
-    id player = ((id (*)(id, SEL))objc_msgSend)(me, playingSel);
-
-    // ⭐【v25 探针】把"抖音内部握着当前 aweme 的对象"摊开，并把落点换算成 itemID
-    //（比标题可靠：标题会被话题/长度截断，itemID 是唯一键）。
-    DYYYProbeAwemeHolder(me, @"play@播放信息中心");
-    DYYYProbeAwemeHolder(dyyyBGPlayModuleInstance, @"play@背景播放模块");
-    DYYYProbeAwemeHolder(player, @"play@playingPlayer");
-
-    // ⭐【v25 核心修复】补岗判据从"playingPlayer 为空"放宽为
-    //   "playingPlayer 为空 【或】 模块手里没有当前条目(_model 为 nil)"。
-    // 依据 diag/v24_check.log：
-    //   · 模块的 _model 是唯一【只领先、不落后】的权威源；
-    //   · _model 为 nil 时模块根本没有可播对象 → 控制中心点了播放没有落点，
-    //     这正是老板反馈的"点不动 / 播不到当前这条"；
-    //   · 而重新上岗是实测唯一有效的杠杆：18:50:30 补岗 → 18:50:32 抖音就打了
-    //     「模块收下当前条目 cnt=2」+「系统发布 title=稀有祖宗」，系统侧 2 秒内跟上。
-    id fallback = dyyyLastPlayingPlayer ? dyyyLastPlayingPlayer : dyyyBGPlayModuleInstance;
-    id mod = dyyyBGPlayModuleInstance ? dyyyBGPlayModuleInstance : player;
-    NSString *modTitleBefore = DYYYModuleAwemeTitle(mod);
-    NSString *modID = DYYYAwemeItemID(DYYYModuleAwemeModel(mod));
-    DYYYSpeedDiag([NSString stringWithFormat:
-        @"[npv] ▶ 收到 play 命令 | playingPlayer=%@ | 模块=%@ | 模块条目=%@(id=%@) | 系统侧=%@",
-        player ? NSStringFromClass([player class]) : @"(nil)",
-        mod ? NSStringFromClass([mod class]) : @"(nil)",
-        modTitleBefore.length ? modTitleBefore : @"(未握条目)",
-        modID ?: @"-", DYYYCurrentSystemNPTitle() ?: @"-"]);
-
-    // ⭐⭐【v26 分治】两个不同的问题，两条不同的路 —— 不再混为一谈：
-    //   问题一：playingPlayer 为空 → 抖音手上没有"代表它对外播放"的对象。
-    //           → 补岗 becomePlayingPlayer:（v21 机制，保留）。
-    //   问题二：模块 _model 为空 → 模块手里没有当前条目 = 播放命令没有落点。
-    //           → 补岗【治不了它】：v25 实测 30 次补岗里 21 次补完模块仍然空。
-    //             改用「模块条目快照」还原现场（见 DYYYRestoreModuleSnapshot 注释）。
-    BOOL drove = NO;
-    BOOL restoredSnapshot = NO;
-    if ((!player || modTitleBefore.length == 0) && mod) {
-        NSString *detail = nil;
-        restoredSnapshot = DYYYRestoreModuleSnapshot(mod, &detail);
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ %@ → %@",
-            !player ? @"playingPlayer 为空" : @"模块未握当前条目",
-            restoredSnapshot
-                ? [NSString stringWithFormat:@"恢复模块条目快照 ✓ %@", detail ?: @""]
-                : [NSString stringWithFormat:@"快照不可用（%@）", detail ?: @"无快照"]]);
-        drove = YES;
-    }
-    if (!player && fallback) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ playingPlayer 为空 → 补岗 %@",
-            NSStringFromClass([fallback class]) ?: @"?"]);
-        ((void (*)(id, SEL, id))objc_msgSend)(me, NSSelectorFromString(@"becomePlayingPlayer:"), fallback);
-        id after = ((id (*)(id, SEL))objc_msgSend)(me, playingSel);
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ 补岗后 playingPlayer=%@ | 模块条目=%@",
-            after ? NSStringFromClass([after class]) : @"(nil)，补岗未生效",
-            DYYYModuleAwemeTitle(mod) ?: @"(仍未握条目)"]);
-        drove = YES;
-    } else if (!player) {
-        DYYYSpeedDiag(@"[npv] ▶ playingPlayer 为空且无可用模块（缓存未建立）→ 无法补岗");
-    }
-
-    NSInteger ret = %orig;
-    dyyyPlayCmdInFlight = NO;
-    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ play 命令处理完毕 ret=%ld（0=Success）", (long)ret]);
-
-    // 【v26】快照恢复后，模块内部条目已修正，但系统侧 title 要抖音自己重发才算"文字也跟上"。
-    // 这正是老板要的"文字不变也能接受"之外的加分项：能跟上就一起跟上。
-    // 只在确有偏差时催一次（节流 1s），不做轮询、不加定时器。
-    NSString *modTitleAfter = DYYYModuleAwemeTitle(dyyyBGPlayModuleInstance);
-    NSString *sysTitleAfter = DYYYCurrentSystemNPTitle();
-    BOOL sysBehind = (modTitleAfter.length > 0 &&
-                      (sysTitleAfter.length == 0 || ![modTitleAfter isEqualToString:sysTitleAfter]));
-    if (restoredSnapshot && sysBehind) {
-        DYYYAskDouyinRebuildNowPlaying(dyyyBGPlayModuleInstance, @"快照恢复后文字没跟上");
-    } else if (!drove && sysBehind) {
-        DYYYAskDouyinRebuildNowPlaying(dyyyBGPlayModuleInstance, @"播放命令后文字没跟上");
-    }
-
-    // ⭐⭐【v27】补岗后单次延迟复查 —— 补岗是【延迟生效】的，v26 读得太早才误判它无效。
-    // 实测规律（diag/v26_check.log，两处独立复现）：
-    //   19:12:03 补岗 becomePlayingPlayer: → 19:12:06 shouldEnterBackgroundPlayMode=1
-    //                                       + 「模块收下当前条目 cnt=2 title=剑馆来了个师姐」
-    //   19:12:09 补岗                     → 19:12:11 同样两连击（闸门=1 + 收下条目）
-    // 即：补岗是"通知抖音重新武装后台播放"的动作，抖音要 2~3 秒后才把当前条目交回模块。
-    // v26 在补岗后【立刻】读模块 → 30 次里 21 次读到空 → 误判"补岗无效"，押错了方向。
-    // 所以这里补一次收尾（单次 dispatch_after，非轮询、非定时器循环）：
-    //   模块自己握回来了 → 报喜（说明抖音状态机走通）；
-    //   还没握回来       → 用快照补位，保证老板下一次点播放时模块必有落点。
-    if (!player && fallback) {
-        __weak id weakMod = mod;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            id m2 = weakMod;
-            if (!m2 || !DYYYShouldHoldNowPlaying()) {
-                return;
-            }
-            NSString *t2 = DYYYModuleAwemeTitle(m2);
-            if (t2.length > 0) {
-                DYYYSpeedDiag([NSString stringWithFormat:
-                    @"[npv] ▶ 补岗后 2.5s：抖音已把条目交回模块 ✓ title=%@", t2]);
-                return;
-            }
-            NSString *d = nil;
-            if (DYYYRestoreModuleSnapshot(m2, &d)) {
-                DYYYSpeedDiag([NSString stringWithFormat:
-                    @"[npv] ▶ 补岗后 2.5s：模块仍空 → 快照补位 ✓ %@", d ?: @""]);
-            } else {
-                DYYYSpeedDiag([NSString stringWithFormat:
-                    @"[npv] ▶ 补岗后 2.5s：模块仍空且快照不可用（%@）", d ?: @"无快照"]);
-            }
-        });
-    }
-    return ret;
-}
-
-// 暂停命令同样留痕（对照用：暂停一直好用，播放不好用，差异点就藏在这两条的尾链里）。
-// 返回类型同上 = NSInteger（q16@0:8）。
-- (NSInteger)handlePauseCommand {
-    DYYYSpeedDiag(@"[npv] ⏸ 收到 pause 命令（控制中心点了暂停）");
-    NSInteger ret = %orig;
-    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ⏸ pause 命令处理完毕 ret=%ld", (long)ret]);
-    return ret;
-}
-
-// becomePlayingPlayer: = "从现在起由这个对象代表抖音对外播放"，play 命令最终打到它身上
-- (void)becomePlayingPlayer:(id)player {
-    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 上岗 becomePlayingPlayer=%@ | 状态=%ld",
-                                             player ? NSStringFromClass([player class]) : @"(nil)",
-                                             (long)DYYYAppStateRaw()]);
-    if (player) {
-        dyyyLastPlayingPlayer = player;   // 【v21】缓存"上岗过的模块"，供播命令空引用时补岗
     }
     %orig;
 }
@@ -2746,23 +1738,9 @@ static void DYYYDumpAwemeSourceShapes(void) {
     %orig;
 }
 
-// 【v16 修正 / v17 结论】resetNowPlayingInfo:(id)model —— 带 model 参数，语义是"用这个 model 重设
-// 或刷新当前播放信息"，**不是无参清空**（同块的 clearNowPlayingInfo / clearCommand 才是真清空，继续拦）。
-// 它当年被一起归入"清空类"无条件掐死，而且【没留任何日志】→ 一直是个盲点，按 v9/v10 已确立的分流
-// 原则改成：前台 = 交接，放行；后台 = 收摊，才拦。
-// ⚠️ v17 结论：加了留痕日志后实测整轮【0 命中】→ 这条方法在 8.0.37 上大概率不存在或根本不被调用，
-// 它【不是】"显示上一条"的根因（此前的怀疑已证伪）。保留这段拦截（无害、且若哪天真命中就是正确的），
-// 但不要再把它当成线索去挖。真正的根因在兜底链，见上面 v17 的"实时读系统侧"与"缓存一致性校验"。
 - (void)resetNowPlayingInfo:(id)model {
-    NSInteger st = DYYYAppStateRaw();
-    if (DYYYShouldHoldNowPlaying() && st == 2) {
-        DYYYSpeedDiag(@"[npv] 拦 resetNowPlayingInfo(后台)");
-        return;
-    }
     if (DYYYShouldHoldNowPlaying()) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 放行 resetNowPlayingInfo(前台) model=%@ title=%@",
-            model ? NSStringFromClass([model class]) : @"(nil)",
-            DYYYAwemeTitleText(model) ?: @"-"]);
+        return;
     }
 
     %orig;
@@ -2782,56 +1760,20 @@ static void DYYYDumpAwemeSourceShapes(void) {
 // 实测系统那条通道抖音根本不走）
 - (void)setCurrentNowPlayingInfo:(id)info {
     dyyyBGPlayModuleInstance = self;   // 缓存实例，供"暂停后补 resignActive"调用（v11）
-    DYYYDumpRemoteControlSignatures();   // 【v20】首次命中即 dump 一次远端方法签名（一次性）
     BOOL isEmpty = (![info isKindOfClass:[NSDictionary class]] || [(NSDictionary *)info count] == 0);
-    // 【v16】非空也要过完整性门槛：切视频/暂停时 store 里可能混进 cnt=3 的残缺字典。
-    // ⭐【v23 探针】非空分支此前【完全没留痕】—— 十二轮迭代里一直是个盲点。
-    // 为什么现在必须闭它（diag/v22_check.log 的因果链）：
-    //   卡死窗口（18:27:34~18:28:39）里，复查 43 次全部报「无当前视频弹药 | store=-」，
-    //   而同一时间「放行 setCurrentNowPlayingInfo:nil(前台)」反复出现 —— 抖音把模块里的
-    //   "当前条目"清空了，之后就再没交出新的。于是 push 无弹药 → 系统侧 title 纹丝不动 →
-    //   控制中心 play 命令落点仍是旧条目（50 次 play 里 22 次发生在错位状态，且呈簇状）。
-    //   但"再没交出新的"只是【从 store 读出来是空】反推的，中间隔着一层 getter；
-    //   本探针直接把"抖音有没有交回条目"变成可读数据，一分钱不花就能定论：
-    //     · 有非空命中 = 抖音交了，问题在我们读 store 的那条路（或我们把它盖了）
-    //     · 全程 0 命中 = 抖音自己就不交，瓶颈在它的状态机上游（别再三轮改我们的兜底）
-    if (!isEmpty && DYYYNPInfoLooksComplete((NSDictionary *)info)) {
-        dyyyLastGoodCurrentNPInfo = info;   // 完整信息才刷新缓存（Boost 兜底单发用，v15.1）
-        // ⭐【v26】这一刻是"抖音亲口说出当前条目"的唯一时点 —— 立刻抓快照。
-        // 之后它大概率会（自己或我们放行地）把 _model 抹掉，快照是唯一能还原现场的凭据。
-        DYYYCaptureModuleSnapshot(self);
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 模块收下当前条目 cnt=%lu title=%@（已抓快照）",
-            (unsigned long)[(NSDictionary *)info count],
-            [(NSDictionary *)info[@"title"] description] ?: @"-"]);
-    } else if (!isEmpty) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 拒收残缺弹药：setCurrentNowPlayingInfo cnt=%lu title=%@",
-            (unsigned long)[(NSDictionary *)info count],
-            [(NSDictionary *)info[@"title"] description] ?: @"-"]);
+    if (!isEmpty) {
+        dyyyLastGoodCurrentNPInfo = info;   // 非空即刷新缓存（Boost 兜底单发用，v15.1）
     }
     // 【v11】抖音把"当前播放信息"清空 = 用户暂停了。它的发布链此刻还没跑（要等 resignActive），
     // 我们主动替它补一次，让卡片当场挂上 —— 不必等用户去拉控制中心。
-    // 【v15.3】空信息写入曾【无条件吞掉不落盘】——为了保住模块 store 当兜底弹药。
-    // 【v22 修正，同一个坑第四次】改成和 v9/v19 完全一样的前后台分流：
-    //   铁证（diag/v21_check.log，18:16:49）：老板【前台(st=0)】滑下一条视频时，抖音同样调
-    //   setCurrentNowPlayingInfo:nil —— 那是"退出旧视频的后台播放态"的第一步，被我们吞掉后
-    //   整条"退出→进入→发布"状态机就断了：抖音内部当前条目永远停在旧视频（系统侧 title
-    //   33 秒纹丝不动，全程"亮瞎眼的小蓝灯"，而老板已滑到"海王星"/《绝代明星》）→ 控制中心
-    //   play 命令虽被抖音执行（ret=0、投票=1），落点却是旧条目 → 老板体感"点了没效果/不播当前这条"。
-    //   这正是本文件 v9 注释里记下的那次事故（拦 doExit：每滑一条必调 3 次全拦 → 系统侧彻底停摆
-    //   → "点击没反应"）的同一条链，当年只放行了 doExit 一个，这一组剩下的三个一直没跟着改。
-    //   安全性：卡片清空由 MPNowPlayingInfoCenter 层吞掉兜底（v19 已验证），兜底弹药另有
-    //   我们自己的 dyyyLastGoodCurrentNPInfo 缓存（完整性门槛保护），不依赖模块 store。
+    // 【v15.3】空信息写入【吞掉不落盘】：实测（16:15 重启会话）暂停时 %orig 会把模块 store
+    // 清成 cnt=0，Boost 读 getter 无弹药、兜底单发没货 → 重启后第一次暂停必失败
+    //（第一次能成功只因播放时退过后台、原生链闸门开过）。"决定清空"(setNeedClean=YES)
+    // 已吞，"执行清空"同步吞掉语义才一致；store 保留的正是暂停那一刻的当前视频信息。
     if (isEmpty && DYYYShouldHoldNowPlaying()) {
-        NSInteger st = DYYYAppStateRaw();
-        dyyyBGPlayModuleInstance = self;
-        if (st == 2) {
-            DYYYSpeedDiag(@"[npv] 拦 setCurrentNowPlayingInfo:nil(后台) → 吞掉，不收摊");
-            DYYYBoostNowPlayingAfterPause();
-            return;
-        }
-        DYYYSpeedDiag([NSString stringWithFormat:
-            @"[npv] 放行 setCurrentNowPlayingInfo:nil(前台 st=%ld) → 让抖音走完切视频状态机", (long)st]);
+        DYYYSpeedDiag(@"[npv] 暂停检测：setCurrentNowPlayingInfo 空信息（吞掉，保 store 弹药）");
         DYYYBoostNowPlayingAfterPause();
+        return;
     }
     %orig;
 }
@@ -2843,31 +1785,19 @@ static void DYYYDumpAwemeSourceShapes(void) {
 - (void)setNeedCleanNowPlayingInfo:(BOOL)value {
     if (value && DYYYShouldHoldNowPlaying()) {
         dyyyBGPlayModuleInstance = self;
-        NSInteger st = DYYYAppStateRaw();
-        if (st == 2) {
-            DYYYSpeedDiag(@"[npv] 拦 setNeedClean=YES(后台) → Boost");
-            DYYYBoostNowPlayingAfterPause();
-            return;
-        }
-        DYYYSpeedDiag([NSString stringWithFormat:
-            @"[npv] 放行 setNeedClean=YES(前台 st=%ld) → 让抖音推进切视频状态机", (long)st]);
+        DYYYSpeedDiag(@"[npv] 拦 setNeedClean=YES → Boost");
         DYYYBoostNowPlayingAfterPause();
+        return;
     }
 
     %orig;
 }
 
-// "决定辞去播放身份"：后台才吞（同 doExit / setPlayingPlayer:nil 的判据）。
-// 【v22】前台放行 —— 它是"退出旧视频播放态"这一组的第三环，拦着同样会让状态机断链。
+// "决定辞去播放身份"：YES 时吞掉
 - (void)setNeedResignPlayingPlayer:(BOOL)value {
     if (value && DYYYShouldHoldNowPlaying()) {
-        NSInteger st = DYYYAppStateRaw();
-        if (st == 2) {
-            DYYYSpeedDiag(@"[npv] 拦 setNeedResign=YES(后台)");
-            return;
-        }
-        DYYYSpeedDiag([NSString stringWithFormat:
-            @"[npv] 放行 setNeedResign=YES(前台 st=%ld)", (long)st]);
+        DYYYSpeedDiag(@"[npv] 拦 setNeedResign=YES");
+        return;
     }
 
     %orig;
@@ -2890,73 +1820,6 @@ static void DYYYDumpAwemeSourceShapes(void) {
         return;
     }
     %orig;
-}
-
-// 【v22 探针】"进入新视频的后台播放态"这一环 —— 抖音滑视频流程的第②步。
-// v9 的注释把流程写得很清楚（退出旧态 → 进入新态 → 发布新信息），但这条链的第②步
-// 九轮迭代里从来没留过痕。本轮放行了第①步（三处决定类方法前台放行）后，
-// 用这两条日志直接验证第②步有没有跟着发生：
-//   · 命中 = 分流奏效，状态机真的走通了
-//   · 0 命中 = 第①步不是瓶颈，得往上找谁掐住了"进入"
-- (void)realEnterBackgroundPlayMode {
-    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ⏵ 进入播放态 realEnterBackgroundPlayMode | st=%ld | 当前视频=%@",
-        (long)DYYYAppStateRaw(), dyyyCurrentAwemeTitle ?: @"-"]);
-    %orig;
-}
-
-- (BOOL)shouldEnterBackgroundPlayMode {
-    BOOL r = %orig;
-    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ⏵ shouldEnterBackgroundPlayMode=%d | st=%ld",
-        (int)r, (long)DYYYAppStateRaw()]);
-    return r;
-}
-
-// ⭐⭐【v20 靶心】"禁止从后台恢复播放"闸门。
-// v5 实证：无条件改判 NO 之后，老板反馈"点播放确实开始播了" ⇒ 这道门就是"点播放没反应"的根。
-// 本轮只敢开【精准窗口】：仅在 handlePlayCommand 的执行栈内改判，其它时机（含退后台自动续播）
-// 一律原样返回 —— 避免出现"暂停了自己又播起来"这类新问题。
-- (BOOL)forbidResumePlayFromBackground {
-    BOOL value = %orig;
-    if (!DYYYShouldHoldNowPlaying()) {
-        return value;
-    }
-    if (value && dyyyPlayCmdInFlight) {
-        DYYYSpeedDiag(@"[npv] ▶ forbidResume=YES，但正处于播命令窗口 → 改判 NO（允许后台续播）");
-        return NO;
-    }
-    if (value) {
-        DYYYSpeedDiag(@"[npv] forbidResume=YES（非播命令时机，原样返回）");
-    }
-    return value;
-}
-
-// 同义决策方法（"should" 变体）：同样只在播命令窗口内放行
-- (BOOL)shouldforbidResumePlayFromBackground {
-    BOOL value = %orig;
-    if (value && dyyyPlayCmdInFlight && DYYYShouldHoldNowPlaying()) {
-        DYYYSpeedDiag(@"[npv] ▶ shouldforbidResume=YES → 改判 NO（播命令窗口内）");
-        return NO;
-    }
-    return value;
-}
-
-// 只观测不改写：看抖音到底何时把它置 YES（v5 曾在这里直接改 NO，属全局越权，已废止）
-- (void)setForbidResumePlayFromBackground:(BOOL)value {
-    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] setForbidResume=%d", value]);
-    %orig;
-}
-
-// 按钮可用性：canPlay=YES 才能点播放；被置 NO 时控制中心按钮呈失效态
-- (BOOL)canPlayForRemoteControl {
-    BOOL value = %orig;
-    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] canPlayForRemoteControl=%d", value]);
-    return value;
-}
-
-- (BOOL)canPauseForRemoteControl {
-    BOOL value = %orig;
-    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] canPauseForRemoteControl=%d", value]);
-    return value;
 }
 
 // 【v7 已移除】forbidResumePlayFromBackground 的强制改写。
@@ -2982,8 +1845,7 @@ static void DYYYDumpAwemeSourceShapes(void) {
     // 这个键就是控制中心"画播放键还是暂停键"的开关（1.0=暂停键 / 0.0=播放键），抖音从不写它，
     // 所以卡片永远停在"暂停键"。我们只补这一个键，标题/封面/时长等内容一字不改。
     // 重入保护：读抖音 getter 若又触发一次发布，那次直接放行、不做二次修正。
-    // 【v16】只有完整信息才进弹药缓存（挡住那条发 cnt=3 残缺字典的无关发布链）。
-    if (DYYYNPInfoLooksComplete(nowPlayingInfo)) {
+    if (nowPlayingInfo.count > 0) {
         dyyyLastGoodCurrentNPInfo = nowPlayingInfo;   // 【v15.2】系统侧非空发布也刷新兜底缓存
     }
     if (nowPlayingInfo.count > 0 && !dyyyNpRatePatching && DYYYShouldHoldNowPlaying()) {
@@ -3061,24 +1923,7 @@ static BOOL DYYYIsAmbientCategory(NSString *c) {
 // stop/close 一律放行（用户点卡片"关闭"要真能关）。
 %hook MPRemoteCommand
 
-// 【v20 观测】谁给播放命令注册了 handler —— 拿到抖音真正的处理者类名与 selector，
-// 以后要精确 hook「点播放」就能直接打靶，不必再猜。
-- (void)addTarget:(id)target action:(SEL)action {
-    NSString *tag = DYYYRemoteCommandTag(self);
-    if (tag) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv-rc] addTarget cmd=%@ target=%@ action=%@", tag,
-                                                 target ? NSStringFromClass([target class]) : @"(nil)",
-                                                 NSStringFromSelector(action) ?: @"?"]);
-    }
-    %orig;
-}
-
 - (void)removeTarget:(id)target action:(SEL)action {
-    NSString *tag = DYYYRemoteCommandTag(self);
-    if (tag) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv-rc] removeTarget cmd=%@ action=%@", tag,
-                                                 NSStringFromSelector(action) ?: @"?"]);
-    }
     if (DYYYShouldHoldNowPlaying() && DYYYIsPreservedPlaybackCommand(self)) {
         return;
     }
@@ -3087,10 +1932,6 @@ static BOOL DYYYIsAmbientCategory(NSString *c) {
 }
 
 - (void)removeTarget:(id)target {
-    NSString *tag = DYYYRemoteCommandTag(self);
-    if (tag) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv-rc] removeTarget(全部) cmd=%@", tag]);
-    }
     if (DYYYShouldHoldNowPlaying() && DYYYIsPreservedPlaybackCommand(self)) {
         return;
     }
@@ -3099,11 +1940,6 @@ static BOOL DYYYIsAmbientCategory(NSString *c) {
 }
 
 - (void)setEnabled:(BOOL)enabled {
-    NSString *tag = DYYYRemoteCommandTag(self);
-    if (tag) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv-rc] setEnabled=%d cmd=%@ | 状态=%ld", (int)enabled, tag,
-                                                 (long)DYYYAppStateRaw()]);
-    }
     if (!enabled && DYYYShouldHoldNowPlaying() && DYYYIsPreservedPlaybackCommand(self)) {
         return;
     }
@@ -14317,18 +13153,9 @@ static Class tabBarButtonClass = nil;
     %orig;
     isInPlayInteractionVC = YES;
     dyyyCurrentSpeedAweme = self.model;
-    // 【v17】切视频候选：交互层 VC 出现 —— self.model 就是这条视频。
-    DYYYNoteAwemeChangedFrom(self.model, @"Interaction.viewWillAppear", self);
     DYYYRestoreFloatSpeedButtonForAwemeIfNeeded(self.model);
     DYYYEnsureFloatSpeedButton(self);
     reloadClearButtonConfiguration();
-}
-
-// 【v17】切视频候选：model 被换 = 这个交互层认领了一条新视频（比 viewWillAppear 更直接、
-// 且不受"VC 是否重新 appear"影响）。是"当前视频是谁"最可能的权威来源。
-- (void)setModel:(AWEAwemeModel *)arg1 {
-    %orig(arg1);
-    DYYYNoteAwemeChangedFrom(arg1, @"Interaction.setModel", self);
 }
 
 - (void)viewDidLayoutSubviews {
@@ -14502,20 +13329,11 @@ static Class tabBarButtonClass = nil;
 
 - (void)setIsAutoPlay:(BOOL)arg0 {
     %orig(arg0);
-    if (arg0) {
-        // 【v17】切视频候选：只有"要播的那条"才会被置 YES —— 语义上最贴近"切到这条"。
-        // 一次挂到三个播放器 VC 上，日志自带类名，一轮实测即可确定谁才是真命中点。
-        DYYYNoteAwemeChangedFrom(self, [NSString stringWithFormat:@"%@.setIsAutoPlay",
-            NSStringFromClass([self class])], self);
-    }
     DYYYApplyPreparedPlaybackSpeedToPlayer(self);
 }
 
 - (void)prepareForDisplay {
     %orig;
-    // 【v17】切视频候选：cell/播放器准备显示 —— 抖音 feed 换视频的必经点之一。
-    DYYYNoteAwemeChangedFrom(self, [NSString stringWithFormat:@"%@.prepareForDisplay",
-        NSStringFromClass([self class])], self);
     if (!DYYYShouldHandleSpeedFeatures()) {
         return;
     }
@@ -14561,20 +13379,11 @@ static Class tabBarButtonClass = nil;
 
 - (void)setIsAutoPlay:(BOOL)arg0 {
     %orig(arg0);
-    if (arg0) {
-        // 【v17】切视频候选：只有"要播的那条"才会被置 YES —— 语义上最贴近"切到这条"。
-        // 一次挂到三个播放器 VC 上，日志自带类名，一轮实测即可确定谁才是真命中点。
-        DYYYNoteAwemeChangedFrom(self, [NSString stringWithFormat:@"%@.setIsAutoPlay",
-            NSStringFromClass([self class])], self);
-    }
     DYYYApplyPreparedPlaybackSpeedToPlayer(self);
 }
 
 - (void)prepareForDisplay {
     %orig;
-    // 【v17】切视频候选：cell/播放器准备显示 —— 抖音 feed 换视频的必经点之一。
-    DYYYNoteAwemeChangedFrom(self, [NSString stringWithFormat:@"%@.prepareForDisplay",
-        NSStringFromClass([self class])], self);
     if (!DYYYShouldHandleSpeedFeatures()) {
         return;
     }
@@ -14619,20 +13428,11 @@ static Class tabBarButtonClass = nil;
 
 - (void)setIsAutoPlay:(BOOL)arg0 {
     %orig(arg0);
-    if (arg0) {
-        // 【v17】切视频候选：只有"要播的那条"才会被置 YES —— 语义上最贴近"切到这条"。
-        // 一次挂到三个播放器 VC 上，日志自带类名，一轮实测即可确定谁才是真命中点。
-        DYYYNoteAwemeChangedFrom(self, [NSString stringWithFormat:@"%@.setIsAutoPlay",
-            NSStringFromClass([self class])], self);
-    }
     DYYYApplyPreparedPlaybackSpeedToPlayer(self);
 }
 
 - (void)prepareForDisplay {
     %orig;
-    // 【v17】切视频候选：cell/播放器准备显示 —— 抖音 feed 换视频的必经点之一。
-    DYYYNoteAwemeChangedFrom(self, [NSString stringWithFormat:@"%@.prepareForDisplay",
-        NSStringFromClass([self class])], self);
     if (!DYYYShouldHandleSpeedFeatures()) {
         return;
     }
@@ -14749,10 +13549,6 @@ static Class tabBarButtonClass = nil;
     }
     %orig;
     DYYYHandleCurrentSpeedAwemeChanged(arg1);
-    // 【v17 说明】这里曾挂 v16 的切视频留痕，实测整轮【0 命中】→ 抖音 8.0.37 划视频【不走】
-    // 这个方法（AwemeHeaders.h 里 AWEFeedContainerViewController 只有个空接口，方法名是早年猜的）。
-    // 观测点已迁到真正会被调用的播放器 VC：setIsAutoPlay: / prepareForDisplay（三个类上并行），
-    // 以及 AWEPlayInteractionViewController 的 setModel: / viewWillAppear:。
 }
 
 - (void)viewWillLayoutSubviews {
