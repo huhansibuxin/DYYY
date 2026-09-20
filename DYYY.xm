@@ -1958,22 +1958,56 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 // 下面的托管逻辑直接在那里接管。
 %hook AWENowPlayingInfoCenter
 
-// playingPlayer 被置 nil = 抖音主动放弃"正在播放"角色（收摊第①步）→ 托管中吞掉。
-// 关键：这一步在【前台点暂停】时同样发生（老板实测：不退界面卡片就没了），
-// 所以判据不能要求"非前台"，否则永远晚一步。
+// ⭐⭐【v19 关键修正】playingPlayer 被置 nil = 抖音放弃"正在播放"角色。
+// v4 起这里【无条件】吞掉，这就是老板当前症状的直接原因：
+//   "控制中心文字不更新 → 点暂停/播放不生效、播不了当前这一条"。
+//
+// 依据（本文件自己的历史定案，同一个坑第二次踩）：
+//   `doExitBackgroundPlayMode` 当初也是无条件拦，v9 铁证（diag/v8.log）——老板"每滑一条视频抖音
+//   必调 3 次、全被拦 → 此后系统侧 SET info 彻底停摆 → 滑到下一条控制中心还是上一个视频的
+//   文字、点击没反应"，与本轮症状【逐字相同】；v10 改成"只有 ApplicationState==2 才拦、
+//   Active/Inactive 放行"后即修复。
+//   AWENowPlayingInfoCenter 这两个"旧的下岗"钩子属同一类"两义方法"，却一直没跟着改。
+//   日志实证（diag/v18_check.log）：每切一条视频必来一次 setPlayingPlayer:nil，32 次【全被拦】，
+//   setNowPlayingInfo:nil 与它 1:1 配对（也 32 次全拦）→ 抖音内部 _playingPlayer 永远停在
+//   【旧播放器】→ 控制中心的 play 命令被引到旧播放器 → 文字不更新 + 点播放播不了当前这条。
+//
+// 卡片安全（放行不会掉卡）：系统侧清空已在 `MPNowPlayingInfoCenter setNowPlayingInfo:` 层
+// 被吞掉，`endReceivingRemoteControlEvents` 也在 UIApplication 层拦着，两处双重保险。
 - (void)setPlayingPlayer:(id)player {
     if (!player && DYYYShouldHoldNowPlaying()) {
-        DYYYSpeedDiag(@"[npv] 拦 setPlayingPlayer:nil");
+        NSInteger st = DYYYAppStateRaw();
+        if (st == 2) {
+            DYYYSpeedDiag(@"[npv] 拦 setPlayingPlayer:nil(后台)");
+            return;
+        }
+        DYYYSpeedDiag([NSString stringWithFormat:
+            @"[npv] 放行 setPlayingPlayer:nil(前台 st=%ld) → 让抖音完成旧播放器下岗", (long)st]);
+        %orig;
         return;
+    }
+    // 【v19 观测】非 nil 也要留痕：一轮就能确认"切视频后新播放器到底有没有上岗"。
+    if (player && DYYYShouldHoldNowPlaying()) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 收到 setPlayingPlayer:%@",
+            NSStringFromClass([player class]) ?: @"?"]);
     }
 
     %orig;
 }
 
 - (void)setNowPlayingInfo:(id)nowPlayingInfo {
-    // 清空抖音侧信息（收摊第②步）→ 托管中吞掉。暂停那一刻就会来，必须挡。
+    // 清空 AWENPC 侧信息（收摊第②步）。同 setPlayingPlayer: —— v19 起按前后台分流，
+    // 前台放行让抖音走完"旧的下岗 → 新的上岗 → 发布新信息"的交接链；
+    // 真正落到系统侧的那次清空由 MPNowPlayingInfoCenter 层吞掉（卡片不会掉）。
     if (!nowPlayingInfo && DYYYShouldHoldNowPlaying()) {
-        DYYYSpeedDiag(@"[npv] 拦 AWENPC setNowPlayingInfo:nil");
+        NSInteger st = DYYYAppStateRaw();
+        if (st == 2) {
+            DYYYSpeedDiag(@"[npv] 拦 AWENPC setNowPlayingInfo:nil(后台)");
+            return;
+        }
+        DYYYSpeedDiag([NSString stringWithFormat:
+            @"[npv] 放行 AWENPC setNowPlayingInfo:nil(前台 st=%ld)", (long)st]);
+        %orig;
         return;
     }
 
