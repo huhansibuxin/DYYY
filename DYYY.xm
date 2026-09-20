@@ -1281,49 +1281,9 @@ static void DYYYHandleCurrentSpeedAwemeChanged(id aweme) {
 + (instancetype)sharedCommandCenter;
 @end
 
-static BOOL dyyyClearingFeedNowPlayingSystemInfo = NO;
-static CFTimeInterval dyyyLastFeedNowPlayingSystemClearTime = 0.0;
-
-static void DYYYClearFeedNowPlayingSystemInfoThrottled(void) {
-    if (!DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo") || dyyyClearingFeedNowPlayingSystemInfo) {
-        return;
-    }
-
-    CFTimeInterval currentTime = CFAbsoluteTimeGetCurrent();
-    if (currentTime - dyyyLastFeedNowPlayingSystemClearTime < 0.25) {
-        return;
-    }
-    dyyyLastFeedNowPlayingSystemClearTime = currentTime;
-
-    Class nowPlayingInfoCenterClass = NSClassFromString(@"MPNowPlayingInfoCenter");
-    if (!nowPlayingInfoCenterClass || ![nowPlayingInfoCenterClass respondsToSelector:@selector(defaultCenter)]) {
-        return;
-    }
-
-    id center = ((id (*)(Class, SEL))objc_msgSend)(nowPlayingInfoCenterClass, @selector(defaultCenter));
-    if (!center) {
-        return;
-    }
-
-    dyyyClearingFeedNowPlayingSystemInfo = YES;
-    @try {
-        if ([center respondsToSelector:@selector(setNowPlayingInfo:)]) {
-            ((void (*)(id, SEL, id))objc_msgSend)(center, @selector(setNowPlayingInfo:), nil);
-        }
-
-        SEL setPlaybackStateSelector = NSSelectorFromString(@"setPlaybackState:");
-        if ([center respondsToSelector:setPlaybackStateSelector]) {
-            ((void (*)(id, SEL, NSInteger))objc_msgSend)(center, setPlaybackStateSelector, 0);
-        }
-    } @catch (__unused NSException *exception) {
-    } @finally {
-        dyyyClearingFeedNowPlayingSystemInfo = NO;
-    }
-}
-
-static BOOL DYYYShouldBlockFeedNowPlayingSystemInfoWrite(void) {
-    return DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo") && !dyyyClearingFeedNowPlayingSystemInfo;
-}
+// 【已移除】原「信息流不显示播放信息」开关（DYYYDisableFeedNowPlayingInfo）全部代码：
+// 它会主动把系统 nowPlayingInfo 清成 nil，与「暂停后保留控制中心控件」目标相反，
+// 且实测就是导致卡片挂不上的干扰源之一。整块删除，不再保留任何分支。
 
 // ===== 后台保留控制中心播放控件（把抖音当音乐 App 用）=====
 // 实测根因（探针版日志，对照组在手）：抖音在【退后台瞬间】自己主动"收摊"——
@@ -1346,13 +1306,12 @@ static BOOL DYYYShouldBlockFeedNowPlayingSystemInfoWrite(void) {
 // 判据：用 applicationState != Active（Inactive 即命中），**不依赖通知投递时序**——
 // block 形式的通知观察者挂 mainQueue 是异步投递，可能晚于抖音的清空动作；
 // 而系统在 applicationWillResignActive 回调之前就已经把 state 置成 Inactive，必定命中。
-static BOOL DYYYIsAppBackgrounded(void) {
-    UIApplicationState s = [UIApplication sharedApplication].applicationState;
-    return s != UIApplicationStateActive;
-}
-
+// 托管判据：只要开关开着就全程托管（不再要求"非前台"）。
+// 实测教训：抖音是【暂停那一刻、还在前台】就把 nowPlayingInfo 清成 nil 的
+//（日志统计：nil 写入 26 次 vs 非空写入 8 次），等退后台才开托管窗口，
+// 系统里早就是空的，回天乏术。目标 = 暂停前后控制中心卡片内容保持一致。
 static BOOL DYYYShouldHoldNowPlaying(void) {
-    return DYYYGetBool(@"DYYYKeepNowPlayingInBackground") && DYYYIsAppBackgrounded();
+    return DYYYGetBool(@"DYYYKeepNowPlayingInBackground");
 }
 
 // 日志：5 秒窗口内最多 24 条。退后台那一串收摊动作必须**全打出来**——
@@ -1416,9 +1375,6 @@ static BOOL DYYYReassertNowPlayingState(void) {
     NSMutableDictionary *pub = [keep mutableCopy];
     pub[@"MPNowPlayingInfoPropertyPlaybackRate"] = @(0.0);
 
-    // 借 dyyyClearingFeedNowPlayingSystemInfo 绕过"信息流不显示播放信息"开关，
-    // 否则回写会被它当成抖音的写入直接吞掉。
-    dyyyClearingFeedNowPlayingSystemInfo = YES;
     @try {
         ((void (*)(id, SEL, id))objc_msgSend)(center, @selector(setNowPlayingInfo:), pub);
         SEL stateSel = NSSelectorFromString(@"setPlaybackState:");
@@ -1426,16 +1382,13 @@ static BOOL DYYYReassertNowPlayingState(void) {
             ((void (*)(id, SEL, NSInteger))objc_msgSend)(center, stateSel, 2); // 2 = Paused
         }
     } @catch (__unused NSException *e) {
-    } @finally {
-        dyyyClearingFeedNowPlayingSystemInfo = NO;
     }
     DYYYNpHoldLog(@"回写 nowPlayingInfo keys=%lu title=%@ + playbackState=Paused",
                   (unsigned long)pub.count, pub[@"title"] ?: @"-");
     return YES;
 }
 
-// 抖音收摊后连发三次（它偶尔会晚一步再清一次）。每次都要求"当下仍在后台"，
-// 回前台 / 恢复播放就自动放弃，一切交还抖音。
+// 抖音收摊后补发两次（它偶尔会晚一步再清一次）。开关关闭即放弃。
 static void DYYYScheduleNowPlayingReassert(void) {
     static NSTimeInterval lastSchedule = 0;
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
@@ -1443,10 +1396,10 @@ static void DYYYScheduleNowPlayingReassert(void) {
         return; // 一次收摊只排一次队（②③④会连着来）
     }
     lastSchedule = now;
-    for (NSNumber *d in @[@(0.4), @(1.5), @(3.0)]) {
+    for (NSNumber *d in @[@(0.3), @(1.2)]) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            if (!DYYYGetBool(@"DYYYKeepNowPlayingInBackground") || !DYYYIsAppBackgrounded()) {
+            if (!DYYYGetBool(@"DYYYKeepNowPlayingInBackground")) {
                 return;
             }
             DYYYReassertNowPlayingState();
@@ -1478,113 +1431,18 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
     return NO;
 }
 
-%hook AWEAwemeBackgroundPlayModule
-
-- (id)nowPlayingInfo {
-    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
-        DYYYClearFeedNowPlayingSystemInfoThrottled();
-        return nil;
-    }
-
-    return %orig;
-}
-
-- (void)refreshNowPlayingInfoIfNeeded {
-    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
-        DYYYClearFeedNowPlayingSystemInfoThrottled();
-        return;
-    }
-
-    %orig;
-}
-
-- (void)updateNowPlayingInfoPlayback {
-    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
-        DYYYClearFeedNowPlayingSystemInfoThrottled();
-        return;
-    }
-
-    %orig;
-}
-
-%end
-
-%hook AWEFeedBackgroundPlayManager
-
-- (id)nowPlayingInfo {
-    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
-        DYYYClearFeedNowPlayingSystemInfoThrottled();
-        return nil;
-    }
-
-    return %orig;
-}
-
-- (void)setNowPlayingInfo:(id)nowPlayingInfo {
-    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
-        DYYYClearFeedNowPlayingSystemInfoThrottled();
-        return;
-    }
-
-    %orig;
-}
-
-- (void)resetNowPlayingInfo:(id)model {
-    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
-        DYYYClearFeedNowPlayingSystemInfoThrottled();
-        return;
-    }
-
-    %orig;
-}
-
-- (void)refreshNowPlayingInfo {
-    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
-        DYYYClearFeedNowPlayingSystemInfoThrottled();
-        return;
-    }
-
-    %orig;
-}
-
-- (void)refreshNowPlayingInfoIsForce:(BOOL)isForce {
-    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
-        DYYYClearFeedNowPlayingSystemInfoThrottled();
-        return;
-    }
-
-    %orig;
-}
-
-- (void)updateNowPlayingInfoPlayback {
-    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
-        DYYYClearFeedNowPlayingSystemInfoThrottled();
-        return;
-    }
-
-    %orig;
-}
-
-%end
-
-// 采用 HideNowPlayingInfo 的强屏蔽思路：播放中心写入时直接清空系统 Now Playing，不再走原实现。
+// 【已移除】AWEAwemeBackgroundPlayModule / AWEFeedBackgroundPlayManager 两个 hook 块：
+// 它们只服务于已删除的「信息流不显示播放信息」开关（清空系统 nowPlayingInfo），
+// 与保留卡片的目标冲突，整块删除。抖音的播放信息走 AWENowPlayingInfoCenter，
+// 下面的托管逻辑直接在那里接管。
 %hook AWENowPlayingInfoCenter
 
-- (void)becomePlayingPlayer:(id)player {
-    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
-        DYYYClearFeedNowPlayingSystemInfoThrottled();
-        return;
-    }
-
-    %orig;
-}
-
-// playingPlayer 被置 nil = 抖音主动放弃"正在播放"角色（退后台收摊第①步）→ 托管窗口内吞掉。
-// 这是最上游的一刀：身份还在，系统就不会把它当成"已经停了"。
+// playingPlayer 被置 nil = 抖音主动放弃"正在播放"角色（收摊第①步）→ 托管中吞掉。
+// 关键：这一步在【前台点暂停】时同样发生（老板实测：不退界面卡片就没了），
+// 所以判据不能要求"非前台"，否则永远晚一步。
 - (void)setPlayingPlayer:(id)player {
     if (!player && DYYYShouldHoldNowPlaying()) {
         DYYYNpHoldLog(@"挡下 AWENowPlayingInfoCenter setPlayingPlayer:(nil)");
-        // 这是收摊第①步 = 抖音认为"我不在播了"。同时触发回写，把卡片重新挂上。
         DYYYScheduleNowPlayingReassert();
         return;
     }
@@ -1593,25 +1451,12 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 }
 
 - (void)setNowPlayingInfo:(id)nowPlayingInfo {
-    // 暂存抖音发布的非空信息（暂停前的真实内容），回写时要用
+    // 暂存抖音发布的非空信息（暂停前的真实内容：标题/作者/时长/进度/封面），回写时要用
     DYYYStashNowPlayingInfo(nowPlayingInfo);
-    // 退后台收摊第②步：清空抖音侧信息 → 托管窗口内吞掉
+    // 清空抖音侧信息（收摊第②步）→ 托管中吞掉。暂停那一刻就会来，必须挡。
     if (!nowPlayingInfo && DYYYShouldHoldNowPlaying()) {
         DYYYNpHoldLog(@"挡下 AWENowPlayingInfoCenter setNowPlayingInfo:(nil)");
         DYYYScheduleNowPlayingReassert();
-        return;
-    }
-    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
-        DYYYClearFeedNowPlayingSystemInfoThrottled();
-        return;
-    }
-
-    %orig;
-}
-
-- (void)refreshNowPlayingInfo {
-    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
-        DYYYClearFeedNowPlayingSystemInfoThrottled();
         return;
     }
 
@@ -1626,23 +1471,21 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 - (void)setNowPlayingInfo:(NSDictionary *)nowPlayingInfo {
     // 暂存抖音发布到系统的非空信息（回写时的内容来源）
     DYYYStashNowPlayingInfo(nowPlayingInfo);
-    // 退后台收摊第③步：清空系统侧信息（卡片被撤的直接原因）→ 托管窗口内吞掉
-    if (!nowPlayingInfo && DYYYShouldHoldNowPlaying()) {
-        DYYYNpHoldLog(@"挡下系统 MPNowPlayingInfoCenter setNowPlayingInfo:(nil)");
-        DYYYScheduleNowPlayingReassert();
-        return;
-    }
-    if (DYYYShouldBlockFeedNowPlayingSystemInfoWrite()) {
-        %orig(nil);
-        return;
-    }
 
-    %orig;
-}
-
-- (void)setPlaybackState:(NSInteger)playbackState {
-    if (DYYYShouldBlockFeedNowPlayingSystemInfoWrite()) {
-        %orig(0);
+    // 清空系统侧信息 = 卡片被撤的直接原因。托管中不吞掉，而是【同步】用暂存内容顶回去。
+    // 同步是重点：之前靠 dispatch_after 延后回写，App 退后台被系统挂起后 block 根本没跑
+    //（日志里回写记录 0 条，就是这个原因），所以必须在这里当场写回。
+    if (nowPlayingInfo.count == 0 && DYYYShouldHoldNowPlaying()) {
+        NSDictionary *keep = dyyyLastGoodNowPlayingInfo;
+        if (keep.count > 0) {
+            NSMutableDictionary *pub = [keep mutableCopy];
+            pub[@"MPNowPlayingInfoPropertyPlaybackRate"] = @(0.0);
+            %orig(pub);
+            DYYYNpHoldLog(@"同步顶回 nowPlayingInfo keys=%lu title=%@",
+                          (unsigned long)pub.count, pub[@"title"] ?: @"-");
+            return;
+        }
+        DYYYNpHoldLog(@"清空被挡但无暂存信息可顶回");
         return;
     }
 
@@ -14481,10 +14324,11 @@ static void findTargetViewInView(UIView *view) {
 
 %ctor {
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
-        @"DYYYDisableFeedNowPlayingInfo" : @YES,
         @"DYYYKeepNowPlayingInBackground" : @YES,
         @"DYYYDiagLog" : @YES
     }];
+    // 老版本遗留开关值清掉（该功能已移除，留着只会在设置页/调试时造成困惑）
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"DYYYDisableFeedNowPlayingInfo"];
 
     // 源头：扫描并批量拦截抖音"更新"相关类的动作方法（异步执行，不拖慢启动）
     if (DYYYGetBool(@"DYYYNoUpdates")) {

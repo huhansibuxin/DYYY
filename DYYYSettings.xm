@@ -50,8 +50,9 @@ static NSString *DYYYCurrentSpeedSettingsDisplayString(void) {
 static char kDYYYSettingsSearchCoordinatorKey;
 static BOOL DYYYBuildingSettingsSearchIndex = NO;
 static BOOL DYYYSettingsSearchIndexBuilt = NO;
-static NSString *const kDYYYFeedNowPlayingSettingTitle = @"屏蔽灵动岛抖音播放信息";
-static NSString *const kDYYYFeedNowPlayingSettingIdentifier = @"DYYYDisableFeedNowPlayingInfo";
+// 原「屏蔽灵动岛抖音播放信息」开关已整体移除（它会主动清空系统播放信息，与保留卡片目标冲突）。
+// 下面这个 identifier 现指向「暂停后保留控制中心控件」，仅用于给它套自定义图标。
+static NSString *const kDYYYFeedNowPlayingSettingIdentifier = @"DYYYKeepNowPlayingInBackground";
 static NSString *const kDYYYFeedNowPlayingSVGIconName = @"ic_liveactivityplayslash_outlined_20";
 
 static UIImage *DYYYFeedNowPlayingSVGIcon(CGSize requestedSize) {
@@ -1202,12 +1203,6 @@ void showDYYYSettingsVC(UIViewController *rootVC, BOOL hasAgreed) {
             @"detail" : @"",
             @"cellType" : @37,
             @"imageName" : @"ic_eyeslash_outlined_16"},
-          @{@"identifier" : @"DYYYDisableFeedNowPlayingInfo",
-            @"title" : kDYYYFeedNowPlayingSettingTitle,
-            @"subTitle" : @"开启后禁止信息流视频播放信息显示在灵动岛",
-            @"detail" : @"",
-            @"cellType" : @37,
-            @"imageName" : kDYYYFeedNowPlayingSVGIconName},
           @{@"identifier" : @"DYYYKeepNowPlayingInBackground",
             @"title" : @"暂停后保留控制中心控件",
             @"subTitle" : @"",
