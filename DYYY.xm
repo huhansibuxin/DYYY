@@ -9,6 +9,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
+#import <execinfo.h>
 #import <float.h>
 #import <math.h>
 #import <objc/message.h>
@@ -1310,6 +1311,78 @@ static void DYYYHandleCurrentSpeedAwemeChanged(id aweme) {
 // 实测教训：抖音是【暂停那一刻、还在前台】就把 nowPlayingInfo 清成 nil 的
 //（日志统计：nil 写入 26 次 vs 非空写入 8 次），等退后台才开托管窗口，
 // 系统里早就是空的，回天乏术。目标 = 暂停前后控制中心卡片内容保持一致。
+// ===== 【定位探针】找出"到底是谁在清空系统播放信息" =====
+// 老板要求：不打"清空→回写→再清空"的拉锯战，直接找到清空那个函数掐死（让它永远不清）。
+// 本段**只记录、不改变任何行为**，定位完成后整段删除。
+// 判定思路：
+//   ① 系统层 setNowPlayingInfo:/setPlaybackState: 全量留痕 + 调用者画像（dladdr 取镜像名+偏移，
+//      release 包符号被剥也能看出是主二进制还是哪个 framework 在动手）；
+//   ② dump 抖音 Now Playing 相关类的全部方法名，直接找 clear/reset/stop 语义的函数名；
+//   ③ 检查 iOS 16 的 MPNowPlayingSession（若抖音用它，卡片由系统自动管理，清空不走 setter）。
+static BOOL dyyyNpSelfWrite = NO; // 标记我们自己的回写，避免自记噪音
+
+// 调用者画像：最多 4 帧，输出「符号名@镜像名」或「镜像名+偏移」
+static NSString *DYYYNPWhoCalled(void) {
+    void *frames[10];
+    int n = backtrace(frames, 10);
+    if (n <= 2) {
+        return @"(no-stack)";
+    }
+    NSMutableArray *arr = [NSMutableArray array];
+    for (int i = 2; i < n && arr.count < 4; i++) {
+        Dl_info info;
+        if (dladdr(frames[i], &info) && info.dli_fname) {
+            NSString *img = [[NSString stringWithUTF8String:info.dli_fname] lastPathComponent];
+            if (info.dli_sname) {
+                [arr addObject:[NSString stringWithFormat:@"%s@%@", info.dli_sname, img]];
+            } else {
+                unsigned long off = (unsigned long)frames[i] - (unsigned long)info.dli_fbase;
+                [arr addObject:[NSString stringWithFormat:@"%@+0x%lx", img, off]];
+            }
+        }
+    }
+    return arr.count ? [arr componentsJoinedByString:@" < "] : @"(unknown)";
+}
+
+// dump 抖音 Now Playing 相关类的全部方法名，挑出 clear/reset/stop 语义的可疑函数
+static void DYYYNpDumpClassMethods(void) {
+    NSArray *names = @[@"AWENowPlayingInfoCenter", @"AWEFeedBackgroundPlayManager",
+                       @"AWEAwemeBackgroundPlayModule", @"AWEAwemeBackgroundPlayManager",
+                       @"AWENowPlayingInfoManager", @"AWEMediaPlayerManager",
+                       @"AWEAwemePlayManager", @"AWEPlayControlManager"];
+    for (NSString *n in names) {
+        Class c = NSClassFromString(n);
+        if (!c) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[np2] 类 %@ 不存在", n]);
+            continue;
+        }
+        NSMutableArray *all = [NSMutableArray array];
+        NSMutableArray *sus = [NSMutableArray array];
+        unsigned int cnt = 0;
+        Method *ms = class_copyMethodList(c, &cnt);
+        for (unsigned int i = 0; i < cnt; i++) {
+            NSString *s = NSStringFromSelector(method_getName(ms[i]));
+            if (all.count < 200) {
+                [all addObject:s];
+            }
+            NSString *ls = s.lowercaseString;
+            if ([ls containsString:@"clear"] || [ls containsString:@"reset"] ||
+                [ls containsString:@"remove"] || [ls containsString:@"stop"] ||
+                [ls containsString:@"invalid"] || [ls containsString:@"pause"] ||
+                [ls containsString:@"leave"] || [ls containsString:@"end"]) {
+                [sus addObject:s];
+            }
+        }
+        if (ms) {
+            free(ms);
+        }
+        DYYYSpeedDiag([NSString stringWithFormat:@"[np2] 类 %@ 方法数=%u 可疑=(%@)", n, cnt, sus]);
+        DYYYSpeedDiag([NSString stringWithFormat:@"[np2] 类 %@ 全部方法=(%@)", n, all]);
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np2] MPNowPlayingSession 存在=%d",
+                   (int)(NSClassFromString(@"MPNowPlayingSession") != nil)]);
+}
+
 static BOOL DYYYShouldHoldNowPlaying(void) {
     return DYYYGetBool(@"DYYYKeepNowPlayingInBackground");
 }
@@ -1376,12 +1449,23 @@ static BOOL DYYYReassertNowPlayingState(void) {
     pub[@"MPNowPlayingInfoPropertyPlaybackRate"] = @(0.0);
 
     @try {
+        dyyyNpSelfWrite = YES;
         ((void (*)(id, SEL, id))objc_msgSend)(center, @selector(setNowPlayingInfo:), pub);
         SEL stateSel = NSSelectorFromString(@"setPlaybackState:");
         if ([center respondsToSelector:stateSel]) {
             ((void (*)(id, SEL, NSInteger))objc_msgSend)(center, stateSel, 2); // 2 = Paused
         }
+        dyyyNpSelfWrite = NO;
+        // 【定位探针】回读验证：我们的回写到底有没有真的落进系统播放中心
+        id back = ((id (*)(id, SEL))objc_msgSend)(center, @selector(nowPlayingInfo));
+        unsigned long backCnt = 0;
+        if ([back isKindOfClass:[NSDictionary class]]) {
+            backCnt = (unsigned long)[(NSDictionary *)back count];
+        }
+        DYYYSpeedDiag([NSString stringWithFormat:@"[np2] REWRITE 写入=%lu 回读=%lu",
+                       (unsigned long)pub.count, backCnt]);
     } @catch (__unused NSException *e) {
+        dyyyNpSelfWrite = NO;
     }
     DYYYNpHoldLog(@"回写 nowPlayingInfo keys=%lu title=%@ + playbackState=Paused",
                   (unsigned long)pub.count, pub[@"title"] ?: @"-");
@@ -1469,6 +1553,12 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 %hook MPNowPlayingInfoCenter
 
 - (void)setNowPlayingInfo:(NSDictionary *)nowPlayingInfo {
+    // 【定位探针】全量留痕：谁、什么时候、把系统播放信息写成什么
+    if (!dyyyNpSelfWrite) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[np2] SET %@ cnt=%lu | %@",
+                       nowPlayingInfo ? @"info" : @"NIL",
+                       (unsigned long)nowPlayingInfo.count, DYYYNPWhoCalled()]);
+    }
     // 暂存抖音发布到系统的非空信息（回写时的内容来源）
     DYYYStashNowPlayingInfo(nowPlayingInfo);
 
@@ -1480,15 +1570,58 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
         if (keep.count > 0) {
             NSMutableDictionary *pub = [keep mutableCopy];
             pub[@"MPNowPlayingInfoPropertyPlaybackRate"] = @(0.0);
+            dyyyNpSelfWrite = YES;
             %orig(pub);
+            dyyyNpSelfWrite = NO;
             DYYYNpHoldLog(@"同步顶回 nowPlayingInfo keys=%lu title=%@",
                           (unsigned long)pub.count, pub[@"title"] ?: @"-");
-            return;
+        } else {
+            DYYYNpHoldLog(@"清空被挡但无暂存信息可顶回");
         }
-        DYYYNpHoldLog(@"清空被挡但无暂存信息可顶回");
+        // 【定位探针】回读：确认系统侧现在实际是什么（验证"回写到底有没有落地"）
+        NSDictionary *actual = [self nowPlayingInfo];
+        DYYYSpeedDiag([NSString stringWithFormat:@"[np2] AFTER readback cnt=%lu title=%@",
+                       (unsigned long)actual.count, actual[@"title"] ?: @"-"]);
         return;
     }
 
+    %orig;
+}
+
+// 【定位探针】播放态声明：音乐 App 暂停时会置 Paused，看抖音/系统到底有没有动过
+- (void)setPlaybackState:(NSInteger)playbackState {
+    if (!dyyyNpSelfWrite) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[np2] STATE %ld | %@",
+                       (long)playbackState, DYYYNPWhoCalled()]);
+    }
+    %orig;
+}
+
+%end
+
+// 【定位探针】会话层：确认卡片消失是不是因为 AVAudioSession 被置为 inactive
+%hook AVAudioSession
+
+- (BOOL)setActive:(BOOL)active error:(NSError **)outError {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np2] SESSION setActive:%d cat=%@ | %@",
+                   (int)active, [self category], DYYYNPWhoCalled()]);
+    return %orig;
+}
+
+- (BOOL)setActive:(BOOL)active withOptions:(AVAudioSessionSetActiveOptions)options error:(NSError **)outError {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np2] SESSION setActive:%d opts=%lu | %@",
+                   (int)active, (unsigned long)options, DYYYNPWhoCalled()]);
+    return %orig;
+}
+
+%end
+
+// 【定位探针】iOS 16 的 MPNowPlayingSession：若抖音用它，卡片归系统自动管理，清空不走 setter
+%hook MPNowPlayingSession
+
+- (void)setAutomaticallyPublishesNowPlayingInfo:(BOOL)value {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np2] SESSION autoPublish=%d | %@",
+                   (int)value, DYYYNPWhoCalled()]);
     %orig;
 }
 
@@ -4574,6 +4707,19 @@ static void DYYYBlockUpdateClassesOnce(void) {
             return;
         }
     }
+    %orig;
+}
+
+// 【定位探针】播放器停播的标准动作——调用 endReceivingRemoteControlEvents 后系统会撤掉
+// 控制中心卡片。这是"卡片消失"的另一个经典嫌疑，必须留痕。
+- (void)beginReceivingRemoteControlEvents {
+    DYYYSpeedDiag(@"[np2] beginReceivingRemoteControlEvents");
+    %orig;
+}
+
+- (void)endReceivingRemoteControlEvents {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np2] endReceivingRemoteControlEvents | %@",
+                   DYYYNPWhoCalled()]);
     %orig;
 }
 %end
@@ -14338,6 +14484,13 @@ static void findTargetViewInView(UIView *view) {
     }
 
     DYYYMigrateCombinedHDRModeIfNeeded();
+
+    // 【定位探针】延迟 dump 抖音 Now Playing 相关类的方法清单（异步、只读、一次性），
+    // 用来直接找出"清空"那个函数名。定位完成后连同 [np2] 探针一起删除。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+        DYYYNpDumpClassMethods();
+    });
 
     Class interactionBaseLabelClass = objc_getClass("AWECommentSwiftBizUI.CommentInteractionBaseLabel");
     if (interactionBaseLabelClass) {
