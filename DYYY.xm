@@ -13585,8 +13585,8 @@ static void DYYYRemoveKeyboardObserver(void) {
     // 降级为参考日志，真正的排除项用 launchOptions——推送/bg fetch/VoIP 拉起都带对应 key。
     @try {
         UIApplicationState st = [UIApplication sharedApplication].applicationState;
-        BOOL pulledByPush = launchOptions[UIApplicationLaunchOptionsRemoteNotificationKey] != nil ||
-                            launchOptions[UIApplicationLaunchOptionsBackgroundFetchingKey] != nil;
+        BOOL pulledByPush = launchOptions[@"UIApplicationLaunchOptionsRemoteNotificationKey"] != nil ||
+                            launchOptions[@"UIApplicationLaunchOptionsBackgroundFetchingKey"] != nil;
         if (st == UIApplicationStateBackground && !pulledByPush) {
             double stamp = [[NSUserDefaults standardUserDefaults] doubleForKey:kDYYYColdResumeStampKey];
             NSTimeInterval age = stamp > 0 ? [[NSDate date] timeIntervalSince1970] - stamp : -1;
