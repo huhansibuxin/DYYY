@@ -1771,13 +1771,15 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 // 【定位探针】iOS 16 的 MPNowPlayingSession：若抖音用它，卡片归系统自动管理，清空不走 setter
 %hook MPNowPlayingSession
 
+// [np3] 注意：不要在这里写 [self class] —— Logos 生成代码里 MPNowPlayingSession 是前向声明，
+// 对该类型发消息会报 "receiver type for instance message is a forward declaration" 并让 clang 段错误。
 - (id)initWithPlayers:(NSArray *)players {
-    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] MPNowPlayingSession initWithPlayers count=%lu 类=%@",
-                   (unsigned long)players.count, NSStringFromClass([self class])]);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np3] MPNowPlayingSession initWithPlayers count=%lu",
+                   (unsigned long)players.count]);
     return %orig;
 }
 
-- (instancetype)initWithActivePlayer:(id)player {
+- (id)initWithActivePlayer:(id)player {
     DYYYSpeedDiag([NSString stringWithFormat:@"[np3] MPNowPlayingSession initWithActivePlayer %@",
                    player ? NSStringFromClass([player class]) : @"(nil)"]);
     return %orig;
