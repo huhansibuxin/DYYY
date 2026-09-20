@@ -1699,6 +1699,20 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
     %orig;
 }
 
+// 【v5 新发现】forbidResumePlayFromBackground = "禁止从后台恢复播放"（dump 方法表里扒出来的）。
+// 老板实测："控制中心那个播放按钮，它会打开最开始那个视频，就是不会播放" —— 这条 getter 就是
+// 那个"不会播放"的开关：抖音暂停后退后台把它置 YES，于是远程 play 命令即使被收到也被拒绝，
+// 只剩下"切回前台打开视频"的残action。托管中强制 NO，让抖音自己的 handlePlayCommand 真正续播
+//（它才是唯一知道"当前该播哪一条"的人，我们不猜它的播放上下文）。
+- (BOOL)forbidResumePlayFromBackground {
+    BOOL v = %orig;
+    if (v && DYYYShouldHoldNowPlaying()) {
+        DYYYSpeedDiag(@"[np5] forbidResumePlayFromBackground=YES → 托管中强制 NO（让后台点播放真能续播）");
+        return NO;
+    }
+    return v;
+}
+
 %end
 
 // 耳机或系统媒体会话可能绕过抖音播放中心，最终都要写入 MPNowPlayingInfoCenter。
@@ -1751,6 +1765,13 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 
 %end
 
+// 【v5】环境音类判定：Ambient / SoloAmbient 表示"我不打算当主音频"，
+// 一旦切到这两类，系统立刻不再把该 App 视作 Now Playing App。
+static BOOL DYYYIsAmbientCategory(NSString *c) {
+    return [c isEqualToString:AVAudioSessionCategoryAmbient] ||
+           [c isEqualToString:AVAudioSessionCategorySoloAmbient];
+}
+
 // 【定位探针】会话层：确认卡片消失是不是因为 AVAudioSession 被置为 inactive
 %hook AVAudioSession
 
@@ -1763,6 +1784,58 @@ static BOOL DYYYIsPreservedPlaybackCommand(id cmd) {
 - (BOOL)setActive:(BOOL)active withOptions:(AVAudioSessionSetActiveOptions)options error:(NSError **)outError {
     DYYYSpeedDiag([NSString stringWithFormat:@"[np2] SESSION setActive:%d opts=%lu | %@",
                    (int)active, (unsigned long)options, DYYYNPWhoCalled()]);
+    return %orig;
+}
+
+// ===== 【v5 定位+保护】audio session 类别层 =====
+// WWDC2019-501 原话：App 成为 Now Playing App 有两个硬条件——① 至少支持一条远程命令
+//（我们已保住）② 用【非 mixable 的播放类别】激活 audio session。
+// 抖音暂停后若把类别从 Playback 降到 Ambient/SoloAmbient（或给 Playback 挂上 MixWithOthers），
+// 系统立刻撤销其 Now Playing 资格 → 卡片消失。这条路【完全绕过】我们 hook 的全部 ObjC 清空方法，
+// 正好解释铁证里的悖论：拦下 110 次 setPlayingPlayer:nil、系统 nowPlayingInfo 始终 7 键非空，卡片照样掉。
+// 保护范围刻意收紧：只在【当前是 Playback 且要降级】时拦（这是"主动放弃播放身份"的明确语义），
+// PlayAndRecord/Record 等一律原样放行 —— 绝不碰抖音的拍摄、直播、语音输入。
+- (BOOL)setCategory:(AVAudioSessionCategory)category error:(NSError **)outError {
+    NSString *cur = [self category];
+    BOOL downgrade = [cur isEqualToString:AVAudioSessionCategoryPlayback] && DYYYIsAmbientCategory(category);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np5] setCategory=%@ (当前=%@) | %@", category, cur, DYYYNPWhoCalled()]);
+    if (downgrade && DYYYShouldHoldNowPlaying()) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[np5] 拦下 setCategory=%@（会失去 Now Playing 资格）→ 强制 Playback", category]);
+        return %orig(AVAudioSessionCategoryPlayback, outError);
+    }
+    return %orig;
+}
+
+- (BOOL)setCategory:(AVAudioSessionCategory)category withOptions:(AVAudioSessionCategoryOptions)options error:(NSError **)outError {
+    NSString *cur = [self category];
+    BOOL downgrade = [cur isEqualToString:AVAudioSessionCategoryPlayback] && DYYYIsAmbientCategory(category);
+    AVAudioSessionCategoryOptions clean = options & ~AVAudioSessionCategoryOptionMixWithOthers;
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np5] setCategory=%@ opts=%lu (当前=%@) | %@",
+                   category, (unsigned long)options, cur, DYYYNPWhoCalled()]);
+    if (DYYYShouldHoldNowPlaying() && (downgrade || clean != options)) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[np5] 拦下并修正 setCategory（downgrade=%d opts %lu→%lu）",
+                       (int)downgrade, (unsigned long)options, (unsigned long)clean]);
+        return %orig(downgrade ? AVAudioSessionCategoryPlayback : category, clean, outError);
+    }
+    return %orig;
+}
+
+- (BOOL)setCategory:(AVAudioSessionCategory)category mode:(AVAudioSessionMode)mode options:(AVAudioSessionCategoryOptions)options error:(NSError **)outError {
+    NSString *cur = [self category];
+    BOOL downgrade = [cur isEqualToString:AVAudioSessionCategoryPlayback] && DYYYIsAmbientCategory(category);
+    AVAudioSessionCategoryOptions clean = options & ~AVAudioSessionCategoryOptionMixWithOthers;
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np5] setCategory=%@ mode=%@ opts=%lu (当前=%@) | %@",
+                   category, mode, (unsigned long)options, cur, DYYYNPWhoCalled()]);
+    if (DYYYShouldHoldNowPlaying() && (downgrade || clean != options)) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[np5] 拦下并修正 setCategory:mode:options:（downgrade=%d opts %lu→%lu）",
+                       (int)downgrade, (unsigned long)options, (unsigned long)clean]);
+        return %orig(downgrade ? AVAudioSessionCategoryPlayback : category, mode, clean, outError);
+    }
+    return %orig;
+}
+
+- (BOOL)setMode:(AVAudioSessionMode)mode error:(NSError **)outError {
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np5] setMode=%@ | %@", mode, DYYYNPWhoCalled()]);
     return %orig;
 }
 
@@ -14634,7 +14707,66 @@ static void findTargetViewInView(UIView *view) {
     }
 }
 
+// ===== 【v5】MediaRemote 私有 C 层：撤销"可作为 Now Playing App"的身份 =====
+// 这是最后一条能【绕过所有 ObjC setter】让控制中心卡片消失的路径。签名已联网核实，不靠猜：
+//   BOOL MRMediaRemoteSetCanBeNowPlayingApplication(BOOL);
+//   void MRMediaRemoteSetNowPlayingApplicationOverrideEnabled(BOOL);
+// 抖音（或它调用的 MediaPlayer 栈）一旦把 canBe 置 0，系统就当它自愿退出 now playing；
+// 此后无论 nowPlayingInfo 多完整（实测始终 7 键非空）、远程命令多齐全，卡片都不会再显示。
+// 这与"拦下 110 次 setPlayingPlayer:nil 卡片照样掉"的悖论完全吻合。
+typedef BOOL (*DYYYMRCanBeFn)(BOOL);
+typedef void (*DYYYMROverrideFn)(BOOL);
+static DYYYMRCanBeFn dyyyOrigMRCanBe = NULL;
+static DYYYMROverrideFn dyyyOrigMROverride = NULL;
+
+static BOOL dyyyHookMRCanBe(BOOL canBe) {
+    if (!canBe) {
+        DYYYSpeedDiag(@"[np5] MRSetCanBeNowPlayingApplication(0) ← 有人在撤 Now Playing 身份");
+        if (DYYYShouldHoldNowPlaying()) {
+            DYYYSpeedDiag(@"[np5] 拦下 MRSetCanBeNowPlayingApplication(0)（托管中不允许撤身份）");
+            return YES;
+        }
+    }
+    return dyyyOrigMRCanBe ? dyyyOrigMRCanBe(canBe) : NO;
+}
+
+static void dyyyHookMROverride(BOOL enabled) {
+    if (!enabled) {
+        DYYYSpeedDiag(@"[np5] MRSetNowPlayingApplicationOverrideEnabled(0)");
+        if (DYYYShouldHoldNowPlaying()) {
+            DYYYSpeedDiag(@"[np5] 拦下 MRSetNowPlayingApplicationOverrideEnabled(0)（托管中保留覆盖）");
+            return;
+        }
+    }
+    if (dyyyOrigMROverride) {
+        dyyyOrigMROverride(enabled);
+    }
+}
+
+// 安装：只 hook 上面两条【签名已核实】的函数。MRMediaRemoteSetNowPlayingInfo 的签名有歧义
+//（可能带 mergePolicy 第二参数），传参不当会污染第二个寄存器，故不 hook —— 宁可少一条证据，
+// 不冒崩溃风险。
+static void DYYYInstallMediaRemoteHooks(void) {
+    void *mr = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_NOW);
+    if (!mr) {
+        DYYYSpeedDiag(@"[np5] MediaRemote dlopen 失败，跳过身份层 hook");
+        return;
+    }
+    void *s1 = dlsym(mr, "MRMediaRemoteSetCanBeNowPlayingApplication");
+    void *s2 = dlsym(mr, "MRMediaRemoteSetNowPlayingApplicationOverrideEnabled");
+    if (s1) {
+        MSHookFunction(s1, (void *)dyyyHookMRCanBe, (void **)&dyyyOrigMRCanBe);
+    }
+    if (s2) {
+        MSHookFunction(s2, (void *)dyyyHookMROverride, (void **)&dyyyOrigMROverride);
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[np5] MediaRemote 身份层 hook 安装 canBe=%d override=%d",
+                   s1 != NULL, s2 != NULL]);
+}
+
 %ctor {
+    DYYYInstallMediaRemoteHooks();
+
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
         @"DYYYKeepNowPlayingInBackground" : @YES,
         @"DYYYDiagLog" : @YES
