@@ -1386,6 +1386,119 @@ static BOOL DYYYShouldHoldNowPlaying(void) {
     return DYYYGetBool(@"DYYYKeepNowPlayingInBackground");
 }
 
+// ===== ⭐⭐【v25 判据换源】"当前视频是谁"正式改用【抖音自己握着的 aweme】 =====
+// 依据 diag/v24_check.log 的决定性读数（11 次模块条目可读）：
+//   · 7 次与系统侧一致、4 次是"模块已换新条目而系统侧仍挂旧文字"、**0 次落后**
+//     → 模块的 _model 只会领先、绝不指错，是唯一可信的"当前视频"。
+//   · 而我们用了一整轮（v17~v24）的 dyyyCurrentAwemeTitle 取自 _delegate（那个
+//     复用的 AWEPlayVideoViewController），实测准度【只有 15%（17/112）】——
+//     整套兜底链"0 发射"、"63% 催发白发"的根因就在这里：期望值本身是错的。
+//   · ivar 清单（类:背景播放模块 ivar(18)）给出了字段名：_model:AWEAwemeModel、
+//     _currentNowPlayingInfo:NSMutableDictionary、_fromID:NSString。
+// 读 _model 只走 object_getIvar（对象型），不做任何 KVC/强转，零崩溃风险。
+static id DYYYModuleAwemeModel(id mod) {
+    if (!mod || [mod isKindOfClass:[NSNull class]]) {
+        return nil;
+    }
+    @try {
+        Ivar iv = class_getInstanceVariable([mod class], "_model");
+        if (!iv) {
+            return nil;
+        }
+        const char *enc = ivar_getTypeEncoding(iv);
+        if (!enc || enc[0] != '@' || enc[1] == '?') {
+            return nil;
+        }
+        return object_getIvar(mod, iv);
+    } @catch (__unused NSException *e) {
+        return nil;
+    }
+}
+
+// 模块握着的当前视频标题（没握着 = 模块此刻没有可播条目 → 控制中心点播放会没有落点）
+static NSString *DYYYModuleAwemeTitle(id mod) {
+    return DYYYAwemeTitleText(DYYYModuleAwemeModel(mod));
+}
+
+// aweme 的唯一 id —— 用 id 比对落点比标题可靠（标题会被话题/长度截断）。
+// 按"先 getter（严格校验返回类型）再 ivar"的顺序取，取不到就返回 nil（不猜）。
+static NSString *DYYYAwemeItemID(id aweme) {
+    if (!aweme) {
+        return nil;
+    }
+    Class cls = [aweme class];
+    for (NSString *g in @[@"itemID", @"awemeID", @"awemeId", @"itemId", @"aid"]) {
+        SEL sel = NSSelectorFromString(g);
+        if (![aweme respondsToSelector:sel]) {
+            continue;
+        }
+        Method mm = class_getInstanceMethod(cls, sel);
+        if (!mm) {
+            continue;
+        }
+        char rt[8] = {0};
+        method_getReturnType(mm, rt, sizeof(rt));
+        if (rt[0] != '@') {
+            continue;                    // 只要返回对象的，防 NSInteger 强转 id
+        }
+        @try {
+            id v = ((id (*)(id, SEL))objc_msgSend)(aweme, sel);
+            if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) {
+                return (NSString *)v;
+            }
+        } @catch (__unused NSException *e) {
+        }
+    }
+    for (NSString *ivn in @[@"_itemID", @"_awemeID", @"_aid"]) {
+        Ivar iv = class_getInstanceVariable(cls, ivn.UTF8String);
+        if (!iv) {
+            continue;
+        }
+        const char *enc = ivar_getTypeEncoding(iv);
+        if (!enc || enc[0] != '@') {
+            continue;
+        }
+        @try {
+            id v = object_getIvar(aweme, iv);
+            if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) {
+                return (NSString *)v;
+            }
+        } @catch (__unused NSException *e) {
+        }
+    }
+    return nil;
+}
+
+// 【v25】把"抖音自己重建当前条目"这条原生路径催一下 —— 它是实测唯一有效的杠杆。
+// 实证（diag/v24_check.log 18:50:30 → 18:50:32）：模块重新上岗后 2 秒内，
+//   抖音打了「模块收下当前条目 cnt=2 title=稀有祖宗」，紧接着「系统发布 title=稀有祖宗」。
+// 用的方法是模块自己的 updateNowPlayingInfoWhenResiginActive（催发链已在用，不是新发明），
+// 会依据 _model 重建 _currentNowPlayingInfo 并重新发布 → 控制中心文字跟着走。
+// 只在"确有新条目且系统侧没跟上"时调用，节流 1s，不做轮询、不加定时器。
+static void DYYYAskDouyinRebuildNowPlaying(id mod, NSString *why) {
+    if (!mod) {
+        return;
+    }
+    static NSTimeInterval lastAsk = 0;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - lastAsk < 1.0) {
+        return;
+    }
+    lastAsk = now;
+    SEL updateSel = NSSelectorFromString(@"updateNowPlayingInfoWhenResiginActive");
+    if (![mod respondsToSelector:updateSel]) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ↻ 重建当前条目(%@)：模块无 updateNowPlayingInfoWhenResiginActive", why]);
+        return;
+    }
+    @try {
+        ((void (*)(id, SEL))objc_msgSend)(mod, updateSel);
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ↻ 重建当前条目(%@)：已催抖音按 _model 重发（催前系统侧=%@）",
+            why, DYYYCurrentSystemNPTitle() ?: @"-"]);
+    } @catch (__unused NSException *e) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ↻ 重建当前条目(%@)：exception（已忽略）", why]);
+    }
+}
+
 // 切视频留痕 + 记录"当前视频是谁"（兜底前的一致性校验靠它）。
 // 【v17】改成带来源参数的多候选挂点：v16 只挂在 AWEFeedContainerViewController
 // 的 aweme:currentIndexDidChange: 上，实测【0 命中】——抖音 8.0.37 划视频不走那里
@@ -1682,19 +1795,23 @@ static void DYYYBoostNowPlayingAfterPause(void) {
             NSDictionary *sysLive = DYYYCurrentSystemNPInfo();
             NSString *sysLiveTitle = [sysLive[@"title"] isKindOfClass:[NSString class]] ? sysLive[@"title"] : nil;
             BOOL sysHasContent = (sysLive.count > 0 && sysLiveTitle.length > 0);
-            if (sysHasContent && dyyyCurrentAwemeTitle.length > 0 &&
-                [sysLiveTitle isEqualToString:dyyyCurrentAwemeTitle]) {
+            // ⭐⭐【v25 判据换源】"当前视频"改用模块自己握的 _model（权威、只领先不落后），
+            // 不再用 dyyyCurrentAwemeTitle（取自复用的 _delegate，实测 15% 准）。
+            // 这是"兜底拒绝：缓存不属于当前视频"屡屡误判的根因 —— 以前拿邻页标题去比对。
+            NSString *truthTitle = DYYYModuleAwemeTitle(dyyyBGPlayModuleInstance) ?: @"";
+            if (sysHasContent && truthTitle.length > 0 && [sysLiveTitle isEqualToString:truthTitle]) {
                 DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 兜底放弃：系统侧已是当前视频 title=%@", sysLiveTitle]);
                 return;
             }
-            if (sysHasContent && dyyyCurrentAwemeTitle.length == 0) {
-                // 当前视频未知（本轮没抓到切视频事件）→ 无从比对，保守收手，宁可不发也不发错。
-                DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 兜底放弃：系统侧有内容(当前视频未知) title=%@", sysLiveTitle]);
+            if (sysHasContent && truthTitle.length == 0) {
+                // 模块此刻没握当前条目（抖音尚未交回）→ 无从比对，保守收手，宁可不发也不发错。
+                DYYYSpeedDiag([NSString stringWithFormat:
+                    @"[npv] 兜底放弃：系统侧有内容且模块未握条目 title=%@", sysLiveTitle]);
                 return;
             }
             if (sysHasContent) {
                 DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 系统侧≠当前视频(系统=%@ | 当前=%@) → 继续兜底",
-                    sysLiveTitle, dyyyCurrentAwemeTitle]);
+                    sysLiveTitle, truthTitle]);
             }
 
             // ② 【v15.1】原生链兜底单发。15:54 实测定案：抖音的
@@ -1730,10 +1847,10 @@ static void DYYYBoostNowPlayingAfterPause(void) {
             // 治的正是"退回后台/暂停后卡片还是上一条"——根因就是兜底把旧缓存顶上去了。
             // 只在两边都有明确标题时才判定，避免数据缺失时误伤（缺任一就按原逻辑走）。
             NSString *cachedTitle = [cached[@"title"] isKindOfClass:[NSString class]] ? cached[@"title"] : nil;
-            if (cachedTitle.length > 0 && dyyyCurrentAwemeTitle.length > 0 &&
-                ![cachedTitle isEqualToString:dyyyCurrentAwemeTitle]) {
+            if (cachedTitle.length > 0 && truthTitle.length > 0 &&
+                ![cachedTitle isEqualToString:truthTitle]) {
                 DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 兜底拒绝：缓存(%@)不属于当前视频(%@)",
-                    cachedTitle, dyyyCurrentAwemeTitle]);
+                    cachedTitle, truthTitle]);
                 return;
             }
             @try {
@@ -1781,7 +1898,10 @@ static void DYYYCutVideoNudge(void) {
     }
     lastNudge = now;
 
-    NSString *expectTitle = dyyyCurrentAwemeTitle ?: @"";
+    // ⭐⭐【v25 判据换源】期望 = 模块自己握着的当前条目（_model），
+    // 不再用 dyyyCurrentAwemeTitle（来自复用的 _delegate，实测只有 15% 准）。
+    // 模块没握条目 = 抖音此刻没有可播的当前视频 → 直接不催，不再空转打日志。
+    __block NSString *expectTitle = DYYYModuleAwemeTitle(dyyyBGPlayModuleInstance) ?: @"";
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -1792,7 +1912,16 @@ static void DYYYCutVideoNudge(void) {
         if (!m) {
             return;
         }
+        // 【v25】模块没握条目 → 催也没意义（它自己都不知道当前是哪条）。
+        NSString *modTitleNow = DYYYModuleAwemeTitle(m);
+        if (modTitleNow.length == 0) {
+            DYYYSpeedDiag(@"[npv] 切视频催发跳过：模块此刻未握当前条目(_model 为空)");
+            return;
+        }
         NSString *sysTitle0 = DYYYCurrentSystemNPTitle() ?: @"-";
+        if (expectTitle.length == 0) {
+            expectTitle = modTitleNow;      // 0.4s 前还没握、现在握上了 → 用实时值
+        }
         if (expectTitle.length > 0 && [sysTitle0 isEqualToString:expectTitle]) {
             DYYYSpeedDiag(@"[npv] 切视频催发:系统侧已跟上，跳过");
             return;
@@ -2128,12 +2257,48 @@ static NSString *DYYYIvarSummary(id obj, Ivar iv) {
         return [NSString stringWithFormat:@"%s=<%@> 标题=%@", name, cls,
             [t substringToIndex:MIN(t.length, (NSUInteger)26)]];
     }
+    if ([v isKindOfClass:[NSDictionary class]]) {
+        // 【v25】字典型 ivar 打键名 —— _currentNowPlayingInfo 里"哪个键装标题"一直是黑盒，
+        // 有了键名才能在需要时精确补键（催发链里已见 title 键，这里做全量确认）。
+        NSArray *keys = [(NSDictionary *)v allKeys];
+        NSString *ks = [[keys sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@","];
+        return [NSString stringWithFormat:@"%s=<%@> 键(%lu)=[%@]", name, cls,
+            (unsigned long)keys.count, [ks substringToIndex:MIN(ks.length, (NSUInteger)140)]];
+    }
     if ([v isKindOfClass:[NSString class]]) {
         NSString *s = (NSString *)v;
         return [NSString stringWithFormat:@"%s=<%@> %@", name, cls,
             [s substringToIndex:MIN(s.length, (NSUInteger)26)]];
     }
     return [NSString stringWithFormat:@"%s=<%@>", name, cls];
+}
+
+// 【v25】一次性打类的方法清单（可只挑名字含关键字的），用来定位"抖音自己怎么重建当前条目"。
+static void DYYYDumpMethodNames(Class cls, NSString *label, NSString *filter) {
+    if (!cls) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv-shape] 方法 %@ 类未加载", label]);
+        return;
+    }
+    unsigned int n = 0;
+    Method *ms = class_copyMethodList(cls, &n);
+    if (!ms) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv-shape] 方法 %@ 不可读", label]);
+        return;
+    }
+    NSMutableArray *names = [NSMutableArray array];
+    for (unsigned int i = 0; i < n; i++) {
+        NSString *sn = NSStringFromSelector(method_getName(ms[i])) ?: @"";
+        if (filter.length > 0 && [sn rangeOfString:filter options:NSCaseInsensitiveSearch].location == NSNotFound) {
+            continue;
+        }
+        char rt[16] = {0};
+        method_getReturnType(ms[i], rt, sizeof(rt));
+        [names addObject:[NSString stringWithFormat:@"%s(%s)", sn.UTF8String, rt[0] ? rt : "?"]];
+    }
+    free(ms);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[npv-shape] 方法 %@ 共%u条 命中%lu条 = %@",
+        label, n, (unsigned long)names.count,
+        names.count ? [names componentsJoinedByString:@" "] : @"(无命中)"]);
 }
 
 // 一次性把类的 ivar 清单打出来（名字+类型），供我们判断该读哪个字段。
@@ -2230,6 +2395,12 @@ static void DYYYDumpAwemeSourceShapes(void) {
     DYYYDumpClassIvars(NSClassFromString(@"AWEFeedBackgroundPlayManager"), @"类:后台播放管理");
     DYYYDumpClassIvars(NSClassFromString(@"AWEAwemeModel"), @"类:aweme模型");
     DYYYDumpClassIvars(NSClassFromString(@"AWEDPlayerViewController_Merge"), @"类:播放器VC");
+    // 【v25】方法清单：v24 已证实模块的 _model 是权威源，本轮要看的是
+    // "抖音自己用什么方法按 _model 重建 _currentNowPlayingInfo"（催发链已见
+    // updateNowPlayingInfoWhenResiginActive，这里把家族全列出来，选最正的那一个）。
+    DYYYDumpMethodNames(NSClassFromString(@"AWEAwemeBackgroundPlayModule"), @"方法:背景播放模块", @"NowPlaying");
+    DYYYDumpMethodNames(NSClassFromString(@"AWENowPlayingInfoCenter"), @"方法:播放信息中心", nil);
+    DYYYDumpMethodNames(NSClassFromString(@"AWEFeedBackgroundPlayManager"), @"方法:后台播放管理", @"NowPlaying");
 }
 
 // 【已移除】AWEAwemeBackgroundPlayModule / AWEFeedBackgroundPlayManager 两个 hook 块：
@@ -2326,30 +2497,43 @@ static void DYYYDumpAwemeSourceShapes(void) {
     id me = (id)self;
     SEL playingSel = NSSelectorFromString(@"playingPlayer");
     id player = ((id (*)(id, SEL))objc_msgSend)(me, playingSel);
-    DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ 收到 play 命令（控制中心点了播放）→ 开续播保护窗口 | 当前 playingPlayer=%@",
-                                             player ? NSStringFromClass([player class]) : @"(nil)"]);
 
-    // ⭐【v24 探针】点播放这一刻，把"抖音内部握着当前 aweme 的对象"全部摊开：
-    //   · 播放信息中心自己（self）—— playingPlayer 的真身住在这儿
-    //   · 背景播放模块 dyyyBGPlayModuleInstance —— 控制中心命令最终打在它身上
-    //   · 最近上岗过的对象 dyyyLastPlayingPlayer
-    // 对照它们取到的标题 vs 系统侧文字，就能一次判定"文字不对"到底错在哪一层。
+    // ⭐【v25 探针】把"抖音内部握着当前 aweme 的对象"摊开，并把落点换算成 itemID
+    //（比标题可靠：标题会被话题/长度截断，itemID 是唯一键）。
     DYYYProbeAwemeHolder(me, @"play@播放信息中心");
     DYYYProbeAwemeHolder(dyyyBGPlayModuleInstance, @"play@背景播放模块");
     DYYYProbeAwemeHolder(player, @"play@playingPlayer");
 
-    // ⭐【v21 关键修复】playingPlayer 为空 = 抖音手上没有可播对象 → 命令执行了也没落点。
-    // 用【最近上岗过的】模块补回去（它就是抖音自己的 playingPlayer，日志实测类名
-    // AWEAwemeBackgroundPlayModule），补完再让抖音走它原生的 playForRemoteControl。
-    // 严格限定在播命令窗口内 —— 其它任何时刻都不干预抖音的播放器生命周期。
+    // ⭐【v25 核心修复】补岗判据从"playingPlayer 为空"放宽为
+    //   "playingPlayer 为空 【或】 模块手里没有当前条目(_model 为 nil)"。
+    // 依据 diag/v24_check.log：
+    //   · 模块的 _model 是唯一【只领先、不落后】的权威源；
+    //   · _model 为 nil 时模块根本没有可播对象 → 控制中心点了播放没有落点，
+    //     这正是老板反馈的"点不动 / 播不到当前这条"；
+    //   · 而重新上岗是实测唯一有效的杠杆：18:50:30 补岗 → 18:50:32 抖音就打了
+    //     「模块收下当前条目 cnt=2」+「系统发布 title=稀有祖宗」，系统侧 2 秒内跟上。
     id fallback = dyyyLastPlayingPlayer ? dyyyLastPlayingPlayer : dyyyBGPlayModuleInstance;
-    if (!player && fallback) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ playingPlayer 为空 → 补岗 %@（最近上岗过的模块）",
+    id mod = dyyyBGPlayModuleInstance ? dyyyBGPlayModuleInstance : player;
+    NSString *modTitleBefore = DYYYModuleAwemeTitle(mod);
+    NSString *modID = DYYYAwemeItemID(DYYYModuleAwemeModel(mod));
+    DYYYSpeedDiag([NSString stringWithFormat:
+        @"[npv] ▶ 收到 play 命令 | playingPlayer=%@ | 模块=%@ | 模块条目=%@(id=%@) | 系统侧=%@",
+        player ? NSStringFromClass([player class]) : @"(nil)",
+        mod ? NSStringFromClass([mod class]) : @"(nil)",
+        modTitleBefore.length ? modTitleBefore : @"(未握条目)",
+        modID ?: @"-", DYYYCurrentSystemNPTitle() ?: @"-"]);
+
+    BOOL drove = NO;
+    if ((!player || modTitleBefore.length == 0) && fallback) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ %@ → 补岗 %@（让抖音把当前条目交回模块）",
+            !player ? @"playingPlayer 为空" : @"模块未握当前条目",
             NSStringFromClass([fallback class]) ?: @"?"]);
         ((void (*)(id, SEL, id))objc_msgSend)(me, NSSelectorFromString(@"becomePlayingPlayer:"), fallback);
         id after = ((id (*)(id, SEL))objc_msgSend)(me, playingSel);
-        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ 补岗后 playingPlayer=%@",
-            after ? NSStringFromClass([after class]) : @"(nil)，补岗未生效"]);
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ 补岗后 playingPlayer=%@ | 模块条目=%@",
+            after ? NSStringFromClass([after class]) : @"(nil)，补岗未生效",
+            DYYYModuleAwemeTitle(fallback) ?: @"(仍未握条目)"]);
+        drove = YES;
     } else if (!player) {
         DYYYSpeedDiag(@"[npv] ▶ playingPlayer 为空且无可用模块（缓存未建立）→ 无法补岗");
     }
@@ -2357,6 +2541,14 @@ static void DYYYDumpAwemeSourceShapes(void) {
     NSInteger ret = %orig;
     dyyyPlayCmdInFlight = NO;
     DYYYSpeedDiag([NSString stringWithFormat:@"[npv] ▶ play 命令处理完毕 ret=%ld（0=Success）", (long)ret]);
+
+    // 【v25】文字没跟上时催抖音用 _model 重建一次（只在没补岗过时做，避免同一命令驱动两次）。
+    NSString *modTitleAfter = DYYYModuleAwemeTitle(dyyyBGPlayModuleInstance);
+    NSString *sysTitleAfter = DYYYCurrentSystemNPTitle();
+    if (!drove && modTitleAfter.length > 0 && sysTitleAfter.length > 0 &&
+        ![modTitleAfter isEqualToString:sysTitleAfter]) {
+        DYYYAskDouyinRebuildNowPlaying(dyyyBGPlayModuleInstance, @"播放命令后文字没跟上");
+    }
     return ret;
 }
 
