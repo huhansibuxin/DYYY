@@ -1585,71 +1585,122 @@ static BOOL DYYYIsPlayCommand(id cmd) {
     return NO;
 }
 
-// 冷启动续播主流程：A=调抖音自己注册的 playCommand handler（等价系统补发 play 命令），
-// 8s 后投票检查，未在播则 B=对引擎实例直接调 play，20s 终检后无条件收工。
+// 冷启动续播主流程，三路径阶梯（每步后投票检查，在播即收工；全部异常带 reason 日志）：
+//   A1(5s)  = 调 hook 捕获的 playCommand handler（等价系统补发命令）；
+//   A2(10s) = 对 AWENowPlayingInfoCenter defaultCenter 调 handlePlayCommand:——抖音自己的
+//             播放分发器（15:00 实测它就是 playCommand 的注册者），比引擎 play 高一层，
+//             它内部会找当前视频，冷启动无感拉起进程里也会创建；
+//   B(15s)  = 对引擎实例直接调 play（底层兜底；15:11 实测单独调它 playState 仍是 2=暂停，
+//             引擎包装层 play 疑似"半死"，所以只做兜底不做主路径）；
+//   25s 终检后无条件收工。
+static void DYYYColdResumeFinish(NSString *why) {
+    NSInteger st = DYYYReadDouyinPlayState();
+    DYYYSpeedDiag([NSString stringWithFormat:@"[cold-resume] 收工(%@) playState=%ld", why, (long)st]);
+    dyyyPendingColdResume = NO;
+    dyyyColdResumeRunning = NO;
+}
+
 static void DYYYScheduleColdResume(void) {
     if (!DYYYShouldHoldNowPlaying() || dyyyPendingColdResume || dyyyColdResumeRunning) {
         return;
     }
     dyyyPendingColdResume = YES;
-    DYYYSpeedDiag(@"[cold-resume] 判定=续播冷拉起，5s 后开始补发 play（A=抖音play handler → B=引擎play）");
+    dyyyColdResumeRunning = YES;
+    DYYYSpeedDiag(@"[cold-resume] 判定=续播冷拉起，开始补发 play（A1=playCommand handler → A2=handlePlayCommand → B=引擎play）");
 
+    // 终检 25s：无条件收工
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (dyyyPendingColdResume) {
+            DYYYColdResumeFinish(@"终检");
+        }
+    });
+
+    // A1: 5s —— playCommand handler
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (!dyyyPendingColdResume) {
             return;
         }
-        dyyyColdResumeRunning = YES;
         @try {
             id target = dyyyPlayCmdTarget;
-            Class eventCls = objc_getClass("MPRemoteCommandEvent");
-            id event = eventCls ? [[eventCls alloc] init] : nil;
-            if (target && dyyyPlayCmdAction && event) {
-                long ret = ((long (*)(id, SEL, id))objc_msgSend)(target, dyyyPlayCmdAction, event);
-                DYYYSpeedDiag([NSString stringWithFormat:@"[cold-resume] A(play handler) 已调 target=%@ ret=%ld",
-                    NSStringFromClass([target class]), ret]);
-            } else {
-                DYYYSpeedDiag([NSString stringWithFormat:@"[cold-resume] A 跳过 target=%@ event=%@（缺一不可）",
-                    target ? @"有" : @"无", event ? @"有" : @"无"]);
-            }
-        } @catch (__unused NSException *e) {
-            DYYYSpeedDiag(@"[cold-resume] A exception");
-        }
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (!dyyyPendingColdResume) {
-                return;
-            }
-            NSInteger st = DYYYReadDouyinPlayState();
-            if (st == 1) {
-                DYYYSpeedDiag(@"[cold-resume] ✓ 已在播（路径 A 生效），收工");
-                dyyyPendingColdResume = NO;
-                dyyyColdResumeRunning = NO;
-                [[NSUserDefaults standardUserDefaults] removeObjectForKey:kDYYYColdResumeStampKey];
-                return;
-            }
+            id event = nil;
             @try {
-                id eng = dyyyLastEngineInstance;
-                if (eng && [eng respondsToSelector:NSSelectorFromString(@"play")]) {
-                    ((void (*)(id, SEL))objc_msgSend)(eng, NSSelectorFromString(@"play"));
-                    DYYYSpeedDiag(@"[cold-resume] B(引擎 play) 已调");
-                } else {
-                    DYYYSpeedDiag(@"[cold-resume] B 跳过（无引擎实例或不响应 play）");
+                Class eventCls = objc_getClass("MPRemoteCommandEvent");
+                if (eventCls) {
+                    event = [[eventCls alloc] init];
                 }
             } @catch (__unused NSException *e) {
-                DYYYSpeedDiag(@"[cold-resume] B exception");
+                event = nil;   // event 构造失败不放弃：A2/A3 还有路
             }
+            if (target && dyyyPlayCmdAction) {
+                long ret = ((long (*)(id, SEL, id))objc_msgSend)(target, dyyyPlayCmdAction, event);
+                DYYYSpeedDiag([NSString stringWithFormat:@"[cold-resume] A1(handler) 已调 target=%@ event=%@ ret=%ld",
+                    NSStringFromClass([target class]), event ? @"构造成功" : @"nil", ret]);
+            } else {
+                DYYYSpeedDiag(@"[cold-resume] A1 跳过（本轮启动未捕获 play handler 注册）");
+            }
+        } @catch (NSException *e) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[cold-resume] A1 exception: %@", e.reason ?: @"unknown"]);
+        }
+    });
 
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                NSInteger st2 = DYYYReadDouyinPlayState();
-                DYYYSpeedDiag([NSString stringWithFormat:@"[cold-resume] 终检 playState=%ld，标志清除（%@）",
-                    (long)st2, st2 == 1 ? @"成功" : @"未播，放弃"]);
-                dyyyPendingColdResume = NO;
-                dyyyColdResumeRunning = NO;
-            });
-        });
+    // 检查点1 10s：在播收工；否则 A2
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!dyyyPendingColdResume) {
+            return;
+        }
+        if (DYYYReadDouyinPlayState() == 1) {
+            DYYYColdResumeFinish(@"A1 生效");
+            return;
+        }
+        @try {
+            Class npc = NSClassFromString(@"AWENowPlayingInfoCenter");
+            id center = npc ? ((id (*)(Class, SEL))objc_msgSend)(npc, @selector(defaultCenter)) : nil;
+            SEL hpc = NSSelectorFromString(@"handlePlayCommand:");
+            if (center && [center respondsToSelector:hpc]) {
+                id event = nil;
+                @try {
+                    Class eventCls = objc_getClass("MPRemoteCommandEvent");
+                    if (eventCls) {
+                        event = [[eventCls alloc] init];
+                    }
+                } @catch (__unused NSException *e) {
+                    event = nil;
+                }
+                long ret = ((long (*)(id, SEL, id))objc_msgSend)(center, hpc, event);
+                DYYYSpeedDiag([NSString stringWithFormat:@"[cold-resume] A2(handlePlayCommand) 已调 center=%@ event=%@ ret=%ld",
+                    NSStringFromClass([center class]), event ? @"构造成功" : @"nil", ret]);
+            } else {
+                DYYYSpeedDiag(@"[cold-resume] A2 跳过（AWENowPlayingInfoCenter 不可用或不响应 handlePlayCommand:）");
+            }
+        } @catch (NSException *e) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[cold-resume] A2 exception: %@", e.reason ?: @"unknown"]);
+        }
+    });
+
+    // 检查点2 15s：在播收工；否则 B（引擎 play 兜底）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!dyyyPendingColdResume) {
+            return;
+        }
+        if (DYYYReadDouyinPlayState() == 1) {
+            DYYYColdResumeFinish(@"A2 生效");
+            return;
+        }
+        @try {
+            id eng = dyyyLastEngineInstance;
+            if (eng && [eng respondsToSelector:NSSelectorFromString(@"play")]) {
+                ((void (*)(id, SEL))objc_msgSend)(eng, NSSelectorFromString(@"play"));
+                DYYYSpeedDiag(@"[cold-resume] B(引擎 play) 已调");
+            } else {
+                DYYYSpeedDiag(@"[cold-resume] B 跳过（无引擎实例或不响应 play）");
+            }
+        } @catch (NSException *e) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[cold-resume] B exception: %@", e.reason ?: @"unknown"]);
+        }
     });
 }
 
