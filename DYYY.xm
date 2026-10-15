@@ -3830,9 +3830,10 @@ static BOOL DYYYIsLandscapeFullscreenNow(void) {
 
 // 原生长按是否值得抑制：只碰播放器/交互容器上的，避免误伤其它长按（头像、文案长按、DYYY 自己的长按）
 static BOOL DYYYLPExitShouldSilence(UILongPressGestureRecognizer *gr) {
-    NSString *cls = NSStringFromClass([gr.view class]);
+    NSString *cls = [NSStringFromClass([gr.view class]) lowercaseString];
     if (cls.length == 0) return NO;
-    NSArray<NSString *> *hints = @[@"Player", @"Play", @"Interaction", @"Landscape", @"Container", @"Video"];
+    // 注意用全小写比对：抖音的横屏类是 AWELand**S**cape（大写 S）
+    NSArray<NSString *> *hints = @[@"player", @"play", @"interaction", @"landscape", @"container", @"video"];
     for (NSString *h in hints) {
         if ([cls rangeOfString:h].location != NSNotFound) return YES;
     }
@@ -3854,22 +3855,6 @@ static UIViewController *DYYYLPExitTopViewController(void) {
     return vc;
 }
 
-// 收集一棵 VC 树里的全部 VC（子 VC + 导航栈 + 弹出链），用于找抖音自己的退出回调
-static NSArray<UIViewController *> *DYYYLPExitCollectVCs(UIViewController *root) {
-    NSMutableArray<UIViewController *> *out = [NSMutableArray array];
-    if (!root) return out;
-    NSMutableArray<UIViewController *> *stack = [NSMutableArray arrayWithObject:root];
-    while (stack.count > 0) {
-        UIViewController *vc = stack.lastObject;
-        [stack removeLastObject];
-        if ([out containsObject:vc]) continue;
-        [out addObject:vc];
-        for (UIViewController *c in vc.childViewControllers) [stack addObject:c];
-        for (UIViewController *c in vc.navigationController.viewControllers) [stack addObject:c];
-        if (vc.presentedViewController) [stack addObject:vc.presentedViewController];
-    }
-    return out;
-}
 
 // 抖音用来收尾「退出横屏」的回调属性名（按可能性排序）。
 // exitLandscapeBlock / customizeDismissBlock 是 SSH grep AwemeCore 挖到的真名，
@@ -3939,23 +3924,150 @@ static id DYYYLPExitBlockHolderInVC(UIViewController *vc) {
     return nil;
 }
 
-// 只调用「无参无返回」的 block：签名必须是 v8@?0，不符就绝不冒险调（调错签名直接崩）。
+// ---- block 自校验调用：签名对不上绝不冒险调（调错签名直接崩）----
 // 调用方式走 block 的 invoke 指针（隐藏首参 = block 自身）：
 // ARC 下不让把 id 直接 __bridge 成 block 类型，这样写既合法也绕开类型检查（签名已自校验过）。
-static BOOL DYYYLPExitCallVoidBlock(id blk) {
+struct DYYYLPBlockHeader { void *isa; int flags; int reserved; void *invoke; void *descriptor; };
+struct DYYYLPBlockDesc2 { unsigned long reserved; unsigned long size; const char *signature; const char *layout; };
+
+// 取 block 签名（如 "v8@?0"），拿不到返回 NULL
+static const char *DYYYLPBlockSignature(id blk) {
+    if (!blk) return NULL;
+    Class blockClass = NSClassFromString(@"NSBlock");
+    if (blockClass && ![blk isKindOfClass:blockClass]) return NULL;
+    struct DYYYLPBlockHeader *h = (struct DYYYLPBlockHeader *)(__bridge void *)blk;
+    if (!h->invoke) return NULL;
+    if (!(h->flags & (1 << 30))) return NULL;               // BLOCK_HAS_SIGNATURE
+    return ((struct DYYYLPBlockDesc2 *)h->descriptor)->signature;
+}
+
+// 按 block 真实签名调用：支持 v8@?0（无参）与 v16@?0@8（一个对象参数，传 fallbackArg）
+static BOOL DYYYLPExitInvokeBlock(id blk, id fallbackArg) {
     if (!blk) return NO;
     Class blockClass = NSClassFromString(@"NSBlock");
     if (blockClass && ![blk isKindOfClass:blockClass]) return NO;
-    struct DYYYLPBlockHeader { void *isa; int flags; int reserved; void *invoke; void *descriptor; };
-    struct DYYYLPBlockDesc2 { unsigned long reserved; unsigned long size; const char *signature; const char *layout; };
     struct DYYYLPBlockHeader *h = (struct DYYYLPBlockHeader *)(__bridge void *)blk;
-    if (!h->invoke) return NO;
-    if (!(h->flags & (1 << 30))) return NO;                 // BLOCK_HAS_SIGNATURE
-    const char *sig = ((struct DYYYLPBlockDesc2 *)h->descriptor)->signature;
+    const char *sig = DYYYLPBlockSignature(blk);
     if (!sig) return NO;
-    if (!(sig[0] == 'v' && sig[1] == '8' && sig[2] == '@' && sig[3] == '?' && sig[4] == '0' && sig[5] == '\0')) return NO;
-    ((void (*)(void *))h->invoke)(h);
-    return YES;
+    if (strcmp(sig, "v8@?0") == 0) {
+        ((void (*)(void *))h->invoke)(h);
+        return YES;
+    }
+    if (strcmp(sig, "v16@?0@8") == 0) {
+        ((void (*)(void *, id))h->invoke)(h, fallbackArg);
+        return YES;
+    }
+    return NO;
+}
+
+// 只调用「无参无返回」的 block（老签名判据，保留给属性扫描用）
+static BOOL DYYYLPExitCallVoidBlock(id blk) {
+    const char *sig = DYYYLPBlockSignature(blk);
+    if (!sig) return NO;
+    if (strcmp(sig, "v8@?0") != 0) return NO;
+    return DYYYLPExitInvokeBlock(blk, nil);
+}
+
+// ============================================================================
+// ⏺ 录制器：把【抖音自己的退出流程】录下来，长按时原样回放
+// ----------------------------------------------------------------------------
+// 为什么必须这么做：横屏 UI 的所有按钮（含返回键 AWENoxusHighlightButton）都没有
+// target-action、没有手势、对象自身也没有可调的返回方法 —— 程序内「点一下返回键」做不到。
+// 但抖音自己退出时一定会走这几个方法，把它们录下来就能一比一复刻。
+//
+// 抖音真名（从设备 AwemeCore 挖出）：
+//   setExitLandscapeBlock: / exitLandscapeBlock   ← 退出横屏的回调（属性 + 真 setter）
+//   configAfterQuitFromLandscapeFeed:             ← 退出横屏后的配置
+//   rotateConfigAfterQuitFromLandscapeFeed:       ← 退出横屏后的旋转/布局收尾
+//                                                    （feed 错位就是这一步没跑）
+// ⚠️ 历史教训：之前所有版本都因我把类名过滤写成 "Landscape"（小写 s）而全部落空 ——
+//    抖音是 AWELand**S**cape（大写 S），所以扫描恒为 0 条、真方法名一个都没找到。
+//
+// 实现用 method_setImplementation（不用交换选择子）：原 IMP 按类存表、直调，
+// 不存在「调到自己」的路径 → 绝不会像早期版本那样自我递归爆栈。
+// ============================================================================
+static __weak id gDYYYLPRecBlockHolder = nil;    // setExitLandscapeBlock: 的接收者
+static id gDYYYLPRecExitBlock = nil;             // 录到的退出 block（copy 一份）
+static __weak id gDYYYLPRecPostHolder = nil;     // config/rotate afterQuit 的接收者
+static __weak id gDYYYLPRecPostArg = nil;        // 它们的参数（aweme / VC，原样回放）
+static NSString *gDYYYLPRecPostSel = nil;        // 录到的 selector 名
+static NSMutableDictionary<NSString *, NSValue *> *gDYYYLPRecOrig = nil;  // "Class|sel" -> 原 IMP
+
+typedef void (*DYYYLPRecIdIMP)(id, SEL, id);
+
+// 按接收者的类链找回我们替换掉的那个原 IMP
+static IMP DYYYLPRecOrigIMP(id self, SEL _cmd) {
+    for (Class c = object_getClass(self); c; c = class_getSuperclass(c)) {
+        NSString *key = [NSString stringWithFormat:@"%s|%s", class_getName(c), sel_getName(_cmd)];
+        NSValue *v = gDYYYLPRecOrig[key];
+        if (v) return (IMP)v.pointerValue;
+    }
+    return NULL;
+}
+
+// setExitLandscapeBlock: —— 抖音在这里把「退出横屏」的回调交过来，录下即可原样回放
+static void DYYYLPRecSetExitBlock(id self, SEL _cmd, id blk) {
+    if (blk) {
+        gDYYYLPRecBlockHolder = self;
+        gDYYYLPRecExitBlock = [blk copy];
+        const char *sig = DYYYLPBlockSignature(blk);
+        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ⏺ 录到 exitLandscapeBlock（持有者=%@ 签名=%s）",
+                       NSStringFromClass([self class]), sig ?: "-"]);
+    }
+    IMP orig = DYYYLPRecOrigIMP(self, _cmd);
+    if (orig) ((DYYYLPRecIdIMP)orig)(self, _cmd, blk);
+}
+
+// configAfterQuitFromLandscapeFeed: / rotateConfigAfterQuitFromLandscapeFeed:
+// —— 抖音退出横屏后的收尾，录 (接收者, 参数) 供回放
+static void DYYYLPRecPostQuit(id self, SEL _cmd, id arg) {
+    gDYYYLPRecPostHolder = self;
+    gDYYYLPRecPostArg = arg;
+    gDYYYLPRecPostSel = NSStringFromSelector(_cmd);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ⏺ 录到 -%@（%@ arg=%@）",
+                   NSStringFromSelector(_cmd), NSStringFromClass([self class]),
+                   arg ? NSStringFromClass([arg class]) : @"nil"]);
+    IMP orig = DYYYLPRecOrigIMP(self, _cmd);
+    if (orig) ((DYYYLPRecIdIMP)orig)(self, _cmd, arg);
+}
+
+// 把所有实现了这三个 selector 的类各包一层（幂等，可重复调用）
+static void DYYYLPRecInstall(void) {
+    static int runs = 0;
+    if (runs >= 3) return;
+    runs++;
+    if (!gDYYYLPRecOrig) gDYYYLPRecOrig = [NSMutableDictionary dictionary];
+    int count = objc_getClassList(NULL, 0);
+    if (count <= 0) return;
+    Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
+    if (!classes) return;
+    count = objc_getClassList(classes, count);
+    NSArray<NSString *> *sels = @[@"setExitLandscapeBlock:",
+                                  @"configAfterQuitFromLandscapeFeed:",
+                                  @"rotateConfigAfterQuitFromLandscapeFeed:"];
+    NSMutableArray<NSString *> *hits = [NSMutableArray array];
+    for (int i = 0; i < count; i++) {
+        Class c = classes[i];
+        const char *cn = class_getName(c);
+        if (!cn) continue;
+        for (NSString *s in sels) {
+            SEL sel = NSSelectorFromString(s);
+            Method m = class_getInstanceMethod(c, sel);
+            if (!m) continue;
+            IMP cur = method_getImplementation(m);
+            IMP mine = (strcmp(s.UTF8String, "setExitLandscapeBlock:") == 0)
+                     ? (IMP)&DYYYLPRecSetExitBlock : (IMP)&DYYYLPRecPostQuit;
+            if (cur == mine) continue;                       // 已经包过了
+            NSString *key = [NSString stringWithFormat:@"%s|%@", cn, s];
+            gDYYYLPRecOrig[key] = [NSValue valueWithPointer:cur];
+            method_setImplementation(m, mine);
+            [hits addObject:[NSString stringWithFormat:@"%s.%@", cn, s]];
+        }
+    }
+    free(classes);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ⏺ 录制钩子第 %d 轮（%lu 处）：%@",
+                   runs, (unsigned long)hits.count,
+                   hits.count ? [hits componentsJoinedByString:@", "] : @"（无新增）"]);
 }
 
 // 在某个对象上找「退出/收起」回调 block 并调用
@@ -3975,403 +4087,21 @@ static BOOL DYYYLPExitTryBlocks(id obj, NSString **whichOut) {
     return NO;
 }
 
-// ①-B 横屏页自己的返回按钮 —— 必须走它，抖音才会做正规收尾（实测：直接 dismiss 必致 feed 错位）。
-// 这个按钮（AWENoxusHighlightButton）重写 touches 自行处理点击、不走标准 target-action，
-// 所以这里先把它所有可用入口 dump 出来，再按「target-action → ivar 里的 block → 自身的点击处理方法」依次试。
-static BOOL DYYYLPExitDumpBackButton(UIView *root) {
-    if (!root) return NO;
-    NSMutableArray<UIView *> *found = [NSMutableArray array];
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
-    while (stack.count > 0) {
-        UIView *v = stack.lastObject;
-        [stack removeLastObject];
-        if ([NSStringFromClass([v class]) isEqualToString:@"AWENoxusHighlightButton"]) [found addObject:v];
-        for (UIView *s in v.subviews) [stack addObject:s];
-    }
-    if (found.count == 0) {
-        DYYYSpeedDiag(@"[lp-exit] ①-B 横屏页里没有 AWENoxusHighlightButton");
-        return NO;
-    }
-    for (UIView *v in found) {
-        UIControl *c = [v isKindOfClass:[UIControl class]] ? (UIControl *)v : nil;
-        // dump 可用入口：靠这些日志就能定位它真正的点击回调
-        NSMutableArray<NSString *> *acts = [NSMutableArray array];
-        if (c) {
-            for (NSUInteger e = 1; e <= (NSUInteger)(1u << 16); e <<= 1) {
-                for (id t in c.allTargets) {
-                    NSArray *as = [c actionsForTarget:t forControlEvent:(UIControlEvents)e];
-                    if (as.count > 0) {
-                        [acts addObject:[NSString stringWithFormat:@"e%lu->%@[%@]",
-                                         (unsigned long)e, NSStringFromClass([t class]),
-                                         [as componentsJoinedByString:@","]]];
-                    }
-                }
-            }
-        }
-        NSMutableArray<NSString *> *ivs = [NSMutableArray array];
-        unsigned int ic = 0;
-        Ivar *il = class_copyIvarList([v class], &ic);
-        for (unsigned int i = 0; il && i < ic; i++) {
-            [ivs addObject:[NSString stringWithFormat:@"%s", ivar_getName(il[i]) ?: ""]];
-        }
-        if (il) free(il);
-        NSMutableArray<NSString *> *ms = [NSMutableArray array];
-        unsigned int mc = 0;
-        Method *ml = class_copyMethodList([v class], &mc);
-        for (unsigned int i = 0; ml && i < mc; i++) {
-            [ms addObject:NSStringFromSelector(method_getName(ml[i]))];
-        }
-        if (ml) free(ml);
-        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ①-B 返回按钮 %@ frame=%@ targets=[%@] ivars=[%@] methods=[%@]",
-                       NSStringFromClass([v class]), NSStringFromCGRect(v.frame),
-                       [acts componentsJoinedByString:@" | "],
-                       [ivs componentsJoinedByString:@","],
-                       [ms componentsJoinedByString:@","]]);
-
-        // 只探测、不调用：真正的退出交给 ② 的「先转竖屏再收起」时序，
-        // 这里如果把不靠谱的入口调了，反而会误触发别的功能 / 阻断正确路径。
-    }
-    return NO;
-}
-
-// ①-C 横屏页里「名字像返回」的按钮 —— 直接给它发点击事件（= 用户手点返回）。
-// 判据只认 action 名（back/exit/close/quit/dismiss/finish），不靠猜位置，避免误点其它按钮。
-// 每次都会把横屏页所有 UIControl 的「类名(window坐标) + 注册的 action」打进日志，便于核实。
-static BOOL DYYYLPExitTapNamedBackControl(UIView *root) {
-    if (!root) return NO;
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
-    NSMutableArray<NSString *> *dump = [NSMutableArray array];
-    while (stack.count > 0) {
-        UIView *v = stack.lastObject;
-        [stack removeLastObject];
-        for (UIView *s in v.subviews) [stack addObject:s];
-        if (![v isKindOfClass:[UIControl class]]) continue;
-        UIControl *c = (UIControl *)v;
-        NSString *where = NSStringFromCGRect([c convertRect:c.bounds toView:nil]);
-        NSMutableArray<NSString *> *acts = [NSMutableArray array];
-        for (id t in c.allTargets) {
-            for (NSUInteger e = 1; e <= (NSUInteger)(1u << 16); e <<= 1) {
-                NSArray<NSString *> *as = [c actionsForTarget:t forControlEvent:(UIControlEvents)e];
-                for (NSString *a in as) {
-                    [acts addObject:[NSString stringWithFormat:@"%@.%@", NSStringFromClass([t class]), a]];
-                }
-            }
-        }
-        // iOS 14+ 的 UIAction 不走 allTargets，单独取
-        @try {
-            id pa = [c valueForKey:@"primaryAction"];
-            if (pa) [acts addObject:[NSString stringWithFormat:@"primaryAction:%@", pa]];
-        } @catch (__unused NSException *e) {}
-        [dump addObject:[NSString stringWithFormat:@"%@%@ %@", NSStringFromClass([c class]), where,
-                         acts.count ? [acts componentsJoinedByString:@"|"] : @"(无action)"]];
-        for (NSString *n in acts) {
-            NSString *low = n.lowercaseString;
-            if ([low containsString:@"back"] || [low containsString:@"exit"] || [low containsString:@"close"] ||
-                [low containsString:@"quit"] || [low containsString:@"dismiss"] || [low containsString:@"finish"]) {
-                [c sendActionsForControlEvents:UIControlEventTouchUpInside];
-                DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ①-C 命中返回键 → sendActions（%@ %@）",
-                               NSStringFromClass([c class]), n]);
-                return YES;
-            }
-        }
-    }
-    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ①-C 横屏页控件：%@", [dump componentsJoinedByString:@" ; "]]);
-    return NO;
-}
 
 // 判断一个视图是否还在横屏那棵树里（用于把横屏的 collectionView 排除掉）
 static BOOL DYYYLPExitHasLandscapeAncestor(UIView *v) {
     for (UIView *p = v; p; p = p.superview) {
         NSString *n = NSStringFromClass([p class]);
-        if ([n containsString:@"Landscape"]) return YES;
+        // ⚠️ 必须大小写不敏感：抖音是 AWELand**S**cape（大写 S），只匹配 "Landscape" 会整片漏掉
+        if ([[n lowercaseString] containsString:@"landscape"]) return YES;
     }
     return NO;
 }
 
-// 横屏页「返回键」的定位：左上角区域的 UIControl。
-// 实测控件清单里它就是 AWENoxusHighlightButton{{59, 27.7}, {24, 24}}（窗口坐标，最靠左上）。
-static UIView *DYYYLPExitFindCornerButton(UIView *root) {
-    if (!root) return nil;
-    UIView *best = nil;
-    CGFloat bestScore = CGFLOAT_MAX;
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
-    while (stack.count > 0) {
-        UIView *v = stack.lastObject;
-        [stack removeLastObject];
-        for (UIView *s in v.subviews) [stack addObject:s];
-        if (![v isKindOfClass:[UIControl class]]) continue;
-        CGRect r = [v convertRect:v.bounds toView:nil];          // 窗口坐标
-        if (r.size.width < 8 || r.size.height < 8) continue;
-        if (r.origin.x > 200 || r.origin.y > 140) continue;      // 只要左上角那片
-        CGFloat score = r.origin.x + r.origin.y;
-        if (score < bestScore) { bestScore = score; best = v; }
-    }
-    return best;
-}
 
-// 类名过滤：只对「横屏/交互/元素」这一族的对象调返回处理方法，避免误调别的功能。
-// strict=YES 时只认类名里带 Landscape 的（第一轮）；=NO 放宽到 Back/Interaction/Element/Feed/Context/Play（第二轮）。
-static BOOL DYYYLPExitClassLooksLikeLandscape(Class c, BOOL strict) {
-    NSString *n = NSStringFromClass(c);
-    if (n.length == 0) return NO;
-    if ([n containsString:@"Landscape"]) return YES;
-    if (strict) return NO;
-    for (NSString *k in @[@"Back", @"Interaction", @"Element", @"Feed", @"Context", @"Play"]) {
-        if ([n containsString:k]) return YES;
-    }
-    return NO;
-}
 
-// 对象图遍历：VC 树 + 视图树 + 手势及其 delegate + 每个对象的对象型 ivar（浅两层）。
-// 抖音把「返回」的处理放在 interaction / element / context 这些非 VC 对象上是常态，
-// 它们是普通 ivar 或视图，遍历就能拿到。
-static NSArray *DYYYLPExitCandidateObjects(void) {
-    NSMutableArray *out = [NSMutableArray array];
-    for (UIViewController *vc in DYYYLPExitAllVCs()) DYYYLPAddUnique(out, vc);
-    UIWindow *active = [DYYYUtils getActiveWindow];
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        if (active && w != active && w.windowLevel != UIWindowLevelNormal) continue;
-        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:w];
-        NSUInteger guard = 0;
-        while (stack.count > 0 && guard++ < 5000 && out.count < 4000) {
-            UIView *v = stack.lastObject;
-            [stack removeLastObject];
-            DYYYLPAddUnique(out, v);
-            for (UIGestureRecognizer *g in v.gestureRecognizers) {
-                DYYYLPAddUnique(out, g);
-                if (g.delegate) DYYYLPAddUnique(out, g.delegate);
-            }
-            for (UIView *s in v.subviews) [stack addObject:s];
-        }
-    }
-    // 两层 ivar 展开：context / helper / element container 都在这一层
-    for (int round = 0; round < 2; round++) {
-        NSArray *snapshot = [out copy];
-        for (id o in snapshot) {
-            if (out.count >= 4000) break;
-            for (Class c = object_getClass(o); c && c != [NSObject class]; c = class_getSuperclass(c)) {
-                unsigned int cnt = 0;
-                Ivar *iv = class_copyIvarList(c, &cnt);
-                for (unsigned int k = 0; iv && k < cnt; k++) {
-                    const char *enc = ivar_getTypeEncoding(iv[k]);
-                    if (!enc || enc[0] != '@') continue;
-                    id val = nil;
-                    @try { val = object_getIvar(o, iv[k]); } @catch (__unused NSException *e) {}
-                    if (val) DYYYLPAddUnique(out, val);
-                }
-                if (iv) free(iv);
-            }
-        }
-    }
-    return out;
-}
 
-// ①-D 真·返回键入口：在对象图里找抖音自己的「返回」处理方法并调用 ——
-//      这是「等价于手指点返回键」的唯一可行做法（横屏 UI 全部无 target-action，点不到）。
-//      带 sender 的入口优先（抖音是 -handleXxxWithSender: 派发风格），sender 传返回键本身。
-static BOOL DYYYLPExitInvokeBackHandler(UIView *backView, NSString **what) {
-    NSArray<NSString *> *withSender = @[@"handleBackButtonWithSender:", @"handleTapGestureWithSender:"];
-    NSArray<NSString *> *noArg = @[@"didSelectBackButton", @"clickBackButton",
-                                   @"didClickBackButton", @"handleBackButton", @"onClickBackButton"];
-    NSArray *objs = DYYYLPExitCandidateObjects();
-    for (int pass = 0; pass < 2; pass++) {
-        for (id o in objs) {
-            Class c = [o class];
-            if (!DYYYLPExitClassLooksLikeLandscape(c, pass == 0)) continue;
-            for (NSString *name in withSender) {
-                SEL s = NSSelectorFromString(name);
-                if (![o respondsToSelector:s]) continue;
-                if ([name isEqualToString:@"handleTapGestureWithSender:"] && !backView) continue;
-                if (what) *what = [NSString stringWithFormat:@"%@ -%@（sender=%@）",
-                                   NSStringFromClass(c), name,
-                                   backView ? NSStringFromClass([backView class]) : @"nil"];
-                ((void (*)(id, SEL, id))objc_msgSend)(o, s, backView);
-                return YES;
-            }
-            for (NSString *name in noArg) {
-                SEL s = NSSelectorFromString(name);
-                if (![o respondsToSelector:s]) continue;
-                if (what) *what = [NSString stringWithFormat:@"%@ -%@", NSStringFromClass(c), name];
-                ((void (*)(id, SEL))objc_msgSend)(o, s);
-                return YES;
-            }
-        }
-    }
-    return NO;
-}
 
-// 一次性类扫描（第一次挂手势时打一条）：把「横屏族」里实现了返回/退出相关方法的类名列出来，
-// 万一 ①-D 没命中，看这条日志就知道该调哪个类的哪个方法。
-static void DYYYLPExitClassScanOnce(void) {
-    static BOOL done = NO;
-    if (done) return;
-    done = YES;
-    int count = objc_getClassList(NULL, 0);
-    if (count <= 0) return;
-    Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
-    if (!classes) return;
-    count = objc_getClassList(classes, count);
-    NSArray<NSString *> *sels = @[@"handleBackButtonWithSender:", @"didSelectBackButton",
-                                  @"configAfterQuitFromLandscapeFeed:", @"configBeforEnterToLandscapeFeed:",
-                                  @"exitLandscapeBlock", @"handleTapGestureWithSender:"];
-    NSMutableArray<NSString *> *hit = [NSMutableArray array];
-    for (int i = 0; i < count && hit.count < 60; i++) {
-        Class c = classes[i];
-        const char *cn = class_getName(c);
-        if (!cn || !strstr(cn, "Landscape")) continue;           // 只扫横屏族，避免全量拷贝方法列表拖慢主线程
-        unsigned int mc = 0;
-        Method *ml = class_copyMethodList(c, &mc);
-        for (unsigned int k = 0; ml && k < mc; k++) {
-            const char *mn = sel_getName(method_getName(ml[k]));
-            if (!mn) continue;
-            for (NSString *s in sels) {
-                if (strcmp(mn, s.UTF8String) == 0) {
-                    [hit addObject:[NSString stringWithFormat:@"%s.%@", cn, s]];
-                    break;
-                }
-            }
-            if (hit.count >= 60) break;
-        }
-        if (ml) free(ml);
-    }
-    free(classes);
-    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] 横屏类扫描（%lu 条）：%@",
-                   (unsigned long)hit.count,
-                   hit.count ? [hit componentsJoinedByString:@" ; "] : @"（无）"]);
-}
-
-// 读手势识别器的 _targets（真正的处理者就藏在这）——拿到 (target 对象, action SEL, 手势自身)。
-// _action 是 SEL ivar，KVC 取不到，必须按 ivar 偏移直接读内存。
-static NSString *DYYYLPExitGRTargets(UIGestureRecognizer *gr, NSMutableArray *store) {
-    NSMutableString *out = [NSMutableString string];
-    NSArray *arr = nil;
-    @try { arr = [gr valueForKey:@"_targets"]; } @catch (__unused NSException *e) {}
-    if (![arr isKindOfClass:[NSArray class]]) return out;
-    for (id t in arr) {
-        id tgt = nil;
-        SEL act = NULL;
-        for (Class c = object_getClass(t); c && c != [NSObject class]; c = class_getSuperclass(c)) {
-            unsigned int cnt = 0;
-            Ivar *iv = class_copyIvarList(c, &cnt);
-            for (unsigned int k = 0; iv && k < cnt; k++) {
-                const char *enc = ivar_getTypeEncoding(iv[k]);
-                if (!enc) continue;
-                if (strcmp(enc, ":") == 0) {
-                    act = *(SEL *)((uint8_t *)(__bridge void *)t + ivar_getOffset(iv[k]));
-                } else if (enc[0] == '@') {
-                    id val = nil;
-                    @try { val = object_getIvar(t, iv[k]); } @catch (__unused NSException *e) {}
-                    if (val) tgt = val;
-                }
-            }
-            if (iv) free(iv);
-        }
-        NSString *tn = tgt ? NSStringFromClass([tgt class]) : @"nil";
-        NSString *an = act ? NSStringFromSelector(act) : @"?";
-        [out appendFormat:@"%@ -%@ ; ", tn, an];
-        if (store && tgt && act) [store addObject:@[tgt, an, gr]];
-    }
-    return out;
-}
-
-// ①-E 直接触发「返回键上的 tap 手势」——抖音横屏的点击全是手势派发（按钮都没有 target-action），
-//      返回键自身没挂 target-action，但极可能被交互层挂了一只 tap 手势，
-//      手势的 _targets 就是真正的处理者 → 用真实手势对象当参数调用它 = 等价于点了一下返回键。
-//      A 段：返回键自己 + 小的祖先容器上的 tap；
-//      B 段（A 段没命中）：AWEDPlayerInteractionView 上的 tap —— 它是全屏交互层，
-//            手势清单实测它带 -handleResponseTapAction:，横屏的点击很可能由它按触点派发。
-static BOOL DYYYLPExitTryTapTargets(NSMutableArray *cand, NSString **what) {
-    if (cand.count == 0) return NO;
-    NSMutableArray *ordered = [NSMutableArray array];
-    for (NSArray *p in cand) {
-        if (DYYYLPExitClassLooksLikeLandscape([p[0] class], NO)) [ordered addObject:p];
-    }
-    for (NSArray *p in cand) if (![ordered containsObject:p]) [ordered addObject:p];
-    NSArray *pick = ordered.firstObject;
-    if (!pick) return NO;
-    id tgt = pick[0];
-    SEL act = NSSelectorFromString(pick[1]);
-    UIGestureRecognizer *owner = pick[2];
-    if (!tgt || !act) return NO;
-    if (what) *what = [NSString stringWithFormat:@"%@ -%@（手势 %@）",
-                       NSStringFromClass([tgt class]), pick[1], NSStringFromClass([owner class])];
-    @try { ((void (*)(id, SEL, id))objc_msgSend)(tgt, act, owner); } @catch (__unused NSException *e) {
-        DYYYSpeedDiag(@"[lp-exit] ①-E 调用抛异常，忽略");
-        return NO;
-    }
-    return YES;
-}
-
-static BOOL DYYYLPExitFireCornerTapGesture(UIView *backView, NSString **what) {
-    if (!backView) return NO;
-    NSMutableArray *cand = [NSMutableArray array];
-    // A 段：只看返回键自己 + 小的祖先容器（避开"全屏容器上的通用 tap"，那类调了会误触）
-    NSMutableArray<UIView *> *views = [NSMutableArray arrayWithObject:backView];
-    for (UIView *v = backView.superview; v && views.count < 4; v = v.superview) {
-        if (v.bounds.size.width > 200 || v.bounds.size.height > 200) break;   // 到全屏容器就停
-        [views addObject:v];
-    }
-    for (UIView *v in views) {
-        for (UIGestureRecognizer *gr in v.gestureRecognizers) {
-            NSString *cn = NSStringFromClass([gr class]);
-            if (![cn containsString:@"Tap"]) continue;      // 只认 tap，别的（长按/拖拽）不动
-            NSMutableArray *store = [NSMutableArray array];
-            NSString *ts = DYYYLPExitGRTargets(gr, store);
-            DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ①-E 手势 %@ @%@ → %@",
-                           cn, NSStringFromClass([v class]), ts.length ? ts : @"（无 target）"]);
-            [cand addObjectsFromArray:store];
-        }
-    }
-    if (DYYYLPExitTryTapTargets(cand, what)) return YES;
-
-    // B 段：全屏交互层（AWEDPlayerInteractionView 等）上的 tap —— 横屏点击的派发方
-    [cand removeAllObjects];
-    UIView *root = backView;
-    while (root.superview && ![root.superview isKindOfClass:[UIWindow class]]) root = root.superview;
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
-    NSUInteger guard = 0;
-    while (stack.count > 0 && guard++ < 3000) {
-        UIView *v = stack.lastObject;
-        [stack removeLastObject];
-        for (UIView *s in v.subviews) [stack addObject:s];
-        NSString *vn = NSStringFromClass([v class]);
-        if (![vn containsString:@"Interaction"]) continue;
-        for (UIGestureRecognizer *gr in v.gestureRecognizers) {
-            if (![NSStringFromClass([gr class]) containsString:@"Tap"]) continue;
-            NSMutableArray *store = [NSMutableArray array];
-            DYYYLPExitGRTargets(gr, store);
-            for (NSArray *p in store) {
-                NSString *an = p[1];
-                if ([an containsString:@"Tap"] && ![an containsString:@"Double"] &&
-                    ![an containsString:@"TwoFinger"]) {
-                    [cand addObject:p];
-                    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ①-F 交互层 %@ -%@", vn, an]);
-                }
-            }
-        }
-    }
-    return DYYYLPExitTryTapTargets(cand, what);
-}
-
-// 诊断：把横屏页所有手势（类名 + 挂在哪 + target/action）打出来，①-E 没命中时靠这条定位。
-static void DYYYLPExitDumpGestures(UIView *root) {
-    if (!root) return;
-    NSMutableArray<NSString *> *lines = [NSMutableArray array];
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
-    while (stack.count > 0 && lines.count < 25) {
-        UIView *v = stack.lastObject;
-        [stack removeLastObject];
-        for (UIView *s in v.subviews) [stack addObject:s];
-        for (UIGestureRecognizer *gr in v.gestureRecognizers) {
-            NSString *ts = DYYYLPExitGRTargets(gr, nil);
-            [lines addObject:[NSString stringWithFormat:@"%@@%@[%@]",
-                              NSStringFromClass([gr class]), NSStringFromClass([v class]),
-                              ts.length ? ts : @"无"]];
-        }
-    }
-    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] 横屏手势（%lu）：%@",
-                   (unsigned long)lines.count, lines.count ? [lines componentsJoinedByString:@" | "] : @"（无）"]);
-}
 
 // ④ 退出后的自愈：竖屏 feed 会以「横屏尺寸」残留（itemSize 宽>高 → 一屏塞两个"半屏"视频）。
 //    实测抖音的横屏返回入口拿不到（横屏点击全由 touches 层处理，手势也只有 pan/交互式 pop，
@@ -4380,6 +4110,9 @@ static void DYYYLPExitDumpGestures(UIView *root) {
 static BOOL DYYYLPExitHealFeed(void) {
     NSArray<UIWindow *> *wins = [UIApplication sharedApplication].windows;
     NSMutableString *winInfo = [NSMutableString string];
+    UIWindow *kw = [UIApplication sharedApplication].keyWindow;
+    [winInfo appendFormat:@"key=%@%@", kw ? NSStringFromClass([kw class]) : @"nil",
+                        kw ? NSStringFromCGRect(kw.bounds) : @""];
     NSMutableArray<NSString *> *diag = [NSMutableArray array];
     UICollectionView *best = nil;
     CGFloat bestArea = -1;
@@ -4394,15 +4127,19 @@ static BOOL DYYYLPExitHealFeed(void) {
             for (UIView *s in v.subviews) [stack addObject:s];
             if (![v isKindOfClass:[UICollectionView class]]) continue;
             UICollectionView *c = (UICollectionView *)v;
-            if (!c.window || c.bounds.size.width < 100 || c.bounds.size.height < 100) continue;
+            if (!c.window || c.bounds.size.width < 120 || c.bounds.size.height < 120) continue;
             BOOL land = DYYYLPExitHasLandscapeAncestor(c);
-            [diag addObject:[NSString stringWithFormat:@"%@%@ sup=%@ 可见%lu个%@",
+            BOOL flow = [c.collectionViewLayout isKindOfClass:[UICollectionViewFlowLayout class]];
+            BOOL vertical = (c.contentSize.height > c.bounds.size.height * 1.2);
+            [diag addObject:[NSString stringWithFormat:@"%@%@ content=%@ 可见%lu个%@%@%@",
                              NSStringFromClass([c class]), NSStringFromCGRect(c.bounds),
-                             c.superview ? NSStringFromClass([c.superview class]) : @"-",
-                             (unsigned long)[[c visibleCells] count], land ? @"(横屏树)" : @""]];
+                             NSStringFromCGSize(c.contentSize),
+                             (unsigned long)[[c visibleCells] count],
+                             flow ? @"(flow)" : @"", vertical ? @"(纵向长)" : @"", land ? @"(横屏树)" : @""]];
             if (land) continue;                                  // 横屏页自己的 collectionView 不动
+            if (!vertical) continue;                             // 真·竖屏 feed 纵向内容一定远长于一屏
             CGFloat area = c.bounds.size.width * c.bounds.size.height;
-            if (c.bounds.size.height >= c.bounds.size.width) area *= 1.5;   // 优先竖屏形状
+            if (flow) area *= 2.0;
             if (area > bestArea) { bestArea = area; best = c; }
         }
     }
@@ -4504,38 +4241,58 @@ static void DYYYLPExitHealSchedule(int attempt) {
         DYYYLPExitHealSchedule(attempt + 1);
     });
 }
-// （原「横屏页控件类名 dump」已被 ①-C 的更详细版本取代：带 window 坐标 + 注册的 action）
-
-// ② 兜底的通用退出 —— 复刻「先转竖屏、再收起」的时序。
-//    ⚠️ 实测这条不完美：收起后竖屏 feed 偶尔停在两个 cell 中间（错位），
-//    所以挂上 ④ 的自愈；能走 ①-D 的话根本不会到这儿。
+// ② 兜底的通用退出 —— 复刻「先转竖屏、再收起」的时序，并把录到的抖音收尾按原样回放一次。
+//    ⚠️ 这条本身不完美（收起后 feed 偶尔残留横屏尺寸），所以后面必定跟 ④ 自愈。
 static void DYYYLPExitFallbackDismiss(UIViewController *top) {
     if (!top) return;
-    if (top.presentingViewController) {
-        [[UIDevice currentDevice] setValue:@(UIInterfaceOrientationPortrait) forKey:@"orientation"];
-        [UIViewController attemptRotationToDeviceOrientation];
-        __weak UIViewController *weakTop = top;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            UIViewController *t = weakTop;
-            if (!t || !t.presentingViewController) return;
+    if (!top.presentingViewController) {
+        UINavigationController *nc = top.navigationController;
+        if (nc && nc.viewControllers.count > 1) {
+            [nc popViewControllerAnimated:YES];
+            DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ② pop 生效（%@）", NSStringFromClass([top class])]);
+        }
+        return;
+    }
+    // 录到的抖音收尾（config / rotate afterQuitFromLandscapeFeed:）—— 原接收者、原参数回放
+    id postHolder = gDYYYLPRecPostHolder;
+    NSString *postSel = gDYYYLPRecPostSel;
+    id postArg = gDYYYLPRecPostArg;
+    BOOL canReplay = (postHolder && postSel.length > 0 &&
+                      [postHolder respondsToSelector:NSSelectorFromString(postSel)]);
+
+    [[UIDevice currentDevice] setValue:@(UIInterfaceOrientationPortrait) forKey:@"orientation"];
+    [UIViewController attemptRotationToDeviceOrientation];
+    __weak UIViewController *weakTop = top;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        UIViewController *t = weakTop;
+        if (t && t.presentingViewController) {
             [t dismissViewControllerAnimated:YES completion:nil];
             DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ② 转竖屏后 dismiss（%@）",
                            NSStringFromClass([t class])]);
+        }
+        // 收起完成后再把抖音自己的收尾按原样调一次（feed 错位就是这一步原本没跑）
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (canReplay) {
+                @try {
+                    ((void (*)(id, SEL, id))objc_msgSend)(postHolder, NSSelectorFromString(postSel), postArg);
+                    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ② 已回放抖音收尾 -%@（%@）",
+                                   postSel, NSStringFromClass([postHolder class])]);
+                } @catch (__unused NSException *e) {
+                    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ② 回放 -%@ 抛异常", postSel]);
+                }
+            } else {
+                DYYYSpeedDiag(@"[lp-exit] ② 没录到抖音收尾，只能靠 ④ 自愈");
+            }
         });
-        DYYYSpeedDiag(@"[lp-exit] ② 已转竖屏，0.35s 后收起横屏页");
-        // ④ 退出后自愈：每 0.6s 重试，直到 feed 恢复「1 个 cell 铺满竖屏」
-        DYYYLPExitHealSchedule(1);
-        return;
-    }
-    UINavigationController *nc = top.navigationController;
-    if (nc && nc.viewControllers.count > 1) {
-        [nc popViewControllerAnimated:YES];
-        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ② pop 生效（%@）", NSStringFromClass([top class])]);
-    }
+    });
+    DYYYSpeedDiag(@"[lp-exit] ② 已转竖屏，0.35s 后收起并回放收尾");
+    // ④ 退出后自愈：每 0.6s 重试，直到 feed 恢复「1 个 cell 铺满竖屏」
+    DYYYLPExitHealSchedule(1);
 }
 
-// 退出横屏全屏：三条路依次试，成功即停
+// 退出横屏全屏：① 回放抖音自己的退出 block → ①′ 属性扫描兜底 → ② 收起 + 回放抖音收尾（+④ 自愈）
 static BOOL DYYYLPExitLandscape(void) {
     UIViewController *top = DYYYLPExitTopViewController();
     if (!top) {
@@ -4546,7 +4303,7 @@ static BOOL DYYYLPExitLandscape(void) {
         DYYYSpeedDiag(@"[lp-exit] 顶层有弹出面板，跳过退出");
         return NO;
     }
-    // 更准的一道：当前最上层 VC 的视图必须还在我们挂手势的那棵视图树里。
+    // 当前最上层 VC 的视图必须还在我们挂手势的那棵视图树里。
     // 弹了评论/设置等面板时它是另一支，这里就会判否 → 不误退。
     UIView *host = gDYYYLPExitGesture.view;
     if (!host || host.window == nil ||
@@ -4555,126 +4312,60 @@ static BOOL DYYYLPExitLandscape(void) {
                        NSStringFromClass([top class])]);
         return NO;
     }
-    NSArray<UIViewController *> *vcs = DYYYLPExitCollectVCs(top);
 
-    // ① 抖音自己的「退出/收起」回调 block。
-    //    ⚠️ 关键坑：transitioningDelegate / delegate / innerVC 都是 weak 属性，
-    //       object_getIvar 读不到（weak 存在 side table），必须走属性 getter 显式取 ——
-    //       抖音的交互式退出转场控制器（带 customizeDismissBlock / panProgress）正挂在这些位置。
-    NSMutableArray<UIViewController *> *scan = [NSMutableArray arrayWithArray:vcs];
-    for (UIViewController *vc in DYYYLPExitAllVCs()) {
-        if (![scan containsObject:vc]) [scan addObject:vc];
+    // ===== ① 回放抖音自己的「退出横屏」block（录制钩子从 setExitLandscapeBlock: 录到的）=====
+    if (gDYYYLPRecExitBlock) {
+        const char *sig = DYYYLPBlockSignature(gDYYYLPRecExitBlock);
+        id holder = gDYYYLPRecBlockHolder;
+        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ① 回放 exitLandscapeBlock（持有者=%@ 签名=%s）",
+                       holder ? NSStringFromClass([holder class]) : @"(已释放)", sig ?: "-"]);
+        if (DYYYLPExitInvokeBlock(gDYYYLPRecExitBlock, top.view)) {
+            DYYYSpeedDiag(@"[lp-exit] ① 已回放，0.6s 后复查是否退出");
+            __weak UIViewController *wtop = top;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                UIViewController *t = wtop;
+                if (!t || !t.presentingViewController) {
+                    DYYYSpeedDiag(@"[lp-exit] ✅ ① 回放成功（横屏页已自己收起）");
+                    DYYYLPExitHealSchedule(1);
+                    return;
+                }
+                DYYYSpeedDiag(@"[lp-exit] ① 回放没退出，转 ②");
+                DYYYLPExitFallbackDismiss(t);
+            });
+            return YES;
+        }
+        DYYYSpeedDiag(@"[lp-exit] ① block 签名不支持回放，转 ①′");
+    } else {
+        DYYYSpeedDiag(@"[lp-exit] ① 还没录到 exitLandscapeBlock，转 ①′");
     }
+
+    // ===== ①′ 属性扫描兜底：万一录制钩子没装上，仍按属性名找抖音的退出 block =====
+    //      ⚠️ weak 属性（transitioningDelegate / delegate / innerVC）object_getIvar 读不到，
+    //         必须走属性 getter 显式取。
     NSMutableArray *holders = [NSMutableArray array];
-    for (UIViewController *vc in scan) {
+    for (UIViewController *vc in DYYYLPExitAllVCs()) {
         DYYYLPAddUnique(holders, vc);
         DYYYLPAddUnique(holders, DYYYLPExitBlockHolderInVC(vc));
         @try { DYYYLPAddUnique(holders, [vc valueForKey:@"transitioningDelegate"]); } @catch (__unused NSException *e) {}
         @try { DYYYLPAddUnique(holders, [vc valueForKey:@"delegate"]); } @catch (__unused NSException *e) {}
         @try { DYYYLPAddUnique(holders, [vc valueForKey:@"innerVC"]); } @catch (__unused NSException *e) {}
     }
-    // 横屏页视图树里所有手势及其 delegate（交互式退出转场常挂在 pan 手势的 delegate 上）
-    NSMutableArray<UIView *> *vstack = [NSMutableArray arrayWithObject:top.view];
-    while (vstack.count > 0) {
-        UIView *v = vstack.lastObject;
-        [vstack removeLastObject];
-        for (UIGestureRecognizer *gr in v.gestureRecognizers) {
-            DYYYLPAddUnique(holders, gr);
-            DYYYLPAddUnique(holders, gr.delegate);
-        }
-        for (UIView *s in v.subviews) [vstack addObject:s];
-    }
     for (id holder in holders) {
         NSString *used = nil;
         if (DYYYLPExitTryBlocks(holder, &used)) {
-            DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ① %@ 生效（持有者=%@，候选 %lu 个）",
+            DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ①′ %@ 生效（持有者=%@，候选 %lu 个）",
                            used, NSStringFromClass([holder class]), (unsigned long)holders.count]);
+            DYYYLPExitHealSchedule(1);
             return YES;
         }
     }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ①′ 属性扫描也没找到（候选 %lu 个），走 ②",
+                   (unsigned long)holders.count]);
 
-    // ①-B 探明 AWENoxusHighlightButton 的可用入口（只记日志，不调用、不阻断后面的路）
-    DYYYLPExitDumpBackButton(top.view);
-
-    // ①-C 按 action 名认返回键 —— 实测横屏 UI 全部无 target-action（整个横屏页都靠上层派发点击），
-    //      这条从未命中，保留只是为了日志（会 dump 横屏页所有控件与 action）。
-    DYYYLPExitTapNamedBackControl(top.view);
-
-    // ①-D 真·返回键入口：找到抖音自己的「返回」处理方法并调用（= 等价于手指点返回键）
-    UIView *backView = DYYYLPExitFindCornerButton(top.view);
-    NSString *what = nil;
-    if (DYYYLPExitInvokeBackHandler(backView, &what)) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ①-D 已调用 %@", what]);
-        __weak UIViewController *wtop = top;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            UIViewController *t = wtop;
-            if (!t || !t.presentingViewController) {
-                DYYYSpeedDiag(@"[lp-exit] ①-D 退出成功（横屏页已自己收起）");
-                DYYYLPExitHealSchedule(1);
-                return;
-            }
-            DYYYSpeedDiag(@"[lp-exit] ①-D 没退出，转 ①-E");
-            NSString *what2 = nil;
-            if (DYYYLPExitFireCornerTapGesture(backView, &what2)) {
-                DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ①-E 已触发返回键手势 %@", what2]);
-                DYYYLPExitHealSchedule(1);
-                return;
-            }
-            DYYYSpeedDiag(@"[lp-exit] ①-E 没触发，转 ②");
-            DYYYLPExitFallbackDismiss(t);
-        });
-        return YES;
-    }
-    DYYYSpeedDiag(@"[lp-exit] ①-D 没找到返回键处理方法");
-
-    // ①-E 触发返回键上的 tap 手势（横屏点击是手势派发，真正的处理者挂在手势 target 上）
-    if (DYYYLPExitFireCornerTapGesture(backView, &what)) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ①-E 已触发返回键手势 %@", what]);
-        __weak UIViewController *wtop2 = top;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            UIViewController *t = wtop2;
-            if (!t || !t.presentingViewController) {
-                DYYYSpeedDiag(@"[lp-exit] ①-E 退出成功（横屏页已自己收起）");
-                DYYYLPExitHealSchedule(1);
-                return;
-            }
-            DYYYSpeedDiag(@"[lp-exit] ①-E 没退出，转 ②");
-            DYYYLPExitFallbackDismiss(t);
-        });
-        return YES;
-    }
-    DYYYLPExitDumpGestures(top.view);      // ①-E 也没命中 → 把手势清单打出来（下一版照它调）
-    DYYYSpeedDiag(@"[lp-exit] ①-E 没触发，直接走 ②");
-
-    // ② 兜底通用返回
-    if (top.presentingViewController) {
-        DYYYLPExitFallbackDismiss(top);
-        return YES;
-    }
-    UINavigationController *nc = top.navigationController;
-    if (nc && nc.viewControllers.count > 1) {
-        [nc popViewControllerAnimated:YES];
-        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ② pop 生效（%@）", NSStringFromClass([top class])]);
-        return YES;
-    }
-
-    // ③ 返回键动作
-    NSArray<NSString *> *sels = @[@"clickBackButton", @"didClickBackButton", @"handleBackButton", @"onClickBackButton"];
-    for (UIViewController *vc in vcs) {
-        for (NSString *name in sels) {
-            SEL s = NSSelectorFromString(name);
-            if (![vc respondsToSelector:s]) continue;
-            ((void (*)(id, SEL))objc_msgSend)(vc, s);
-            DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ③ %@ -%@ 生效", NSStringFromClass([vc class]), name]);
-            return YES;
-        }
-    }
-
-    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ❌ 三条路都没走通（顶层=%@ 共搜到 %lu 个 VC）",
-                   NSStringFromClass([top class]), (unsigned long)vcs.count]);
-    return NO;
+    // ===== ② 收起 + 回放抖音收尾（+ ④ 自愈）=====
+    DYYYLPExitFallbackDismiss(top);
+    return YES;
 }
 
 @interface DYYYLPExitGestureTarget : NSObject <UIGestureRecognizerDelegate>
@@ -4714,7 +4405,7 @@ shouldBeRequiredToFailByGestureRecognizer:(UIGestureRecognizer *)otherGestureRec
 static void DYYYLPExitArm(UIView *host) {
     if (!host) return;
     if (gDYYYLPExitGesture) return;
-    DYYYLPExitClassScanOnce();   // 进横屏打一次「横屏族返回/退出方法」清单（只打一次）
+    DYYYLPRecInstall();          // 补装一次录制钩子（幂等，防漏掉晚加载的类）
     DYYYLPExitGestureTarget *t = [DYYYLPExitGestureTarget new];
     UILongPressGestureRecognizer *g =
         [[UILongPressGestureRecognizer alloc] initWithTarget:t action:@selector(handleLongPress:)];
@@ -4725,7 +4416,10 @@ static void DYYYLPExitArm(UIView *host) {
     [host addGestureRecognizer:g];
     gDYYYLPExitGesture = g;
     gDYYYLPExitTarget = t;
-    DYYYSpeedDiag(@"[lp-exit] 横屏长按退出已就绪（0.30s）");
+    DYYYSpeedDiag([NSString stringWithFormat:
+                   @"[lp-exit] 横屏长按退出已就绪（0.30s）；录制状态：退出block=%@ 收尾=%@",
+                   gDYYYLPRecExitBlock ? @"有" : @"无",
+                   gDYYYLPRecPostSel.length ? gDYYYLPRecPostSel : @"无"]);
 }
 
 static void DYYYLPExitDisarm(void) {
@@ -15819,6 +15513,13 @@ static void findTargetViewInView(UIView *view) {
         @"DYYYKeepNowPlayingInBackground" : @YES,
         @"DYYYDiagLog" : @YES
     }];
+    // 横屏长按退出：装上「录制钩子」抓住抖音自己的退出流程
+    // （setExitLandscapeBlock: / config|rotateAfterQuitFromLandscapeFeed:），
+    //  再用两轮补装覆盖稍后才注册的类。
+    DYYYLPRecInstall();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ DYYYLPRecInstall(); });
+
     // 老版本遗留开关值清掉（该功能已移除，留着只会在设置页/调试时造成困惑）
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"DYYYDisableFeedNowPlayingInfo"];
 
