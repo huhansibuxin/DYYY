@@ -191,44 +191,116 @@ static void DYYYFSInstallOrientationHook(void) {
     });
 }
 
-// 反向全屏：临时收紧为「仅横屏右」→ 抖音原生入口直接落右（一次到位）→ 稳定后放开
+// 取当前最上层的 VC（用于 setNeedsUpdateOfSupportedInterfaceOrientations）
+static UIViewController *DYYYFSTopViewController(void) {
+    UIWindow *keyWin = nil;
+    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+        if ([s isKindOfClass:[UIWindowScene class]] &&
+            s.activationState == UISceneActivationStateForegroundActive) {
+            for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                if (w.isKeyWindow) { keyWin = w; break; }
+            }
+            break;
+        }
+    }
+    if (!keyWin) keyWin = [UIApplication sharedApplication].keyWindow;
+    UIViewController *vc = keyWin.rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
+}
+
+// 翻到右边：三种手段按「干预从轻到重」依次试，任一成功即止。
+// 背景：v35 日志已证明抖音是【显式强推方向】，会绕开 delegate 的 mask（mask 被咨询但结果被无视），
+//       且单独的 requestGeometryUpdate 在本机静默失效 —— 所以必须递进兜底。
+static void DYYYFSFlipToRight(void) {
+    __block NSInteger stage = 0;
+
+    __block void (^step)(void);
+    step = ^{
+        if (DYYYFSCurrentOrientation() == UIInterfaceOrientationLandscapeRight) {
+            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] ✅ 已到右边（stage=%ld 生效）", (long)stage]);
+            return;
+        }
+        if (stage >= 3) {
+            DYYYFSDiag(@"[fs-rev] ❌ 三种手段都没翻过去");
+            return;
+        }
+        stage++;
+        if (stage == 1) {
+            DYYYFSDiag(@"[fs-rev] 手段1/3 setNeedsUpdateOfSupportedInterfaceOrientations");
+            if (@available(iOS 16.0, *)) {
+                UIViewController *vc = DYYYFSTopViewController();
+                if ([vc respondsToSelector:@selector(setNeedsUpdateOfSupportedInterfaceOrientations)]) {
+                    [vc setNeedsUpdateOfSupportedInterfaceOrientations];
+                }
+            }
+        } else if (stage == 2) {
+            DYYYFSDiag(@"[fs-rev] 手段2/3 requestGeometryUpdate(LandscapeRight)");
+            DYYYFSRequestOrientationOnce(UIInterfaceOrientationLandscapeRight);
+        } else {
+            DYYYFSDiag(@"[fs-rev] 手段3/3 KVC 强设 device orientation=LandscapeRight");
+            @try {
+                [[UIDevice currentDevice] setValue:@(UIInterfaceOrientationLandscapeRight) forKey:@"orientation"];
+            } @catch (__unused NSException *e) {}
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), step);
+    };
+    step();
+}
+
+// 反向全屏：先走抖音原生入口进横屏（必定成功），等旋转彻底停稳后再翻到右边。
+// ——老板口径：允许"多转一下"，但全屏观看（老入口）绝不能被翻。
 static void DYYYFSEnterReverse(UIView *entryView) {
     if (!entryView) return;
     DYYYFSInstallOrientationHook();
     gDYYYFSMaskHits = 0;
-    gDYYYFSForceReverse = YES;
-    DYYYFSDiag(@"[fs-rev] 收紧=仅横屏右，进入");
+    gDYYYFSForceReverse = YES;  // 收紧（抖音会绕开，但能压制它把方向自动拨回左）
+    DYYYFSDiag(@"[fs-rev] 反向全屏：先进横屏，稳定后翻到右");
     simulateTapOnEntryView(entryView);
 
-    __block void (^poll)(NSInteger);
-    poll = ^(NSInteger n) {
+    __block void (^poll)(NSInteger, NSInteger);
+    poll = ^(NSInteger n, NSInteger stable) {
         UIInterfaceOrientation cur = DYYYFSCurrentOrientation();
         BOOL isLand = (cur == UIInterfaceOrientationLandscapeLeft || cur == UIInterfaceOrientationLandscapeRight);
-        if (isLand) {
-            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 落点 cur=%ld n=%ld", (long)cur, (long)n]);
-            if (cur != UIInterfaceOrientationLandscapeRight) {
-                DYYYFSRequestOrientationOnce(UIInterfaceOrientationLandscapeRight);
+        if (!isLand) {
+            if (n < 14) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    poll(n + 1, 0);
+                });
+                return;
             }
-            // 保持收紧 1 秒，防抖音随后把方向拨回左边；随后放开（老入口不受影响）
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            gDYYYFSForceReverse = NO;
+            DYYYFSDiag(@"[fs-rev] 2.1s 未进横屏，放弃");
+            return;
+        }
+        if (cur == UIInterfaceOrientationLandscapeRight) {
+            DYYYFSDiag(@"[fs-rev] 一进来就在右边，无需翻转");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 gDYYYFSForceReverse = NO;
-                DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 已放开收紧 cur=%ld",
-                            (long)DYYYFSCurrentOrientation()]);
             });
             return;
         }
-        if (n < 10) {
+        // 已经横屏左：连续两次读到同一个方向才算动画停稳（否则请求会被系统打包成迟到效应）
+        stable += 1;
+        if (stable < 2) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                poll(n + 1);
+                poll(n + 1, stable);
             });
             return;
         }
-        // 没进横屏：立刻放开，绝不把方向锁死
-        gDYYYFSForceReverse = NO;
-        DYYYFSDiag(@"[fs-rev] 1.5s 未进横屏，已放开收紧");
+        DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 已稳定在左 n=%ld，开始翻右", (long)n]);
+        DYYYFSFlipToRight();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            gDYYYFSForceReverse = NO;
+            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 已放开收紧 cur=%ld",
+                        (long)DYYYFSCurrentOrientation()]);
+        });
     };
-    poll(1);
+    poll(1, 0);
 }
+
+// 说明：v34/v35 走的「收紧 mask 一次落右」路线已证伪 —— 抖音横屏是显式强推方向，
+// delegate 的 mask 会被咨询但不被采纳，故删除该实现，不再保留死代码。
 
 // 「反向全屏」菜单项开关：未设置过 = 默认显示（老板要求默认打开）
 static BOOL DYYYFSReverseItemEnabled(void) {
