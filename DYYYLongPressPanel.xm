@@ -90,29 +90,36 @@ static void DYYYFSDiag(NSString *msg) {
     } @catch (__unused NSException *e) {}
 }
 
-// ⚠️【进全屏前的方向准备】——两件事，都在「长按菜单刚收起、界面还在竖屏」这一刻做，所以是无感的。
-//
-// 1) 清残留：反向全屏是靠改 scene 的方向偏好实现的，这个偏好会【留在 scene 上】，
-//    之后每次进全屏（含「全屏观看」）都被带成同一侧，必须杀后台才恢复（老板实测）。
-//    证据：v37 用「读 UIDevice.orientation 判断是否横屏」当开关，日志里一次都没触发；
-//    v38 打全量日志后看到 `入口复位 UIDevice 1→1`、`1.2s ... UIDevice=1` —— KVC 写进去的值【读回来恒为 1】，
-//    所以残留不在 UIDevice，而在 scene 几何偏好里。清理必须【无条件写】，不能以读值当开关。
-//
-// 2) 预置目标侧（seed）：把偏好收窄成「竖屏 + 仅目标横屏侧」再点抖音原生入口 ——
-//    竖屏仍在允许范围内，所以菜单此刻不会被转走；而抖音入口一旦转横屏，唯一可选项就是目标侧，
-//    于是【一次到位】落到目标侧，不再需要「先进左、再翻右」那次多余的旋转（老板要的"别转圈"）。
-static void DYYYFSPrepareEntryOrientation(UIInterfaceOrientation seed) {
-    UIDeviceOrientation before = [UIDevice currentDevice].orientation;
-    [[UIDevice currentDevice] setValue:@(UIDeviceOrientationPortrait) forKey:@"orientation"];
+// 两个目标侧，按老板肉眼方向命名：
+//   「左」= UIInterfaceOrientationLandscapeRight(3) —— 抖音原生入口自己会落的那一侧
+//   「右」= UIInterfaceOrientationLandscapeLeft(4)  —— 反向全屏要的那一侧（日志里翻面成功后 cur=4）
+static UIInterfaceOrientation DYYYFSNormalTarget(void)  { return UIInterfaceOrientationLandscapeRight; }
+static UIInterfaceOrientation DYYYFSReverseTarget(void) { return UIInterfaceOrientationLandscapeLeft;  }
 
-    UIInterfaceOrientationMask mask = UIInterfaceOrientationMaskAllButUpsideDown;   // 默认：还原抖音原生行为
-    if (seed == UIInterfaceOrientationLandscapeLeft || seed == UIInterfaceOrientationLandscapeRight) {
-        UIInterfaceOrientationMask side = (seed == UIInterfaceOrientationLandscapeLeft)
-            ? UIInterfaceOrientationMaskLandscapeLeft : UIInterfaceOrientationMaskLandscapeRight;
-        mask = UIInterfaceOrientationMaskPortrait | side;
-        // 与翻面同一套约定（UIInterfaceOrientation 的值直接喂给 UIDevice.orientation）
-        [[UIDevice currentDevice] setValue:@(seed) forKey:@"orientation"];
-    }
+// ⚠️【进全屏前的方向准备】——在「长按菜单刚收起、界面还在竖屏」这一刻执行，无感。
+//
+// 做法（老板拍板的口径）：**把 scene 几何偏好直接设成本次要落的那一侧**，再点抖音原生入口：
+//   · 点「全屏观看」→ 偏好设成「竖屏 + 左」
+//   · 点「反向全屏」→ 偏好设成「竖屏 + 右」
+// 竖屏仍在允许范围内，所以菜单此刻不会被转走；而抖音入口一旦转横屏，唯一可选项就是指定侧，
+// 于是【一次到位】落到目标侧 —— 不再需要「先进左、再翻右」那次多余的旋转（不转圈，也更像系统自动旋转）。
+//
+// 同时它天然解决了「方向粘住」：反向全屏留下的偏好会一直留在 scene 上，导致之后每次进全屏都被带成同一侧
+// （老板实测：必须杀后台才恢复）。现在每次进屏都【无条件重设】偏好，残留自动被覆盖。
+// 证据链：v37 用「读 UIDevice.orientation 判断是否横屏」当开关，日志里一次都没触发；
+//        v38 全量日志显示 `入口复位 UIDevice 1→1`、`1.2s ... UIDevice=1` —— KVC 写进去的值【读回来恒为 1】，
+//        说明残留不在 UIDevice，而在 scene 几何偏好里。所以清理【无条件写】，不能以读值当开关。
+static void DYYYFSPrepareEntryOrientation(UIInterfaceOrientation seed) {
+    if (seed == UIInterfaceOrientationUnknown) seed = DYYYFSNormalTarget();   // 未指定 = 抖音原生那一侧
+
+    UIInterfaceOrientationMask side = (seed == UIInterfaceOrientationLandscapeLeft)
+        ? UIInterfaceOrientationMaskLandscapeLeft : UIInterfaceOrientationMaskLandscapeRight;
+    UIInterfaceOrientationMask mask = UIInterfaceOrientationMaskPortrait | side;
+
+    UIDeviceOrientation before = [UIDevice currentDevice].orientation;
+    // 与翻面同一套约定：UIInterfaceOrientation 的值直接喂给 UIDevice.orientation（实测 设 4 就得 4）
+    [[UIDevice currentDevice] setValue:@(seed) forKey:@"orientation"];
+
     if (@available(iOS 16.0, *)) {
         for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
             if ([scene isKindOfClass:[UIWindowScene class]] &&
@@ -123,9 +130,9 @@ static void DYYYFSPrepareEntryOrientation(UIInterfaceOrientation seed) {
             }
         }
     }
-    DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 入口准备 seed=%ld mask=%lu UIDevice %ld→%ld",
-                (long)seed, (unsigned long)mask, (long)before,
-                (long)[UIDevice currentDevice].orientation]);
+    DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 入口预置 seed=%ld(%@) mask=%lu UIDevice %ld→%ld",
+                (long)seed, (seed == DYYYFSReverseTarget() ? @"右/反向" : @"左/全屏"),
+                (unsigned long)mask, (long)before, (long)[UIDevice currentDevice].orientation]);
 }
 
 // 读当前界面方向（iOS13+ 取前台活跃 windowScene；老系统回落 statusBarOrientation）
@@ -164,20 +171,14 @@ static void DYYYFSApplyOrientation(UIInterfaceOrientation target) {
     [UIViewController attemptRotationToDeviceOrientation];
 }
 
-// 反向全屏的目标侧：抖音原生入口默认落 UIInterfaceOrientationLandscapeRight(3)，我们要它的反面(4)。
-// 4 就是老板肉眼看到的「右边」（日志里翻面成功后 cur=4）。
-static UIInterfaceOrientation DYYYFSReverseTarget(void) {
-    return UIInterfaceOrientationLandscapeLeft;   // 4
-}
-
-// 反向全屏：先【预置目标侧】再点抖音原生入口 → 入口一次就落到目标侧（不再转两圈）；
-// 若入口没按预置落（仍落在另一侧），再退回「翻面」兜底（那套三件套已验证有效）。
+// 反向全屏：先【把偏好预置成右侧】再点抖音原生入口 → 入口一次就落到右侧（不再转两圈）；
+// 若入口没按预置落（仍落在左侧），才退回「翻面」兜底（那套三件套已验证有效）。
 static void DYYYFSEnterReverse(UIView *entryView) {
     if (!entryView) return;
     UIInterfaceOrientation target = DYYYFSReverseTarget();
 
-    gDYYYFSEntrySeed = target;                 // 由 simulateTapOnEntryView 消费（清残留 + 按 seed 收窄偏好）
-    DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 反向全屏：预置目标侧 %ld 后进入", (long)target]);
+    gDYYYFSEntrySeed = target;                 // 由 simulateTapOnEntryView 消费（重设偏好 + 预置设备方向）
+    DYYYFSDiag(@"[fs-rev] 反向全屏：预置「竖屏+右」偏好后进入");
     simulateTapOnEntryView(entryView);
 
     __block void (^poll)(NSInteger);
