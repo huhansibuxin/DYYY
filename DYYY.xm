@@ -4507,7 +4507,7 @@ static void DYYYDanmakuPassthroughHit(const char *cls) {
         DYYYDanmakuPassthroughHit("AWEDanmakuContentLabel");
         return NO;
     }
-    return %orig(pointInside, point, event);
+    return %orig;
 }
 
 - (void)setTextColor:(UIColor *)textColor {
@@ -4566,7 +4566,7 @@ static void DYYYDanmakuPassthroughHit(const char *cls) {
         DYYYDanmakuPassthroughHit("XIGDanmakuPlayerView");
         return NO;
     }
-    return %orig(pointInside, point, event);
+    return %orig;
 }
 
 %end
@@ -4587,7 +4587,7 @@ static void DYYYDanmakuPassthroughHit(const char *cls) {
         DYYYDanmakuPassthroughHit("DDanmakuPlayerView");
         return NO;
     }
-    return %orig(pointInside, point, event);
+    return %orig;
 }
 
 %end
