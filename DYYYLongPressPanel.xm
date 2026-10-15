@@ -20,8 +20,12 @@ static UIView *findLandscapeEntryViewInView(UIView *view) {
     return nil;
 }
 
+static void DYYYFSClearOrientationBias(void);   // 定义见下方 DYYYFS 区
+
 static void simulateTapOnEntryView(UIView *entryView) {
     if (!entryView) return;
+    // 进全屏前先清掉「反向全屏」遗留在进程里的设备方向残留（否则「全屏观看」也被带偏，详见 DYYYFSClearOrientationBias）
+    DYYYFSClearOrientationBias();
     if ([entryView respondsToSelector:@selector(sendActionsForControlEvents:)]) {
         [(UIControl *)entryView sendActionsForControlEvents:UIControlEventTouchUpInside];
         return;
@@ -77,6 +81,18 @@ static void DYYYFSDiag(NSString *msg) {
             } @catch (__unused NSException *e) {}
         });
     } @catch (__unused NSException *e) {}
+}
+
+// ⚠️「方向粘住」修复（v37）：「反向全屏」靠 KVC 改 UIDevice.orientation 实现，而这个值会【留在进程里】——
+//    之后每一次点「全屏观看」都被带成横屏右，必须杀后台才恢复
+//    （老板实测：全屏观看→左；反向全屏→右；退出来再点全屏观看→也右；杀后台才回到左）。
+//    对策：任何入口进全屏之前，先把残留的横屏值清回竖屏。长按菜单此时是在竖屏信息流上弹出的，
+//    所以「清回竖屏」是无感的；不调 attemptRotationToDeviceOrientation，避免这一下自己触发旋转。
+static void DYYYFSClearOrientationBias(void) {
+    UIDeviceOrientation cur = [UIDevice currentDevice].orientation;
+    if (cur != UIDeviceOrientationLandscapeLeft && cur != UIDeviceOrientationLandscapeRight) return;
+    [[UIDevice currentDevice] setValue:@(UIDeviceOrientationPortrait) forKey:@"orientation"];
+    DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 清除方向残留 %ld → 1", (long)cur]);
 }
 
 // 读当前界面方向（iOS13+ 取前台活跃 windowScene；老系统回落 statusBarOrientation）
