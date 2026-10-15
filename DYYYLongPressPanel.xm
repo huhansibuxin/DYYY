@@ -20,12 +20,17 @@ static UIView *findLandscapeEntryViewInView(UIView *view) {
     return nil;
 }
 
-static void DYYYFSClearOrientationBias(void);   // 定义见下方 DYYYFS 区
+// 进全屏前要落的目标方向（0 = 不预置，只清场）。由「反向全屏」在点击前设置，simulateTapOnEntryView 消费一次即清空。
+static UIInterfaceOrientation gDYYYFSEntrySeed = 0;
+static void DYYYFSPrepareEntryOrientation(UIInterfaceOrientation seed);   // 定义见下方 DYYYFS 区
 
 static void simulateTapOnEntryView(UIView *entryView) {
+    UIInterfaceOrientation seed = gDYYYFSEntrySeed;
+    gDYYYFSEntrySeed = 0;
     if (!entryView) return;
-    // 进全屏前先清掉「反向全屏」遗留在进程里的设备方向残留（否则「全屏观看」也被带偏，详见 DYYYFSClearOrientationBias）
-    DYYYFSClearOrientationBias();
+    // 进全屏前先清掉上一次「反向全屏」留在 scene 上的方向偏好，并按需预置本次目标侧
+    // （否则「全屏观看」会被带偏，详见 DYYYFSPrepareEntryOrientation 注释）
+    DYYYFSPrepareEntryOrientation(seed);
     if ([entryView respondsToSelector:@selector(sendActionsForControlEvents:)]) {
         [(UIControl *)entryView sendActionsForControlEvents:UIControlEventTouchUpInside];
         return;
@@ -48,13 +53,14 @@ static void simulateTapOnEntryView(UIView *entryView) {
 }
 
 // ======================= 【反向全屏】 =======================
-// 需求：长按菜单「全屏观看」之外，再提供一个【方向相反】的全屏入口。
-// 现状：进全屏靠模拟点击抖音原生横屏入口 AWELandscapeFeedEntryView，方向由抖音自己定
-//      （固定在同一侧），我们此前没有任何方向干预代码。
-// 做法：不改进入方式（不破坏抖音流程），在【进入横屏之后】把界面强制翻到另一侧。
+// 需求：长按菜单「全屏观看」之外，再提供一个【方向相反】的全屏入口，且不要"转两圈"。
+// 现状：进全屏靠模拟点击抖音原生横屏入口 AWELandscapeFeedEntryView，抖音固定落在同一侧(3)。
+// 做法（v39 起）：进屏【之前】把 scene 几何偏好收窄成「竖屏 + 仅目标横屏侧」，再点原生入口 ——
+//      抖音入口转横屏时唯一可选项就是目标侧，于是一次到位落到 4，不再需要"先进左再翻右"的第二段旋转。
+//      万一入口没按预置落，才退回翻面兜底（geometry + KVC + attemptRotationToDeviceOrientation 三件套）。
 // 依据：AwemeCore 二进制核验到 Landscape_right 常量 + AWEXPlayOrientationManager /
 //      LandscapeFeedAutoRotateController，抖音内部本就区分左右两向，翻面不破坏布局。
-// 探针：每次反向操作记 3~4 行（进横屏时 / 0.5s / 1.2s），用来确认抖音有没有把方向拨回。
+// 探针：`入口准备 seed/mask` / `✅ 入口一次落到目标侧` / `翻面兜底` / `1.0s 复核`。
 
 // 精简诊断日志（DYYYSpeedDiag 在 DYYY.xm 里是 static，本编译单元看不到，故另写一份）
 static void DYYYFSDiag(NSString *msg) {
@@ -83,30 +89,42 @@ static void DYYYFSDiag(NSString *msg) {
     } @catch (__unused NSException *e) {}
 }
 
-// ⚠️「方向粘住」修复：「反向全屏」靠 KVC 改 UIDevice.orientation 实现，而这个值会【留在进程里】——
-//    之后每一次点「全屏观看」都被带成横屏同一侧，必须杀后台才恢复
-//    （老板实测：全屏观看→左；反向全屏→右；退出来再点全屏观看→也右；杀后台才回到左）。
-//    v37 曾用「读 .orientation 判断是否为横屏」当开关 → 实测一次都没触发：
-//    读回来的值跟我们写进去的对不上（UIDevice 的 getter 在没 beginGeneratingDeviceOrientationNotifications
-//    时给出的是陈旧值）。所以这里【不再读、直接写死清回竖屏】，另外把 iOS16 scene 的几何偏好一并复位，两条路都堵。
-//    调用时机是长按菜单刚收起、界面还在竖屏时 → 「清回竖屏」无感；不调 attemptRotationToDeviceOrientation，
-//    避免这一下自己触发旋转。
-static void DYYYFSClearOrientationBias(void) {
+// ⚠️【进全屏前的方向准备】——两件事，都在「长按菜单刚收起、界面还在竖屏」这一刻做，所以是无感的。
+//
+// 1) 清残留：反向全屏是靠改 scene 的方向偏好实现的，这个偏好会【留在 scene 上】，
+//    之后每次进全屏（含「全屏观看」）都被带成同一侧，必须杀后台才恢复（老板实测）。
+//    证据：v37 用「读 UIDevice.orientation 判断是否横屏」当开关，日志里一次都没触发；
+//    v38 打全量日志后看到 `入口复位 UIDevice 1→1`、`1.2s ... UIDevice=1` —— KVC 写进去的值【读回来恒为 1】，
+//    所以残留不在 UIDevice，而在 scene 几何偏好里。清理必须【无条件写】，不能以读值当开关。
+//
+// 2) 预置目标侧（seed）：把偏好收窄成「竖屏 + 仅目标横屏侧」再点抖音原生入口 ——
+//    竖屏仍在允许范围内，所以菜单此刻不会被转走；而抖音入口一旦转横屏，唯一可选项就是目标侧，
+//    于是【一次到位】落到目标侧，不再需要「先进左、再翻右」那次多余的旋转（老板要的"别转圈"）。
+static void DYYYFSPrepareEntryOrientation(UIInterfaceOrientation seed) {
     UIDeviceOrientation before = [UIDevice currentDevice].orientation;
     [[UIDevice currentDevice] setValue:@(UIDeviceOrientationPortrait) forKey:@"orientation"];
+
+    UIInterfaceOrientationMask mask = UIInterfaceOrientationMaskAllButUpsideDown;   // 默认：还原抖音原生行为
+    if (seed == UIInterfaceOrientationLandscapeLeft || seed == UIInterfaceOrientationLandscapeRight) {
+        UIInterfaceOrientationMask side = (seed == UIInterfaceOrientationLandscapeLeft)
+            ? UIInterfaceOrientationMaskLandscapeLeft : UIInterfaceOrientationMaskLandscapeRight;
+        mask = UIInterfaceOrientationMaskPortrait | side;
+        // 与翻面同一套约定（UIInterfaceOrientation 的值直接喂给 UIDevice.orientation）
+        [[UIDevice currentDevice] setValue:@(seed) forKey:@"orientation"];
+    }
     if (@available(iOS 16.0, *)) {
         for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
             if ([scene isKindOfClass:[UIWindowScene class]] &&
                 scene.activationState == UISceneActivationStateForegroundActive) {
                 UIWindowSceneGeometryPreferencesIOS *prefs =
-                    [[UIWindowSceneGeometryPreferencesIOS alloc]
-                        initWithInterfaceOrientations:UIInterfaceOrientationMaskAllButUpsideDown];
+                    [[UIWindowSceneGeometryPreferencesIOS alloc] initWithInterfaceOrientations:mask];
                 [(UIWindowScene *)scene requestGeometryUpdateWithPreferences:prefs errorHandler:nil];
             }
         }
     }
-    DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 入口复位 UIDevice %ld→%ld",
-                (long)before, (long)[UIDevice currentDevice].orientation]);
+    DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 入口准备 seed=%ld mask=%lu UIDevice %ld→%ld",
+                (long)seed, (unsigned long)mask, (long)before,
+                (long)[UIDevice currentDevice].orientation]);
 }
 
 // 读当前界面方向（iOS13+ 取前台活跃 windowScene；老系统回落 statusBarOrientation）
@@ -145,32 +163,37 @@ static void DYYYFSApplyOrientation(UIInterfaceOrientation target) {
     [UIViewController attemptRotationToDeviceOrientation];
 }
 
-// 反向全屏：点抖音原生入口 → 进横屏 → 翻到【另一侧】（0.5s / 1.2s 各补确认一次）。
-// 只有一条判断：目标 = 当前方向的反面。不做"是不是已经在右边"之类的判断。
+// 反向全屏的目标侧：抖音原生入口默认落 UIInterfaceOrientationLandscapeRight(3)，我们要它的反面(4)。
+// 4 就是老板肉眼看到的「右边」（日志里翻面成功后 cur=4）。
+static UIInterfaceOrientation DYYYFSReverseTarget(void) {
+    return UIInterfaceOrientationLandscapeLeft;   // 4
+}
+
+// 反向全屏：先【预置目标侧】再点抖音原生入口 → 入口一次就落到目标侧（不再转两圈）；
+// 若入口没按预置落（仍落在另一侧），再退回「翻面」兜底（那套三件套已验证有效）。
 static void DYYYFSEnterReverse(UIView *entryView) {
     if (!entryView) return;
-    DYYYFSDiag(@"[fs-rev] 反向全屏：进横屏后翻到另一侧");
+    UIInterfaceOrientation target = DYYYFSReverseTarget();
+
+    gDYYYFSEntrySeed = target;                 // 由 simulateTapOnEntryView 消费（清残留 + 按 seed 收窄偏好）
+    DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 反向全屏：预置目标侧 %ld 后进入", (long)target]);
     simulateTapOnEntryView(entryView);
 
     __block void (^poll)(NSInteger);
     poll = ^(NSInteger n) {
         UIInterfaceOrientation cur = DYYYFSCurrentOrientation();
+        if (cur == target) {
+            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] ✅ 入口一次落到目标侧 cur=%ld（无翻面）", (long)cur]);
+            return;
+        }
         BOOL isLand = (cur == UIInterfaceOrientationLandscapeLeft || cur == UIInterfaceOrientationLandscapeRight);
         if (isLand) {
-            UIInterfaceOrientation target = (cur == UIInterfaceOrientationLandscapeLeft)
-                ? UIInterfaceOrientationLandscapeRight : UIInterfaceOrientationLandscapeLeft;
-            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 已进横屏 cur=%ld → 翻到 %ld", (long)cur, (long)target]);
+            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 落在 cur=%ld（目标%ld）→ 翻面兜底", (long)cur, (long)target]);
             DYYYFSApplyOrientation(target);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                UIInterfaceOrientation a = DYYYFSCurrentOrientation();
-                DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 0.5s cur=%ld (目标%ld)", (long)a, (long)target]);
-                if (a != target) DYYYFSApplyOrientation(target);
-            });
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 UIInterfaceOrientation b = DYYYFSCurrentOrientation();
-                DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 1.2s cur=%ld (目标%ld) UIDevice=%ld%@",
-                            (long)b, (long)target, (long)[UIDevice currentDevice].orientation,
-                            (b == target ? @" ✓稳定" : @" ✗被拨回")]);
+                DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 1.0s 复核 cur=%ld (目标%ld)%@",
+                            (long)b, (long)target, (b == target ? @" ✓稳定" : @" ✗被拨回")]);
                 if (b != target) DYYYFSApplyOrientation(target);
             });
             return;
@@ -181,7 +204,7 @@ static void DYYYFSEnterReverse(UIView *entryView) {
             });
             return;
         }
-        DYYYFSDiag(@"[fs-rev] 1.6s 内未进入横屏，放弃翻面");
+        DYYYFSDiag(@"[fs-rev] 1.6s 内未进入横屏，放弃");
     };
     poll(1);
 }
