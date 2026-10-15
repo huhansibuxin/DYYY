@@ -4277,28 +4277,11 @@ static NSString *DYYYLPExitGRTargets(UIGestureRecognizer *gr, NSMutableArray *st
 // ①-E 直接触发「返回键上的 tap 手势」——抖音横屏的点击全是手势派发（按钮都没有 target-action），
 //      返回键自身没挂 target-action，但极可能被交互层挂了一只 tap 手势，
 //      手势的 _targets 就是真正的处理者 → 用真实手势对象当参数调用它 = 等价于点了一下返回键。
-static BOOL DYYYLPExitFireCornerTapGesture(UIView *backView, NSString **what) {
-    if (!backView) return NO;
-    NSMutableArray *cand = [NSMutableArray array];
-    // 只看返回键自己 + 小的祖先容器（避开"全屏容器上的通用 tap"，那类调了会误触）
-    NSMutableArray<UIView *> *views = [NSMutableArray arrayWithObject:backView];
-    for (UIView *v = backView.superview; v && views.count < 4; v = v.superview) {
-        if (v.bounds.size.width > 200 || v.bounds.size.height > 200) break;   // 到全屏容器就停
-        [views addObject:v];
-    }
-    for (UIView *v in views) {
-        for (UIGestureRecognizer *gr in v.gestureRecognizers) {
-            NSString *cn = NSStringFromClass([gr class]);
-            if (![cn containsString:@"Tap"]) continue;      // 只认 tap，别的（长按/拖拽）不动
-            NSMutableArray *store = [NSMutableArray array];
-            NSString *ts = DYYYLPExitGRTargets(gr, store);
-            DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ①-E 手势 %@ @%@ → %@",
-                           cn, NSStringFromClass([v class]), ts.length ? ts : @"（无 target）"]);
-            [cand addObjectsFromArray:store];
-        }
-    }
+//      A 段：返回键自己 + 小的祖先容器上的 tap；
+//      B 段（A 段没命中）：AWEDPlayerInteractionView 上的 tap —— 它是全屏交互层，
+//            手势清单实测它带 -handleResponseTapAction:，横屏的点击很可能由它按触点派发。
+static BOOL DYYYLPExitTryTapTargets(NSMutableArray *cand, NSString **what) {
     if (cand.count == 0) return NO;
-    // 优先调「横屏/交互/元素」这一族的 target
     NSMutableArray *ordered = [NSMutableArray array];
     for (NSArray *p in cand) {
         if (DYYYLPExitClassLooksLikeLandscape([p[0] class], NO)) [ordered addObject:p];
@@ -4317,6 +4300,57 @@ static BOOL DYYYLPExitFireCornerTapGesture(UIView *backView, NSString **what) {
         return NO;
     }
     return YES;
+}
+
+static BOOL DYYYLPExitFireCornerTapGesture(UIView *backView, NSString **what) {
+    if (!backView) return NO;
+    NSMutableArray *cand = [NSMutableArray array];
+    // A 段：只看返回键自己 + 小的祖先容器（避开"全屏容器上的通用 tap"，那类调了会误触）
+    NSMutableArray<UIView *> *views = [NSMutableArray arrayWithObject:backView];
+    for (UIView *v = backView.superview; v && views.count < 4; v = v.superview) {
+        if (v.bounds.size.width > 200 || v.bounds.size.height > 200) break;   // 到全屏容器就停
+        [views addObject:v];
+    }
+    for (UIView *v in views) {
+        for (UIGestureRecognizer *gr in v.gestureRecognizers) {
+            NSString *cn = NSStringFromClass([gr class]);
+            if (![cn containsString:@"Tap"]) continue;      // 只认 tap，别的（长按/拖拽）不动
+            NSMutableArray *store = [NSMutableArray array];
+            NSString *ts = DYYYLPExitGRTargets(gr, store);
+            DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ①-E 手势 %@ @%@ → %@",
+                           cn, NSStringFromClass([v class]), ts.length ? ts : @"（无 target）"]);
+            [cand addObjectsFromArray:store];
+        }
+    }
+    if (DYYYLPExitTryTapTargets(cand, what)) return YES;
+
+    // B 段：全屏交互层（AWEDPlayerInteractionView 等）上的 tap —— 横屏点击的派发方
+    [cand removeAllObjects];
+    UIView *root = backView;
+    while (root.superview && ![root.superview isKindOfClass:[UIWindow class]]) root = root.superview;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+    NSUInteger guard = 0;
+    while (stack.count > 0 && guard++ < 3000) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        for (UIView *s in v.subviews) [stack addObject:s];
+        NSString *vn = NSStringFromClass([v class]);
+        if (![vn containsString:@"Interaction"]) continue;
+        for (UIGestureRecognizer *gr in v.gestureRecognizers) {
+            if (![NSStringFromClass([gr class]) containsString:@"Tap"]) continue;
+            NSMutableArray *store = [NSMutableArray array];
+            DYYYLPExitGRTargets(gr, store);
+            for (NSArray *p in store) {
+                NSString *an = p[1];
+                if ([an containsString:@"Tap"] && ![an containsString:@"Double"] &&
+                    ![an containsString:@"TwoFinger"]) {
+                    [cand addObject:p];
+                    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ①-F 交互层 %@ -%@", vn, an]);
+                }
+            }
+        }
+    }
+    return DYYYLPExitTryTapTargets(cand, what);
 }
 
 // 诊断：把横屏页所有手势（类名 + 挂在哪 + target/action）打出来，①-E 没命中时靠这条定位。
@@ -4339,93 +4373,124 @@ static void DYYYLPExitDumpGestures(UIView *root) {
                    (unsigned long)lines.count, lines.count ? [lines componentsJoinedByString:@" | "] : @"（无）"]);
 }
 
-// ④ 退出后的自愈：竖屏 feed 的「错位」实测有两种表现 ——
-//    (a) 滚动停在两个 cell 中间；(b) cell/itemSize 还是横屏尺寸（一屏塞两个"半屏"视频）。
-//    关键：必须等窗口真正转回竖屏再动手，所以这里会重试；成功判据 = 只剩 1 个 cell 且铺满视口。
+// ④ 退出后的自愈：竖屏 feed 会以「横屏尺寸」残留（itemSize 宽>高 → 一屏塞两个"半屏"视频）。
+//    实测抖音的横屏返回入口拿不到（横屏点击全由 touches 层处理，手势也只有 pan/交互式 pop，
+//    没有可调用的 action），所以这里退而求其次：把已退出的 feed 强行重排回竖屏尺寸。
+//    遍历【全部窗口】并把「窗口 / 候选 collectionView」都打进日志 —— 哪一步不成立一眼可见。
 static BOOL DYYYLPExitHealFeed(void) {
-    // 先找「竖屏主窗口」——转屏过程中窗口还是横屏尺寸，这时什么都不动，等下一轮
-    UIWindow *mainWin = nil;
-    CGSize mainSize = CGSizeZero;
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        if (w.windowLevel != UIWindowLevelNormal || !w.rootViewController) continue;
-        if (w.bounds.size.height < w.bounds.size.width) continue;      // 不是竖屏
-        if (w.bounds.size.height > mainSize.height) { mainWin = w; mainSize = w.bounds.size; }
-    }
-    if (!mainWin) {
-        DYYYSpeedDiag(@"[lp-exit] ④ 还没有竖屏主窗口，稍后重试");
-        return NO;
-    }
-    UICollectionView *cv = nil;
+    NSArray<UIWindow *> *wins = [UIApplication sharedApplication].windows;
+    NSMutableString *winInfo = [NSMutableString string];
     NSMutableArray<NSString *> *diag = [NSMutableArray array];
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:mainWin];
-    while (stack.count > 0) {
-        UIView *v = stack.lastObject;
-        [stack removeLastObject];
-        for (UIView *s in v.subviews) [stack addObject:s];
-        if (![v isKindOfClass:[UICollectionView class]]) continue;
-        UICollectionView *c = (UICollectionView *)v;
-        if (!c.window || c.bounds.size.width < 100 || c.bounds.size.height < 100) continue;
-        if (DYYYLPExitHasLandscapeAncestor(c)) continue;
-        BOOL full = (c.bounds.size.height >= mainSize.height * 0.9 && c.bounds.size.width >= mainSize.width * 0.9);
-        [diag addObject:[NSString stringWithFormat:@"%@%@%@", NSStringFromClass([c class]),
-                         NSStringFromCGRect(c.bounds), full ? @"(满屏)" : @""]];
-        if (full) cv = c;
+    UICollectionView *best = nil;
+    CGFloat bestArea = -1;
+    for (UIWindow *w in wins) {
+        [winInfo appendFormat:@"[%@ L%.0f %@]", NSStringFromClass([w class]),
+         (double)w.windowLevel, NSStringFromCGRect(w.bounds)];
+        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:w];
+        NSUInteger guard = 0;
+        while (stack.count > 0 && guard++ < 4000) {
+            UIView *v = stack.lastObject;
+            [stack removeLastObject];
+            for (UIView *s in v.subviews) [stack addObject:s];
+            if (![v isKindOfClass:[UICollectionView class]]) continue;
+            UICollectionView *c = (UICollectionView *)v;
+            if (!c.window || c.bounds.size.width < 100 || c.bounds.size.height < 100) continue;
+            BOOL land = DYYYLPExitHasLandscapeAncestor(c);
+            [diag addObject:[NSString stringWithFormat:@"%@%@ sup=%@ 可见%lu个%@",
+                             NSStringFromClass([c class]), NSStringFromCGRect(c.bounds),
+                             c.superview ? NSStringFromClass([c.superview class]) : @"-",
+                             (unsigned long)[[c visibleCells] count], land ? @"(横屏树)" : @""]];
+            if (land) continue;                                  // 横屏页自己的 collectionView 不动
+            CGFloat area = c.bounds.size.width * c.bounds.size.height;
+            if (c.bounds.size.height >= c.bounds.size.width) area *= 1.5;   // 优先竖屏形状
+            if (area > bestArea) { bestArea = area; best = c; }
+        }
     }
-    if (!cv) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ④ 没找到铺满竖屏的 feed collectionView（候选：%@）",
-                       diag.count ? [diag componentsJoinedByString:@", "] : @"无"]);
-        return NO;
-    }
-    [cv.collectionViewLayout invalidateLayout];
-    [cv setNeedsLayout];
-    [cv layoutIfNeeded];
+    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ④ 窗口(%lu)：%@ | 候选(%lu)：%@",
+                   (unsigned long)wins.count, winInfo, (unsigned long)diag.count,
+                   diag.count ? [diag componentsJoinedByString:@" ;; "] : @"无"]);
+    if (!best) return NO;
 
-    NSArray<UICollectionViewCell *> *cells = [cv visibleCells];
-    NSString *itemStr = @"-";
-    UICollectionViewFlowLayout *fl = [cv.collectionViewLayout isKindOfClass:[UICollectionViewFlowLayout class]]
-        ? (UICollectionViewFlowLayout *)cv.collectionViewLayout : nil;
-    if (fl) itemStr = NSStringFromCGSize(fl.itemSize);
+    NSArray<UICollectionViewCell *> *cells = [best visibleCells];
+    UICollectionViewFlowLayout *fl = [best.collectionViewLayout isKindOfClass:[UICollectionViewFlowLayout class]]
+        ? (UICollectionViewFlowLayout *)best.collectionViewLayout : nil;
     NSMutableArray<NSString *> *frames = [NSMutableArray array];
     for (UICollectionViewCell *c in cells) [frames addObject:NSStringFromCGRect(c.frame)];
-    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ④ feed bounds=%@ itemSize=%@ 可见%lu个 cell=%@",
-                   NSStringFromCGRect(cv.bounds), itemStr, (unsigned long)cells.count,
-                   [frames componentsJoinedByString:@" "]]);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ④ feed %@ bounds=%@ itemSize=%@ 可见%lu个 cell=%@",
+                   NSStringFromClass([best class]), NSStringFromCGRect(best.bounds),
+                   fl ? NSStringFromCGSize(fl.itemSize) : @"(非flow)",
+                   (unsigned long)cells.count, [frames componentsJoinedByString:@" "]]);
 
     BOOL recovered = (cells.count == 1 &&
-                      fabs(cells.firstObject.frame.size.height - cv.bounds.size.height) < 2.0 &&
-                      fabs(cells.firstObject.frame.size.width - cv.bounds.size.width) < 2.0);
+                      fabs(cells.firstObject.frame.size.height - best.bounds.size.height) < 2.0 &&
+                      fabs(cells.firstObject.frame.size.width - best.bounds.size.width) < 2.0);
     if (recovered) {
         DYYYSpeedDiag(@"[lp-exit] ④ feed 已恢复（1 个 cell 铺满视口）");
         return YES;
     }
-    // itemSize 还是横屏尺寸（宽>高）→ 直接纠回视口尺寸（= 抖音转屏后该有的值）
-    if (fl && fl.itemSize.width > fl.itemSize.height && fl.itemSize.width > cv.bounds.size.width + 2.0) {
-        fl.itemSize = cv.bounds.size;
-        [fl invalidateLayout];
-        [cv setNeedsLayout];
-        [cv layoutIfNeeded];
-        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ④ itemSize 是横屏尺寸，已纠正为 %@",
-                       NSStringFromCGRect(cv.bounds)]);
+
+    // 1) itemSize 还是横屏尺寸 → 直接纠回视口尺寸（= 抖音自己转屏后会得到的值）
+    if (fl && fl.itemSize.width > fl.itemSize.height && fl.itemSize.width > best.bounds.size.width + 2.0) {
+        fl.itemSize = best.bounds.size;
+        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ④ itemSize 是横屏尺寸，改为 %@",
+                       NSStringFromCGSize(fl.itemSize)]);
     }
-    for (UICollectionViewCell *c in [cv visibleCells]) {
+    [best.collectionViewLayout invalidateLayout];
+    [best setNeedsLayout];
+    [best layoutIfNeeded];
+
+    // 2) 强推一次「整棵 feed 视图树」重排：把 bounds 抖 1pt 再还原（= 转屏时 UIKit 干的事）
+    UIView *hammer = best;
+    for (int i = 0; i < 4; i++) {
+        if (!hammer.superview || [hammer.superview isKindOfClass:[UIWindow class]]) break;
+        hammer = hammer.superview;
+    }
+    CGRect hf = hammer.frame;
+    hammer.frame = CGRectMake(hf.origin.x, hf.origin.y, hf.size.width, hf.size.height + 1.0);
+    [hammer layoutIfNeeded];
+    hammer.frame = hf;
+    [hammer layoutIfNeeded];
+    [best.collectionViewLayout invalidateLayout];
+    [best setNeedsLayout];
+    [best layoutIfNeeded];
+
+    // 3) 每个可见 cell 重排一次，并把离视口中心最近的项居中
+    for (UICollectionViewCell *c in [best visibleCells]) {
         [c setNeedsLayout];
         [c layoutIfNeeded];
     }
-    // 再把离视口中心最近的 cell 居中
-    CGFloat mid = cv.contentOffset.y + cv.bounds.size.height / 2.0;
+    CGFloat mid = best.contentOffset.y + best.bounds.size.height / 2.0;
     NSIndexPath *pick = nil;
     CGFloat bestD = CGFLOAT_MAX;
-    for (NSIndexPath *ip in [cv indexPathsForVisibleItems]) {
-        UICollectionViewLayoutAttributes *a = [cv.collectionViewLayout layoutAttributesForItemAtIndexPath:ip];
+    for (NSIndexPath *ip in [best indexPathsForVisibleItems]) {
+        UICollectionViewLayoutAttributes *a = [best.collectionViewLayout layoutAttributesForItemAtIndexPath:ip];
         if (!a) continue;
         CGFloat d = fabs(CGRectGetMidY(a.frame) - mid);
         if (d < bestD) { bestD = d; pick = ip; }
     }
     if (pick && bestD >= 2.0) {
-        CGFloat before = cv.contentOffset.y;
-        [cv scrollToItemAtIndexPath:pick atScrollPosition:UICollectionViewScrollPositionCenteredVertically animated:NO];
-        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ④ 已居中 feed（%@ 第 %ld 项，offset %.1f → %.1f）",
-                       NSStringFromClass([cv class]), (long)pick.item, before, cv.contentOffset.y]);
+        CGFloat before = best.contentOffset.y;
+        [best scrollToItemAtIndexPath:pick atScrollPosition:UICollectionViewScrollPositionCenteredVertically animated:NO];
+        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ④ 已居中 feed（第 %ld 项，offset %.1f → %.1f）",
+                       (long)pick.item, before, best.contentOffset.y]);
+    }
+
+    // 4) 还不对？把 cell 内部两层视图打出来（下一版照它判断是 cell 还是播放器视图的锅）
+    NSArray<UICollectionViewCell *> *after = [best visibleCells];
+    if (after.count != 1) {
+        for (UICollectionViewCell *c in after) {
+            NSMutableArray<NSString *> *sub = [NSMutableArray array];
+            for (UIView *s in c.contentView.subviews) {
+                if (sub.count >= 14) break;
+                [sub addObject:[NSString stringWithFormat:@"%@%@", NSStringFromClass([s class]), NSStringFromCGRect(s.frame)]];
+                for (UIView *s2 in s.subviews) {
+                    if (sub.count >= 14) break;
+                    [sub addObject:[NSString stringWithFormat:@"%@%@", NSStringFromClass([s2 class]), NSStringFromCGRect(s2.frame)]];
+                }
+            }
+            DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ④ cell%@ 内部：%@",
+                           NSStringFromCGRect(c.frame), [sub componentsJoinedByString:@" | "]]);
+        }
     }
     return NO;
 }
