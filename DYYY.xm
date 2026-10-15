@@ -4059,7 +4059,7 @@ static void DYYYLPRecInstall(void) {
                      ? (IMP)&DYYYLPRecSetExitBlock : (IMP)&DYYYLPRecPostQuit;
             if (cur == mine) continue;                       // 已经包过了
             NSString *key = [NSString stringWithFormat:@"%s|%@", cn, s];
-            gDYYYLPRecOrig[key] = [NSValue valueWithPointer:cur];
+            gDYYYLPRecOrig[key] = [NSValue valueWithPointer:(const void *)cur];
             method_setImplementation(m, mine);
             [hits addObject:[NSString stringWithFormat:@"%s.%@", cn, s]];
         }
