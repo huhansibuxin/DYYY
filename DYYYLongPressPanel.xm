@@ -92,8 +92,10 @@ static UIInterfaceOrientation DYYYFSCurrentOrientation(void) {
     return [UIApplication sharedApplication].statusBarOrientation;
 }
 
-// 兜底：单独请求一次指定方向（仅在方向不对时调，避免重复动画）
-static void DYYYFSRequestOrientationOnce(UIInterfaceOrientation target) {
+// 强制界面旋转到指定方向 —— 三件套一起上（geometry 请求 + KVC 老法 + attemptRotationToDeviceOrientation）。
+// ⚠️ 第一次（v33）反向全屏真的能翻过去，靠的就是最后那句 attemptRotationToDeviceOrientation；
+//    后面几版把它删了，KVC 那档因此形同虚设。
+static void DYYYFSApplyOrientation(UIInterfaceOrientation target) {
     UIInterfaceOrientationMask mask = (target == UIInterfaceOrientationLandscapeLeft)
         ? UIInterfaceOrientationMaskLandscapeLeft : UIInterfaceOrientationMaskLandscapeRight;
     if (@available(iOS 16.0, *)) {
@@ -109,146 +111,48 @@ static void DYYYFSRequestOrientationOnce(UIInterfaceOrientation target) {
             }
         }
     }
+    [[UIDevice currentDevice] setValue:@(target) forKey:@"orientation"];
+    [UIViewController attemptRotationToDeviceOrientation];
 }
 
-// 说明：v34/v35 的「临时收紧 delegate mask 让抖音一次落右」路线已实测证伪并整段删除 ——
-// 日志证明 mask 被咨询了但结果不被采纳（抖音是显式强推方向），落点始终是左。
-
-// 当前 keyWindow（诊断用：取安全区内边距做左右交叉验证）
-static UIWindow *DYYYFSKeyWindow(void) {
-    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-        if ([s isKindOfClass:[UIWindowScene class]] &&
-            s.activationState == UISceneActivationStateForegroundActive) {
-            for (UIWindow *w in ((UIWindowScene *)s).windows) {
-                if (w.isKeyWindow) return w;
-            }
-            break;
-        }
-    }
-    return [UIApplication sharedApplication].keyWindow;
-}
-
-// 取当前最上层的 VC（用于 setNeedsUpdateOfSupportedInterfaceOrientations）
-static UIViewController *DYYYFSTopViewController(void) {
-    UIWindow *keyWin = DYYYFSKeyWindow();
-    UIViewController *vc = keyWin.rootViewController;
-    while (vc.presentedViewController) vc = vc.presentedViewController;
-    return vc;
-}
-
-// 翻转后的校验：还在左就再来一轮（最多 2 轮），避免"发出去没生效"就收工
-static void DYYYFSFlipToRight(void);
-static void DYYYFSVerifyFlip(NSInteger round) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        UIInterfaceOrientation cur = DYYYFSCurrentOrientation();
-        if (cur == UIInterfaceOrientationLandscapeRight) {
-            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 第%ld轮已生效，收工 cur=%ld",
-                        (long)round, (long)cur]);
-            return;
-        }
-        if (round >= 2) {
-            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 两轮都没翻过去，放弃 cur=%ld", (long)cur]);
-            return;
-        }
-        DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 第%ld轮未生效，再来一轮 cur=%ld",
-                    (long)round, (long)cur]);
-        DYYYFSFlipToRight();
-        DYYYFSVerifyFlip(round + 1);
-    });
-}
-
-// 翻到右边：三种手段按「干预从轻到重」依次试，任一成功即止。
-// 背景：mask 路线已证伪（抖音显式强推方向）；单独 requestGeometryUpdate 在部分场景静默失效 → 必须递进兜底。
-static void DYYYFSFlipToRight(void) {
-    __block NSInteger stage = 0;
-
-    __block void (^step)(void);
-    step = ^{
-        if (DYYYFSCurrentOrientation() == UIInterfaceOrientationLandscapeRight) {
-            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] ✅ 已到右边（stage=%ld 生效）", (long)stage]);
-            return;
-        }
-        if (stage >= 3) {
-            DYYYFSDiag(@"[fs-rev] ❌ 三种手段都没翻过去");
-            return;
-        }
-        stage++;
-        if (stage == 1) {
-            DYYYFSDiag(@"[fs-rev] 手段1/3 setNeedsUpdateOfSupportedInterfaceOrientations");
-            if (@available(iOS 16.0, *)) {
-                UIViewController *vc = DYYYFSTopViewController();
-                if ([vc respondsToSelector:@selector(setNeedsUpdateOfSupportedInterfaceOrientations)]) {
-                    [vc setNeedsUpdateOfSupportedInterfaceOrientations];
-                }
-            }
-        } else if (stage == 2) {
-            DYYYFSDiag(@"[fs-rev] 手段2/3 requestGeometryUpdate(LandscapeRight)");
-            DYYYFSRequestOrientationOnce(UIInterfaceOrientationLandscapeRight);
-        } else {
-            DYYYFSDiag(@"[fs-rev] 手段3/3 KVC 强设 device orientation=LandscapeRight");
-            @try {
-                [[UIDevice currentDevice] setValue:@(UIInterfaceOrientationLandscapeRight) forKey:@"orientation"];
-            } @catch (__unused NSException *e) {}
-        }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), step);
-    };
-    step();
-}
-
-// 反向全屏：先走抖音原生入口进横屏（必定成功），等旋转【彻底停稳】后再判断是否需要翻到右边。
-// ——老板口径：允许"多转一下"，但全屏观看（老入口）绝不能被翻。
-// ⚠️ v35.3 教训：v35.2 用「连续 2 次读数一致」就下判断 → 被旋转动画中的瞬时值骗了
-//    （日志显示读到 cur=4 直接跳过翻转，可肉眼看到的其实是左）。现在改为：
-//    ① 每轮都把读数写进日志（含安全区左右内边距，做独立于 interfaceOrientation 的左右交叉验证）
-//    ② 判据收紧为「已横屏 + 连续 5 次读数一致(≈0.75s) + 距点按 ≥1.35s」
-//    ③ 判定"已在右边"后再复核一次（0.6s），变卦立刻翻
-//    ④ 翻转后做校验，没生效再补一轮（最多 2 轮）
+// 反向全屏：点抖音原生入口 → 进横屏 → 翻到【另一侧】（0.5s / 1.2s 各补确认一次）。
+// 只有一条判断：目标 = 当前方向的反面。不做"是不是已经在右边"之类的判断。
 static void DYYYFSEnterReverse(UIView *entryView) {
     if (!entryView) return;
-    DYYYFSDiag(@"[fs-rev] 反向全屏：进横屏，等彻底停稳再判断");
+    DYYYFSDiag(@"[fs-rev] 反向全屏：进横屏后翻到另一侧");
     simulateTapOnEntryView(entryView);
 
-    __block NSInteger last = -1, stable = 0, n = 0;
-    __block void (^watch)(void);
-    watch = ^{
-        n++;
+    __block void (^poll)(NSInteger);
+    poll = ^(NSInteger n) {
         UIInterfaceOrientation cur = DYYYFSCurrentOrientation();
-        UIWindow *win = DYYYFSKeyWindow();
-        UIEdgeInsets ins = win.safeAreaInsets;
-        if (cur == last) stable++; else { last = cur; stable = 1; }
         BOOL isLand = (cur == UIInterfaceOrientationLandscapeLeft || cur == UIInterfaceOrientationLandscapeRight);
-        DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] watch n=%ld cur=%ld stable=%ld land=%d safeL=%.0f safeR=%.0f",
-                    (long)n, (long)cur, (long)stable, isLand, ins.left, ins.right]);
-
-        if (isLand && stable >= 5 && n >= 9) {
-            if (cur == UIInterfaceOrientationLandscapeRight) {
-                // ⚠️ v35.2 就是死在这里：动画中一度读到 4 就断定"已在右边"，可停稳后其实是左。
-                // 所以这里不直接下结论，0.6s 后再复核一次，变卦立刻翻。
-                DYYYFSDiag(@"[fs-rev] 稳定在右，0.6s 后复核");
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    UIInterfaceOrientation c2 = DYYYFSCurrentOrientation();
-                    if (c2 == UIInterfaceOrientationLandscapeRight) {
-                        DYYYFSDiag(@"[fs-rev] 复核通过：确实在右，无需翻转");
-                        return;
-                    }
-                    DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 复核变卦 cur=%ld → 翻右（第1轮）", (long)c2]);
-                    DYYYFSFlipToRight();
-                    DYYYFSVerifyFlip(1);
-                });
-            } else {
-                DYYYFSDiag(@"[fs-rev] 稳定在左 → 翻右（第1轮）");
-                DYYYFSFlipToRight();
-                DYYYFSVerifyFlip(1);
-            }
+        if (isLand) {
+            UIInterfaceOrientation target = (cur == UIInterfaceOrientationLandscapeLeft)
+                ? UIInterfaceOrientationLandscapeRight : UIInterfaceOrientationLandscapeLeft;
+            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 已进横屏 cur=%ld → 翻到 %ld", (long)cur, (long)target]);
+            DYYYFSApplyOrientation(target);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                UIInterfaceOrientation a = DYYYFSCurrentOrientation();
+                DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 0.5s cur=%ld (目标%ld)", (long)a, (long)target]);
+                if (a != target) DYYYFSApplyOrientation(target);
+            });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                UIInterfaceOrientation b = DYYYFSCurrentOrientation();
+                DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 1.2s cur=%ld (目标%ld)%@",
+                            (long)b, (long)target, (b == target ? @" ✓稳定" : @" ✗被拨回")]);
+                if (b != target) DYYYFSApplyOrientation(target);
+            });
             return;
         }
-        if (n >= 25) {
-            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 3.75s 未判定，放弃 最后cur=%ld", (long)cur]);
+        if (n < 8) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                poll(n + 1);
+            });
             return;
         }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), watch);
+        DYYYFSDiag(@"[fs-rev] 1.6s 内未进入横屏，放弃翻面");
     };
-    watch();
+    poll(1);
 }
 
 // 「反向全屏」菜单项开关：未设置过 = 默认显示（老板要求默认打开）
