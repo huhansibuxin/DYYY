@@ -3871,6 +3871,22 @@ static NSArray<UIViewController *> *DYYYLPExitCollectVCs(UIViewController *root)
     return out;
 }
 
+// 抖音用来收尾「退出横屏」的回调属性名（按可能性排序）。
+// exitLandscapeBlock / customizeDismissBlock 是 SSH grep AwemeCore 挖到的真名，
+// 后者所在类同时带 innerVC / panProgress，是交互式退出转场控制器。
+static NSArray<NSString *> *DYYYLPExitBlockKeys(void) {
+    static NSArray<NSString *> *keys = nil;
+    if (!keys) {
+        keys = @[@"exitLandscapeBlock", @"customizeDismissBlock",
+                 @"dismissBlock", @"closeBlock", @"exitBlock"];
+    }
+    return keys;
+}
+
+static void DYYYLPAddUnique(NSMutableArray *arr, id obj) {
+    if (obj && ![arr containsObject:obj]) [arr addObject:obj];
+}
+
 // 收集【整个 App】的 VC 树（含每一层 presented 链）。
 // 横屏全屏页是 present 出来的，抖音的退出回调未必挂在它那棵树上（更可能挂在竖屏 feed 侧），
 // 只扫顶层那棵树会整片漏掉 → 这里从各 window 的 rootViewController 全量收。
@@ -3899,8 +3915,9 @@ static NSArray<UIViewController *> *DYYYLPExitAllVCs(void) {
 // 先看 VC 自己，再把它声明的每个对象型 ivar 翻一遍（抖音把这个回调放在
 // 非 VC 的 helper / viewModel / context 上是常态，光看 VC 会漏）。
 static id DYYYLPExitBlockHolderInVC(UIViewController *vc) {
-    static NSString *const kBlockKey = @"exitLandscapeBlock";
-    if ([vc respondsToSelector:NSSelectorFromString(kBlockKey)]) return vc;
+    for (NSString *key in DYYYLPExitBlockKeys()) {
+        if ([vc respondsToSelector:NSSelectorFromString(key)]) return vc;
+    }
     for (Class c = object_getClass(vc); c && c != [NSObject class]; c = class_getSuperclass(c)) {
         unsigned int count = 0;
         Ivar *ivars = class_copyIvarList(c, &count);
@@ -3912,7 +3929,9 @@ static id DYYYLPExitBlockHolderInVC(UIViewController *vc) {
             id v = nil;
             @try { v = object_getIvar(vc, ivars[i]); } @catch (__unused NSException *e) {}
             if (!v) continue;
-            if ([v respondsToSelector:NSSelectorFromString(kBlockKey)]) found = v;
+            for (NSString *key in DYYYLPExitBlockKeys()) {
+                if ([v respondsToSelector:NSSelectorFromString(key)]) { found = v; break; }
+            }
         }
         free(ivars);
         if (found) return found;
@@ -3937,6 +3956,82 @@ static BOOL DYYYLPExitCallVoidBlock(id blk) {
     if (!(sig[0] == 'v' && sig[1] == '8' && sig[2] == '@' && sig[3] == '?' && sig[4] == '0' && sig[5] == '\0')) return NO;
     ((void (*)(void *))h->invoke)(h);
     return YES;
+}
+
+// 在某个对象上找「退出/收起」回调 block 并调用
+static BOOL DYYYLPExitTryBlocks(id obj, NSString **whichOut) {
+    if (!obj) return NO;
+    for (NSString *key in DYYYLPExitBlockKeys()) {
+        if (![obj respondsToSelector:NSSelectorFromString(key)]) continue;
+        id blk = nil;
+        @try { blk = [obj valueForKey:key]; } @catch (__unused NSException *e) {}
+        if (DYYYLPExitCallVoidBlock(blk)) {
+            if (whichOut) *whichOut = key;
+            return YES;
+        }
+        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ① 候选 %@ 的 %@ 不可用（nil/签名不符）",
+                       NSStringFromClass([obj class]), key]);
+    }
+    return NO;
+}
+
+// ①-B 横屏页自己的返回按钮 —— 必须走它，抖音才会做正规收尾（实测：直接 dismiss 必致 feed 错位）。
+// 这个按钮（AWENoxusHighlightButton）重写 touches 自行处理点击、不走标准 target-action，
+// 所以这里先把它所有可用入口 dump 出来，再按「target-action → ivar 里的 block → 自身的点击处理方法」依次试。
+static BOOL DYYYLPExitDumpBackButton(UIView *root) {
+    if (!root) return NO;
+    NSMutableArray<UIView *> *found = [NSMutableArray array];
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+    while (stack.count > 0) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        if ([NSStringFromClass([v class]) isEqualToString:@"AWENoxusHighlightButton"]) [found addObject:v];
+        for (UIView *s in v.subviews) [stack addObject:s];
+    }
+    if (found.count == 0) {
+        DYYYSpeedDiag(@"[lp-exit] ①-B 横屏页里没有 AWENoxusHighlightButton");
+        return NO;
+    }
+    for (UIView *v in found) {
+        UIControl *c = [v isKindOfClass:[UIControl class]] ? (UIControl *)v : nil;
+        // dump 可用入口：靠这些日志就能定位它真正的点击回调
+        NSMutableArray<NSString *> *acts = [NSMutableArray array];
+        if (c) {
+            for (NSUInteger e = 1; e <= (NSUInteger)(1u << 16); e <<= 1) {
+                for (id t in c.allTargets) {
+                    NSArray *as = [c actionsForTarget:t forControlEvent:(UIControlEvents)e];
+                    if (as.count > 0) {
+                        [acts addObject:[NSString stringWithFormat:@"e%lu->%@[%@]",
+                                         (unsigned long)e, NSStringFromClass([t class]),
+                                         [as componentsJoinedByString:@","]]];
+                    }
+                }
+            }
+        }
+        NSMutableArray<NSString *> *ivs = [NSMutableArray array];
+        unsigned int ic = 0;
+        Ivar *il = class_copyIvarList([v class], &ic);
+        for (unsigned int i = 0; il && i < ic; i++) {
+            [ivs addObject:[NSString stringWithFormat:@"%s", ivar_getName(il[i]) ?: ""]];
+        }
+        if (il) free(il);
+        NSMutableArray<NSString *> *ms = [NSMutableArray array];
+        unsigned int mc = 0;
+        Method *ml = class_copyMethodList([v class], &mc);
+        for (unsigned int i = 0; ml && i < mc; i++) {
+            [ms addObject:NSStringFromSelector(method_getName(ml[i]))];
+        }
+        if (ml) free(ml);
+        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ①-B 返回按钮 %@ frame=%@ targets=[%@] ivars=[%@] methods=[%@]",
+                       NSStringFromClass([v class]), NSStringFromCGRect(v.frame),
+                       [acts componentsJoinedByString:@" | "],
+                       [ivs componentsJoinedByString:@","],
+                       [ms componentsJoinedByString:@","]]);
+
+        // 只探测、不调用：真正的退出交给 ② 的「先转竖屏再收起」时序，
+        // 这里如果把不靠谱的入口调了，反而会误触发别的功能 / 阻断正确路径。
+    }
+    return NO;
 }
 
 // 诊断：列出横屏页视图树里的 UIControl 类名。
@@ -3980,32 +4075,62 @@ static BOOL DYYYLPExitLandscape(void) {
     }
     NSArray<UIViewController *> *vcs = DYYYLPExitCollectVCs(top);
 
-    // ① 抖音自己的退出回调（属性 exitLandscapeBlock，签名不符不调）。
-    //    这是【唯一】能保证 feed 状态被抖音自己收尾（回到原视频、位置不错位）的路径，
-    //    所以扫描范围放到整个 App 的 VC 树 + 每个 VC 的对象型 ivar，尽力找到它。
+    // ① 抖音自己的「退出/收起」回调 block。
+    //    ⚠️ 关键坑：transitioningDelegate / delegate / innerVC 都是 weak 属性，
+    //       object_getIvar 读不到（weak 存在 side table），必须走属性 getter 显式取 ——
+    //       抖音的交互式退出转场控制器（带 customizeDismissBlock / panProgress）正挂在这些位置。
     NSMutableArray<UIViewController *> *scan = [NSMutableArray arrayWithArray:vcs];
     for (UIViewController *vc in DYYYLPExitAllVCs()) {
         if (![scan containsObject:vc]) [scan addObject:vc];
     }
+    NSMutableArray *holders = [NSMutableArray array];
     for (UIViewController *vc in scan) {
-        id holder = DYYYLPExitBlockHolderInVC(vc);
-        if (!holder) continue;
-        id blk = nil;
-        @try { blk = [holder valueForKey:@"exitLandscapeBlock"]; } @catch (__unused NSException *e) {}
-        if (DYYYLPExitCallVoidBlock(blk)) {
-            DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ① exitLandscapeBlock 生效（持有者=%@，扫到 VC %lu 个）",
-                           NSStringFromClass([holder class]), (unsigned long)scan.count]);
+        DYYYLPAddUnique(holders, vc);
+        DYYYLPAddUnique(holders, DYYYLPExitBlockHolderInVC(vc));
+        @try { DYYYLPAddUnique(holders, [vc valueForKey:@"transitioningDelegate"]); } @catch (__unused NSException *e) {}
+        @try { DYYYLPAddUnique(holders, [vc valueForKey:@"delegate"]); } @catch (__unused NSException *e) {}
+        @try { DYYYLPAddUnique(holders, [vc valueForKey:@"innerVC"]); } @catch (__unused NSException *e) {}
+    }
+    // 横屏页视图树里所有手势及其 delegate（交互式退出转场常挂在 pan 手势的 delegate 上）
+    NSMutableArray<UIView *> *vstack = [NSMutableArray arrayWithObject:top.view];
+    while (vstack.count > 0) {
+        UIView *v = vstack.lastObject;
+        [vstack removeLastObject];
+        for (UIGestureRecognizer *gr in v.gestureRecognizers) {
+            DYYYLPAddUnique(holders, gr);
+            DYYYLPAddUnique(holders, gr.delegate);
+        }
+        for (UIView *s in v.subviews) [vstack addObject:s];
+    }
+    for (id holder in holders) {
+        NSString *used = nil;
+        if (DYYYLPExitTryBlocks(holder, &used)) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ① %@ 生效（持有者=%@，候选 %lu 个）",
+                           used, NSStringFromClass([holder class]), (unsigned long)holders.count]);
             return YES;
         }
-        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ① %@ 上拿到 exitLandscapeBlock 但不可用（nil/签名不符）",
-                       NSStringFromClass([holder class])]);
     }
 
-    // ② 通用返回：presented 就 dismiss，否则导航栈 pop
+    // ①-B 探明横屏页返回按钮的可用入口（只记日志，不调用、不阻断 ②）
+    DYYYLPExitDumpBackButton(top.view);
+
+    // ② 通用返回 —— 复刻抖音返回键的时序：先把设备转回竖屏，再收起横屏页。
+    //    ⚠️ 实测：横屏状态下直接 dismiss，转场按横屏尺寸算，竖屏 feed 布局随之算错 →
+    //       上下界面错位、落到相邻视频、回不到原视频。先转竖屏即可对齐抖音自己的行为。
     if (top.presentingViewController) {
         DYYYLPExitLogControls(top.view);
-        [top dismissViewControllerAnimated:YES completion:nil];
-        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ② dismiss 生效（%@）", NSStringFromClass([top class])]);
+        [[UIDevice currentDevice] setValue:@(UIInterfaceOrientationPortrait) forKey:@"orientation"];
+        [UIViewController attemptRotationToDeviceOrientation];
+        __weak UIViewController *weakTop = top;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            UIViewController *t = weakTop;
+            if (!t || !t.presentingViewController) return;
+            [t dismissViewControllerAnimated:YES completion:nil];
+            DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ② 转竖屏后 dismiss（%@）",
+                           NSStringFromClass([t class])]);
+        });
+        DYYYSpeedDiag(@"[lp-exit] ② 已转竖屏，0.35s 后收起横屏页");
         return YES;
     }
     UINavigationController *nc = top.navigationController;
