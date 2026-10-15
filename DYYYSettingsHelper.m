@@ -479,6 +479,11 @@ static NSArray *allSettingsViewControllers(void) {
         [[NSUserDefaults standardUserDefaults] objectForKey:item.identifier] == nil) {
         item.isSwitchOn = YES;
     }
+    // 「长按菜单显示反向全屏」：未设置过 = 默认开启（与 DYYYLongPressPanel 的 DYYYFSReverseItemEnabled 同语义）
+    if ([item.identifier isEqualToString:@"DYYYLongPressFullScreenReverse"] &&
+        [[NSUserDefaults standardUserDefaults] objectForKey:item.identifier] == nil) {
+        item.isSwitchOn = YES;
+    }
 
     [self applyDependencyRulesForItem:item];
     if ((item.cellType == 20 || item.cellType == 26) && cellTapHandlers != nil) {

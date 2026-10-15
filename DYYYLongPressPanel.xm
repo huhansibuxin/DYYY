@@ -92,8 +92,8 @@ static UIInterfaceOrientation DYYYFSCurrentOrientation(void) {
     return [UIApplication sharedApplication].statusBarOrientation;
 }
 
-// 强制界面旋转到指定横屏方向（iOS16 走 WindowScene geometry 更新，KVC 老法一并兜底）
-static void DYYYFSApplyOrientation(UIInterfaceOrientation target) {
+// 兜底：单独请求一次指定方向（仅在方向不对时调，避免重复动画）
+static void DYYYFSRequestOrientationOnce(UIInterfaceOrientation target) {
     UIInterfaceOrientationMask mask = (target == UIInterfaceOrientationLandscapeLeft)
         ? UIInterfaceOrientationMaskLandscapeLeft : UIInterfaceOrientationMaskLandscapeRight;
     if (@available(iOS 16.0, *)) {
@@ -109,47 +109,95 @@ static void DYYYFSApplyOrientation(UIInterfaceOrientation target) {
             }
         }
     }
-    [[UIDevice currentDevice] setValue:@(target) forKey:@"orientation"];
-    [UIViewController attemptRotationToDeviceOrientation];
 }
 
-// 进入全屏：reverse=NO → 完全保持抖音默认行为；reverse=YES → 进横屏后翻到另一侧（带 2 次补正确认）
-static void DYYYFSEnterLandscape(UIView *entryView, BOOL reverse) {
+// ---- 方向收紧：唯一会碰到抖音行为的地方，且【只在「反向全屏」动作期间】生效 ----
+// 原理：抖音横屏入口自身会请求左侧；把 App 允许方向临时收紧成「仅横屏右」，
+// iOS 就必须让这次旋转直接落到右边 —— 一次到位，不再"先进左边再翻 180°"（那正是转两圈的来源）。
+// 老入口「全屏观看」完全不经过这里，零改动。
+static BOOL gDYYYFSForceReverse = NO;
+
+static IMP gDYYYFSSupportedOrientOrig = NULL;
+static UIInterfaceOrientationMask DYYYFSSupportedOrient(id self, SEL _cmd, UIApplication *app, UIWindow *win) {
+    if (gDYYYFSForceReverse) {
+        return UIInterfaceOrientationMaskLandscapeRight;
+    }
+    if (gDYYYFSSupportedOrientOrig) {
+        return ((UIInterfaceOrientationMask (*)(id, SEL, UIApplication *, UIWindow *))gDYYYFSSupportedOrientOrig)(self, _cmd, app, win);
+    }
+    return UIInterfaceOrientationMaskAllButUpsideDown;
+}
+
+// 惰性接管 AppDelegate 的 supportedInterfaceOrientationsForWindow:（首次用到「反向全屏」时才装，无加载期开销）
+static void DYYYFSInstallOrientationHook(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class ad = objc_getClass("AppDelegate");
+        SEL sel = NSSelectorFromString(@"application:supportedInterfaceOrientationsForWindow:");
+        if (!ad) {
+            DYYYFSDiag(@"[fs-rev] 未找到 AppDelegate，方向收紧不可用");
+            return;
+        }
+        Method m = class_getInstanceMethod(ad, sel);
+        if (m) {
+            gDYYYFSSupportedOrientOrig = method_getImplementation(m);
+            // 正确姿势：若该方法是【本类】实现的 → 直接换 IMP；
+            // 若只是【从父类继承】的 → class_addMethod 会在本类新增一个覆盖，
+            // 避免误改父类实现（会影响其他继承类）。
+            if (!class_addMethod(ad, sel, (IMP)DYYYFSSupportedOrient, method_getTypeEncoding(m))) {
+                method_setImplementation(m, (IMP)DYYYFSSupportedOrient);
+            }
+            DYYYFSDiag(@"[fs-rev] 已接管方向 mask（原实现保留）");
+        } else {
+            class_addMethod(ad, sel, (IMP)DYYYFSSupportedOrient, "Q@:@@");
+            DYYYFSDiag(@"[fs-rev] AppDelegate 无该方向方法，已新增");
+        }
+    });
+}
+
+// 反向全屏：临时收紧为「仅横屏右」→ 抖音原生入口直接落右（一次到位）→ 稳定后放开
+static void DYYYFSEnterReverse(UIView *entryView) {
     if (!entryView) return;
+    DYYYFSInstallOrientationHook();
+    gDYYYFSForceReverse = YES;
+    DYYYFSDiag(@"[fs-rev] 收紧=仅横屏右，进入");
     simulateTapOnEntryView(entryView);
-    if (!reverse) return;
 
     __block void (^poll)(NSInteger);
     poll = ^(NSInteger n) {
         UIInterfaceOrientation cur = DYYYFSCurrentOrientation();
         BOOL isLand = (cur == UIInterfaceOrientationLandscapeLeft || cur == UIInterfaceOrientationLandscapeRight);
         if (isLand) {
-            UIInterfaceOrientation target = (cur == UIInterfaceOrientationLandscapeLeft)
-                ? UIInterfaceOrientationLandscapeRight : UIInterfaceOrientationLandscapeLeft;
-            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 已进横屏 cur=%ld → 翻面→ %ld", (long)cur, (long)target]);
-            DYYYFSApplyOrientation(target);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                UIInterfaceOrientation a = DYYYFSCurrentOrientation();
-                DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 0.5s cur=%ld (目标%ld)", (long)a, (long)target]);
-                if (a != target) DYYYFSApplyOrientation(target);
-            });
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                UIInterfaceOrientation b = DYYYFSCurrentOrientation();
-                DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 1.2s cur=%ld (目标%ld)%@",
-                            (long)b, (long)target, (b == target ? @" ✓稳定" : @" ✗被拨回")]);
-                if (b != target) DYYYFSApplyOrientation(target);
+            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 落点 cur=%ld n=%ld", (long)cur, (long)n]);
+            if (cur != UIInterfaceOrientationLandscapeRight) {
+                DYYYFSRequestOrientationOnce(UIInterfaceOrientationLandscapeRight);
+            }
+            // 保持收紧 1 秒，防抖音随后把方向拨回左边；随后放开（老入口不受影响）
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                gDYYYFSForceReverse = NO;
+                DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 已放开收紧 cur=%ld",
+                            (long)DYYYFSCurrentOrientation()]);
             });
             return;
         }
-        if (n < 8) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (n < 10) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 poll(n + 1);
             });
             return;
         }
-        DYYYFSDiag(@"[fs-rev] 1.6s 内未进入横屏，放弃翻面");
+        // 没进横屏：立刻放开，绝不把方向锁死
+        gDYYYFSForceReverse = NO;
+        DYYYFSDiag(@"[fs-rev] 1.5s 未进横屏，已放开收紧");
     };
     poll(1);
+}
+
+// 「反向全屏」菜单项开关：未设置过 = 默认显示（老板要求默认打开）
+static BOOL DYYYFSReverseItemEnabled(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    NSString *key = @"DYYYLongPressFullScreenReverse";
+    return [d objectForKey:key] == nil ? YES : [d boolForKey:key];
 }
 
 // 定时关闭：后台兜底检查定时器（解决 dispatch_after 在深度休眠时主队列不 drain 的问题）
@@ -586,11 +634,8 @@ static void DYYYStartTimerCloseCheck(void) {
         [viewModels addObject:coverViewModel];
     }
 
-    // 全屏观看功能（正向 / 反向两项，永远互为反面；
-    // 哪个是"正"由设置页「长按全屏观看反向」决定，默认不开启=保持抖音原生方向）
+    // 全屏观看功能（老代码原样保留：永远抖音原生方向、只转一次，不做任何方向干预）
     if (enableCopyText) {
-        BOOL fsReverseDefault = DYYYGetBool(@"DYYYLongPressFullScreenReverse");
-
         AWELongPressPanelBaseViewModel *fullScreen = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
         fullScreen.awemeModel = self.awemeModel;
         fullScreen.actionType = 671;
@@ -601,26 +646,29 @@ static void DYYYStartTimerCloseCheck(void) {
           [panelManager dismissWithAnimation:YES completion:^{
             UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
             UIView *entryView = findLandscapeEntryViewInView(keyWindow);
-            DYYYFSEnterLandscape(entryView, fsReverseDefault);
+            simulateTapOnEntryView(entryView);
           }];
         };
         [viewModels addObject:fullScreen];
 
-        // 反向全屏：与上面一项方向相反，方便横屏时把手机换到另一边
-        AWELongPressPanelBaseViewModel *fullScreenRev = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
-        fullScreenRev.awemeModel = self.awemeModel;
-        fullScreenRev.actionType = 680;
-        fullScreenRev.duxIconName = @"ic_fullscreen_outlined";
-        fullScreenRev.describeString = @"反向全屏";
-        fullScreenRev.action = ^{
-          AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
-          [panelManager dismissWithAnimation:YES completion:^{
-            UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
-            UIView *entryView = findLandscapeEntryViewInView(keyWindow);
-            DYYYFSEnterLandscape(entryView, !fsReverseDefault);
-          }];
-        };
-        [viewModels addObject:fullScreenRev];
+        // 反向全屏：与「全屏观看」方向相反。做法=动作期间临时收紧允许方向为「仅横屏右」，
+        // 让抖音原生入口直接落右边（一次到位，不再"先进左边再翻"）。开关默认开启。
+        if (DYYYFSReverseItemEnabled()) {
+            AWELongPressPanelBaseViewModel *fullScreenRev = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
+            fullScreenRev.awemeModel = self.awemeModel;
+            fullScreenRev.actionType = 680;
+            fullScreenRev.duxIconName = @"ic_fullscreen_outlined";
+            fullScreenRev.describeString = @"反向全屏";
+            fullScreenRev.action = ^{
+              AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
+              [panelManager dismissWithAnimation:YES completion:^{
+                UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+                UIView *entryView = findLandscapeEntryViewInView(keyWindow);
+                DYYYFSEnterReverse(entryView);
+              }];
+            };
+            [viewModels addObject:fullScreenRev];
+        }
     }
 
     // 音频下载功能
@@ -1410,11 +1458,8 @@ static void DYYYStartTimerCloseCheck(void) {
         [viewModels addObject:coverViewModel];
     }
 
-    // 全屏观看功能（正向 / 反向两项，永远互为反面；
-    // 哪个是"正"由设置页「长按全屏观看反向」决定，默认不开启=保持抖音原生方向）
+    // 全屏观看功能（老代码原样保留：永远抖音原生方向、只转一次，不做任何方向干预）
     if (enableCopyText) {
-        BOOL fsReverseDefault = DYYYGetBool(@"DYYYLongPressFullScreenReverse");
-
         AWELongPressPanelBaseViewModel *fullScreen = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
         fullScreen.awemeModel = self.awemeModel;
         fullScreen.actionType = 671;
@@ -1425,26 +1470,29 @@ static void DYYYStartTimerCloseCheck(void) {
           [panelManager dismissWithAnimation:YES completion:^{
             UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
             UIView *entryView = findLandscapeEntryViewInView(keyWindow);
-            DYYYFSEnterLandscape(entryView, fsReverseDefault);
+            simulateTapOnEntryView(entryView);
           }];
         };
         [viewModels addObject:fullScreen];
 
-        // 反向全屏：与上面一项方向相反，方便横屏时把手机换到另一边
-        AWELongPressPanelBaseViewModel *fullScreenRev = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
-        fullScreenRev.awemeModel = self.awemeModel;
-        fullScreenRev.actionType = 680;
-        fullScreenRev.duxIconName = @"ic_fullscreen_outlined";
-        fullScreenRev.describeString = @"反向全屏";
-        fullScreenRev.action = ^{
-          AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
-          [panelManager dismissWithAnimation:YES completion:^{
-            UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
-            UIView *entryView = findLandscapeEntryViewInView(keyWindow);
-            DYYYFSEnterLandscape(entryView, !fsReverseDefault);
-          }];
-        };
-        [viewModels addObject:fullScreenRev];
+        // 反向全屏：与「全屏观看」方向相反。做法=动作期间临时收紧允许方向为「仅横屏右」，
+        // 让抖音原生入口直接落右边（一次到位，不再"先进左边再翻"）。开关默认开启。
+        if (DYYYFSReverseItemEnabled()) {
+            AWELongPressPanelBaseViewModel *fullScreenRev = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
+            fullScreenRev.awemeModel = self.awemeModel;
+            fullScreenRev.actionType = 680;
+            fullScreenRev.duxIconName = @"ic_fullscreen_outlined";
+            fullScreenRev.describeString = @"反向全屏";
+            fullScreenRev.action = ^{
+              AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
+              [panelManager dismissWithAnimation:YES completion:^{
+                UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+                UIView *entryView = findLandscapeEntryViewInView(keyWindow);
+                DYYYFSEnterReverse(entryView);
+              }];
+            };
+            [viewModels addObject:fullScreenRev];
+        }
     }
 
     // 音频下载功能
