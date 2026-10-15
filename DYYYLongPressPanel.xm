@@ -115,25 +115,60 @@ static void DYYYFSRequestOrientationOnce(UIInterfaceOrientation target) {
 // 原理：抖音横屏入口自身会请求左侧；把 App 允许方向临时收紧成「仅横屏右」，
 // iOS 就必须让这次旋转直接落到右边 —— 一次到位，不再"先进左边再翻 180°"（那正是转两圈的来源）。
 // 老入口「全屏观看」完全不经过这里，零改动。
+// ⚠️ v35 关键修复：抖音真正的 UIApplicationDelegate 是 **AWEAppDelegate**，
+//    二进制里另有一个同名的 AppDelegate（别的类），v34 挂它 → 方向收紧从未被调用过。
+//    现在改为：优先挂「当前 App 的 delegate 类」，再兜底 AWEAppDelegate / AppDelegate。
 static BOOL gDYYYFSForceReverse = NO;
+static NSInteger gDYYYFSMaskHits = 0;
 
 static IMP gDYYYFSSupportedOrientOrig = NULL;
+
+// 若 delegate 没实现该方法，系统用的就是 Info.plist 的值 → 原样返回，避免多放开方向
+static UIInterfaceOrientationMask DYYYFSBundleMask(void) {
+    static UIInterfaceOrientationMask mask;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        mask = UIInterfaceOrientationMaskAllButUpsideDown;
+        NSBundle *b = [NSBundle mainBundle];
+        NSArray *v = [b objectForInfoDictionaryKey:@"UISupportedInterfaceOrientations~iphone"];
+        if (![v isKindOfClass:[NSArray class]])
+            v = [b objectForInfoDictionaryKey:@"UISupportedInterfaceOrientations"];
+        if (![v isKindOfClass:[NSArray class]]) return;
+        UIInterfaceOrientationMask r = 0;
+        for (NSString *s in v) {
+            if ([s isEqualToString:@"UIInterfaceOrientationPortrait"]) r |= UIInterfaceOrientationMaskPortrait;
+            else if ([s isEqualToString:@"UIInterfaceOrientationPortraitUpsideDown"]) r |= UIInterfaceOrientationMaskPortraitUpsideDown;
+            else if ([s isEqualToString:@"UIInterfaceOrientationLandscapeLeft"]) r |= UIInterfaceOrientationMaskLandscapeLeft;
+            else if ([s isEqualToString:@"UIInterfaceOrientationLandscapeRight"]) r |= UIInterfaceOrientationMaskLandscapeRight;
+        }
+        if (r) mask = r;
+    });
+    return mask;
+}
+
 static UIInterfaceOrientationMask DYYYFSSupportedOrient(id self, SEL _cmd, UIApplication *app, UIWindow *win) {
     if (gDYYYFSForceReverse) {
+        if (gDYYYFSMaskHits < 3) {
+            gDYYYFSMaskHits++;
+            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] mask 被咨询 #%ld -> 仅横屏右", (long)gDYYYFSMaskHits]);
+        }
         return UIInterfaceOrientationMaskLandscapeRight;
     }
     if (gDYYYFSSupportedOrientOrig) {
         return ((UIInterfaceOrientationMask (*)(id, SEL, UIApplication *, UIWindow *))gDYYYFSSupportedOrientOrig)(self, _cmd, app, win);
     }
-    return UIInterfaceOrientationMaskAllButUpsideDown;
+    return DYYYFSBundleMask();
 }
 
-// 惰性接管 AppDelegate 的 supportedInterfaceOrientationsForWindow:（首次用到「反向全屏」时才装，无加载期开销）
+// 惰性接管 delegate 的方向方法（首次用到「反向全屏」时才装，无加载期开销）
 static void DYYYFSInstallOrientationHook(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        Class ad = objc_getClass("AppDelegate");
         SEL sel = NSSelectorFromString(@"application:supportedInterfaceOrientationsForWindow:");
+        id delegate = [UIApplication sharedApplication].delegate;
+        Class ad = delegate ? object_getClass(delegate) : Nil;
+        if (!ad) ad = objc_getClass("AWEAppDelegate");
+        if (!ad) ad = objc_getClass("AppDelegate");
         if (!ad) {
             DYYYFSDiag(@"[fs-rev] 未找到 AppDelegate，方向收紧不可用");
             return;
@@ -141,16 +176,17 @@ static void DYYYFSInstallOrientationHook(void) {
         Method m = class_getInstanceMethod(ad, sel);
         if (m) {
             gDYYYFSSupportedOrientOrig = method_getImplementation(m);
-            // 正确姿势：若该方法是【本类】实现的 → 直接换 IMP；
-            // 若只是【从父类继承】的 → class_addMethod 会在本类新增一个覆盖，
-            // 避免误改父类实现（会影响其他继承类）。
+            // 若该方法是【本类】实现的 → class_addMethod 会失败，直接换 IMP；
+            // 若只是【从父类继承】的 → class_addMethod 成功，在本类新增覆盖（不动父类）。
             if (!class_addMethod(ad, sel, (IMP)DYYYFSSupportedOrient, method_getTypeEncoding(m))) {
                 method_setImplementation(m, (IMP)DYYYFSSupportedOrient);
             }
-            DYYYFSDiag(@"[fs-rev] 已接管方向 mask（原实现保留）");
+            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 已接管方向 mask 于 %@（原实现保留）",
+                        NSStringFromClass(ad)]);
         } else {
             class_addMethod(ad, sel, (IMP)DYYYFSSupportedOrient, "Q@:@@");
-            DYYYFSDiag(@"[fs-rev] AppDelegate 无该方向方法，已新增");
+            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] %@ 无该方向方法，已新增",
+                        NSStringFromClass(ad)]);
         }
     });
 }
@@ -159,6 +195,7 @@ static void DYYYFSInstallOrientationHook(void) {
 static void DYYYFSEnterReverse(UIView *entryView) {
     if (!entryView) return;
     DYYYFSInstallOrientationHook();
+    gDYYYFSMaskHits = 0;
     gDYYYFSForceReverse = YES;
     DYYYFSDiag(@"[fs-rev] 收紧=仅横屏右，进入");
     simulateTapOnEntryView(entryView);
