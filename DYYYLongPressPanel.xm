@@ -49,12 +49,12 @@ static void simulateTapOnEntryView(UIView *entryView) {
 
 // ======================= 【反向全屏】 =======================
 // 需求：长按菜单「全屏观看」之外，再提供一个【方向相反】的全屏入口。
-// 现状：进全屏靠模拟点击抖音原生横屏入口 AWELandscapeFeedEntryView，方向由抖音自己定
-//      （固定在同一侧），我们此前没有任何方向干预代码。
-// 做法：不改进入方式（不破坏抖音流程），在【进入横屏之后】把界面强制翻到另一侧。
-// 依据：AwemeCore 二进制核验到 Landscape_right 常量 + AWEXPlayOrientationManager /
-//      LandscapeFeedAutoRotateController，抖音内部本就区分左右两向，翻面不破坏布局。
-// 探针：每次反向操作记 3~4 行（进横屏时 / 0.5s / 1.2s），用来确认抖音有没有把方向拨回。
+// 做法（唯一保留的一条线）：进全屏方式完全不动，仍模拟点击抖音原生横屏入口
+//      AWELandscapeFeedEntryView；等抖音自己进横屏后，再把界面强制翻到另一侧。
+//      翻面用 DYYYFSApplyOrientation（geometry 请求 + KVC + attemptRotationToDeviceOrientation 三件套），
+//      完成后 0.5s / 1.2s 各补确认一次，被抖音拨回就再翻。
+// 代价：反向全屏会有第二段旋转动画（老板已确认可接受）；「全屏观看」保持原生行为不受影响。
+// 遗留降噪：DYYYFSClearOrientationBias 在每次进屏前把方向状态复位，避免上次翻面残留把后续入口带偏。
 
 // 精简诊断日志（DYYYSpeedDiag 在 DYYY.xm 里是 static，本编译单元看不到，故另写一份）
 static void DYYYFSDiag(NSString *msg) {
@@ -83,14 +83,11 @@ static void DYYYFSDiag(NSString *msg) {
     } @catch (__unused NSException *e) {}
 }
 
-// ⚠️「方向粘住」修复：「反向全屏」靠 KVC 改 UIDevice.orientation 实现，而这个值会【留在进程里】——
-//    之后每一次点「全屏观看」都被带成横屏同一侧，必须杀后台才恢复
-//    （老板实测：全屏观看→左；反向全屏→右；退出来再点全屏观看→也右；杀后台才回到左）。
-//    v37 曾用「读 .orientation 判断是否为横屏」当开关 → 实测一次都没触发：
-//    读回来的值跟我们写进去的对不上（UIDevice 的 getter 在没 beginGeneratingDeviceOrientationNotifications
-//    时给出的是陈旧值）。所以这里【不再读、直接写死清回竖屏】，另外把 iOS16 scene 的几何偏好一并复位，两条路都堵。
-//    调用时机是长按菜单刚收起、界面还在竖屏时 → 「清回竖屏」无感；不调 attemptRotationToDeviceOrientation，
-//    避免这一下自己触发旋转。
+// 进全屏前的一次性方向复位（两个入口共用入口 simulateTapOnEntryView 开头调用，菜单仍在竖屏时执行 → 无感）。
+// 用途：「反向全屏」强制翻面会把方向状态残留在进程里，不复位的话下一次点「全屏观看」会被带偏到同一侧。
+// 做法：无条件把 UIDevice.orientation 写回竖屏（UIDevice 的读值不可靠 —— 写进去的值读回来对不上，
+//      所以这里不读、不判断，直接写），同时把 iOS16 scene 的几何偏好复位。
+// 注意：不调 attemptRotationToDeviceOrientation，避免复位这一下自己触发旋转。
 static void DYYYFSClearOrientationBias(void) {
     UIDeviceOrientation before = [UIDevice currentDevice].orientation;
     [[UIDevice currentDevice] setValue:@(UIDeviceOrientationPortrait) forKey:@"orientation"];
@@ -122,9 +119,8 @@ static UIInterfaceOrientation DYYYFSCurrentOrientation(void) {
     return [UIApplication sharedApplication].statusBarOrientation;
 }
 
-// 强制界面旋转到指定方向 —— 三件套一起上（geometry 请求 + KVC 老法 + attemptRotationToDeviceOrientation）。
-// ⚠️ 第一次（v33）反向全屏真的能翻过去，靠的就是最后那句 attemptRotationToDeviceOrientation；
-//    后面几版把它删了，KVC 那档因此形同虚设。
+// 强制界面翻到指定方向 —— 三件套一起上：geometry 请求 + KVC 改 UIDevice.orientation + attemptRotationToDeviceOrientation。
+// ⚠️ 最后那句 attemptRotationToDeviceOrientation 不能省：只写 KVC 不调它，方向请求不会落地。
 static void DYYYFSApplyOrientation(UIInterfaceOrientation target) {
     UIInterfaceOrientationMask mask = (target == UIInterfaceOrientationLandscapeLeft)
         ? UIInterfaceOrientationMaskLandscapeLeft : UIInterfaceOrientationMaskLandscapeRight;
@@ -644,8 +640,8 @@ static void DYYYStartTimerCloseCheck(void) {
         };
         [viewModels addObject:fullScreen];
 
-        // 反向全屏：与「全屏观看」方向相反。做法=动作期间临时收紧允许方向为「仅横屏右」，
-        // 让抖音原生入口直接落右边（一次到位，不再"先进左边再翻"）。开关默认开启。
+        // 反向全屏：与「全屏观看」方向相反 —— 走抖音原生入口进横屏后，再强制翻到另一侧。
+        // （兜底路线，会有第二段旋转；其它方向干预方案已实测无效，不再尝试。）开关默认开启。
         if (DYYYFSReverseItemEnabled()) {
             AWELongPressPanelBaseViewModel *fullScreenRev = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
             fullScreenRev.awemeModel = self.awemeModel;
@@ -1468,8 +1464,8 @@ static void DYYYStartTimerCloseCheck(void) {
         };
         [viewModels addObject:fullScreen];
 
-        // 反向全屏：与「全屏观看」方向相反。做法=动作期间临时收紧允许方向为「仅横屏右」，
-        // 让抖音原生入口直接落右边（一次到位，不再"先进左边再翻"）。开关默认开启。
+        // 反向全屏：与「全屏观看」方向相反 —— 走抖音原生入口进横屏后，再强制翻到另一侧。
+        // （兜底路线，会有第二段旋转；其它方向干预方案已实测无效，不再尝试。）开关默认开启。
         if (DYYYFSReverseItemEnabled()) {
             AWELongPressPanelBaseViewModel *fullScreenRev = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
             fullScreenRev.awemeModel = self.awemeModel;
