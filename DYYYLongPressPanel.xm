@@ -43,6 +43,115 @@ static void simulateTapOnEntryView(UIView *entryView) {
     }
 }
 
+// ======================= 【反向全屏】 =======================
+// 需求：长按菜单「全屏观看」之外，再提供一个【方向相反】的全屏入口。
+// 现状：进全屏靠模拟点击抖音原生横屏入口 AWELandscapeFeedEntryView，方向由抖音自己定
+//      （固定在同一侧），我们此前没有任何方向干预代码。
+// 做法：不改进入方式（不破坏抖音流程），在【进入横屏之后】把界面强制翻到另一侧。
+// 依据：AwemeCore 二进制核验到 Landscape_right 常量 + AWEXPlayOrientationManager /
+//      LandscapeFeedAutoRotateController，抖音内部本就区分左右两向，翻面不破坏布局。
+// 探针：每次反向操作记 3~4 行（进横屏时 / 0.5s / 1.2s），用来确认抖音有没有把方向拨回。
+
+// 精简诊断日志（DYYYSpeedDiag 在 DYYY.xm 里是 static，本编译单元看不到，故另写一份）
+static void DYYYFSDiag(NSString *msg) {
+    @try {
+        if (!DYYYGetBool(@"DYYYDiagLog")) return;
+        NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
+        static dispatch_queue_t q;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{ q = dispatch_queue_create("com.dyyy.fsdiag", DISPATCH_QUEUE_SERIAL); });
+        dispatch_async(q, ^{
+            @try {
+                NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DYYY"];
+                [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+                NSString *path = [dir stringByAppendingPathComponent:@"speed_diag.log"];
+                NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+                if (fh) {
+                    [fh seekToEndOfFile];
+                    [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+                    [fh closeFile];
+                } else {
+                    NSString *old = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+                    [((old ? [old stringByAppendingString:line] : line)) writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                }
+            } @catch (__unused NSException *e) {}
+        });
+    } @catch (__unused NSException *e) {}
+}
+
+// 读当前界面方向（iOS13+ 取前台活跃 windowScene；老系统回落 statusBarOrientation）
+static UIInterfaceOrientation DYYYFSCurrentOrientation(void) {
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]] &&
+                scene.activationState == UISceneActivationStateForegroundActive) {
+                return ((UIWindowScene *)scene).interfaceOrientation;
+            }
+        }
+    }
+    return [UIApplication sharedApplication].statusBarOrientation;
+}
+
+// 强制界面旋转到指定横屏方向（iOS16 走 WindowScene geometry 更新，KVC 老法一并兜底）
+static void DYYYFSApplyOrientation(UIInterfaceOrientation target) {
+    UIInterfaceOrientationMask mask = (target == UIInterfaceOrientationLandscapeLeft)
+        ? UIInterfaceOrientationMaskLandscapeLeft : UIInterfaceOrientationMaskLandscapeRight;
+    if (@available(iOS 16.0, *)) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]] &&
+                scene.activationState == UISceneActivationStateForegroundActive) {
+                UIWindowSceneGeometryPreferencesIOS *prefs =
+                    [[UIWindowSceneGeometryPreferencesIOS alloc] initWithInterfaceOrientations:mask];
+                [(UIWindowScene *)scene requestGeometryUpdateWithPreferences:prefs errorHandler:^(NSError *error) {
+                    DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] geometry 被拒 target=%ld err=%@",
+                                (long)target, error.localizedDescription ?: @"-"]);
+                }];
+            }
+        }
+    }
+    [[UIDevice currentDevice] setValue:@(target) forKey:@"orientation"];
+    [UIViewController attemptRotationToDeviceOrientation];
+}
+
+// 进入全屏：reverse=NO → 完全保持抖音默认行为；reverse=YES → 进横屏后翻到另一侧（带 2 次补正确认）
+static void DYYYFSEnterLandscape(UIView *entryView, BOOL reverse) {
+    if (!entryView) return;
+    simulateTapOnEntryView(entryView);
+    if (!reverse) return;
+
+    __block void (^poll)(NSInteger);
+    poll = ^(NSInteger n) {
+        UIInterfaceOrientation cur = DYYYFSCurrentOrientation();
+        BOOL isLand = (cur == UIInterfaceOrientationLandscapeLeft || cur == UIInterfaceOrientationLandscapeRight);
+        if (isLand) {
+            UIInterfaceOrientation target = (cur == UIInterfaceOrientationLandscapeLeft)
+                ? UIInterfaceOrientationLandscapeRight : UIInterfaceOrientationLandscapeLeft;
+            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 已进横屏 cur=%ld → 翻面→ %ld", (long)cur, (long)target]);
+            DYYYFSApplyOrientation(target);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                UIInterfaceOrientation a = DYYYFSCurrentOrientation();
+                DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 0.5s cur=%ld (目标%ld)", (long)a, (long)target]);
+                if (a != target) DYYYFSApplyOrientation(target);
+            });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                UIInterfaceOrientation b = DYYYFSCurrentOrientation();
+                DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 1.2s cur=%ld (目标%ld)%@",
+                            (long)b, (long)target, (b == target ? @" ✓稳定" : @" ✗被拨回")]);
+                if (b != target) DYYYFSApplyOrientation(target);
+            });
+            return;
+        }
+        if (n < 8) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                poll(n + 1);
+            });
+            return;
+        }
+        DYYYFSDiag(@"[fs-rev] 1.6s 内未进入横屏，放弃翻面");
+    };
+    poll(1);
+}
+
 // 定时关闭：后台兜底检查定时器（解决 dispatch_after 在深度休眠时主队列不 drain 的问题）
 static NSTimer *dyyyTimerCloseCheckTimer = nil;
 
@@ -477,8 +586,11 @@ static void DYYYStartTimerCloseCheck(void) {
         [viewModels addObject:coverViewModel];
     }
 
-    // 全屏观看功能
+    // 全屏观看功能（正向 / 反向两项，永远互为反面；
+    // 哪个是"正"由设置页「长按全屏观看反向」决定，默认不开启=保持抖音原生方向）
     if (enableCopyText) {
+        BOOL fsReverseDefault = DYYYGetBool(@"DYYYLongPressFullScreenReverse");
+
         AWELongPressPanelBaseViewModel *fullScreen = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
         fullScreen.awemeModel = self.awemeModel;
         fullScreen.actionType = 671;
@@ -489,10 +601,26 @@ static void DYYYStartTimerCloseCheck(void) {
           [panelManager dismissWithAnimation:YES completion:^{
             UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
             UIView *entryView = findLandscapeEntryViewInView(keyWindow);
-            simulateTapOnEntryView(entryView);
+            DYYYFSEnterLandscape(entryView, fsReverseDefault);
           }];
         };
         [viewModels addObject:fullScreen];
+
+        // 反向全屏：与上面一项方向相反，方便横屏时把手机换到另一边
+        AWELongPressPanelBaseViewModel *fullScreenRev = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
+        fullScreenRev.awemeModel = self.awemeModel;
+        fullScreenRev.actionType = 680;
+        fullScreenRev.duxIconName = @"ic_fullscreen_outlined";
+        fullScreenRev.describeString = @"反向全屏";
+        fullScreenRev.action = ^{
+          AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
+          [panelManager dismissWithAnimation:YES completion:^{
+            UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+            UIView *entryView = findLandscapeEntryViewInView(keyWindow);
+            DYYYFSEnterLandscape(entryView, !fsReverseDefault);
+          }];
+        };
+        [viewModels addObject:fullScreenRev];
     }
 
     // 音频下载功能
@@ -1282,8 +1410,11 @@ static void DYYYStartTimerCloseCheck(void) {
         [viewModels addObject:coverViewModel];
     }
 
-    // 全屏观看功能
+    // 全屏观看功能（正向 / 反向两项，永远互为反面；
+    // 哪个是"正"由设置页「长按全屏观看反向」决定，默认不开启=保持抖音原生方向）
     if (enableCopyText) {
+        BOOL fsReverseDefault = DYYYGetBool(@"DYYYLongPressFullScreenReverse");
+
         AWELongPressPanelBaseViewModel *fullScreen = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
         fullScreen.awemeModel = self.awemeModel;
         fullScreen.actionType = 671;
@@ -1294,10 +1425,26 @@ static void DYYYStartTimerCloseCheck(void) {
           [panelManager dismissWithAnimation:YES completion:^{
             UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
             UIView *entryView = findLandscapeEntryViewInView(keyWindow);
-            simulateTapOnEntryView(entryView);
+            DYYYFSEnterLandscape(entryView, fsReverseDefault);
           }];
         };
         [viewModels addObject:fullScreen];
+
+        // 反向全屏：与上面一项方向相反，方便横屏时把手机换到另一边
+        AWELongPressPanelBaseViewModel *fullScreenRev = [[%c(AWELongPressPanelBaseViewModel) alloc] init];
+        fullScreenRev.awemeModel = self.awemeModel;
+        fullScreenRev.actionType = 680;
+        fullScreenRev.duxIconName = @"ic_fullscreen_outlined";
+        fullScreenRev.describeString = @"反向全屏";
+        fullScreenRev.action = ^{
+          AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
+          [panelManager dismissWithAnimation:YES completion:^{
+            UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+            UIView *entryView = findLandscapeEntryViewInView(keyWindow);
+            DYYYFSEnterLandscape(entryView, !fsReverseDefault);
+          }];
+        };
+        [viewModels addObject:fullScreenRev];
     }
 
     // 音频下载功能
