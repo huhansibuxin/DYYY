@@ -307,8 +307,6 @@ typedef NS_ENUM(NSUInteger, DYEdgeMode) {
 - (void)setType:(long long)arg0;
 @end
 
-@interface XIGDanmakuPlayerView : UIView
-@end
 @interface DDanmakuPlayerView : UIView
 @end
 
