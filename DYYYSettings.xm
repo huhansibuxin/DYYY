@@ -970,6 +970,14 @@ void showDYYYSettingsVC(UIViewController *rootVC, BOOL hasAgreed) {
               @"detail" : @"",
               @"cellType" : @37,
               @"imageName" : @"ic_dansquarenut_outlined_20"
+          },
+          @{
+              @"identifier" : @"DYYYDisableDanmakuTap",
+              @"title" : @"禁止弹幕点击",
+              @"subTitle" : @"弹幕区域触摸穿透：播放时点到弹幕不会弹出菜单，也不影响点赞/切视频等操作",
+              @"detail" : @"",
+              @"cellType" : @6,
+              @"imageName" : @"ic_dansquare_outlined_20"
           }
       ];
 

@@ -4462,7 +4462,54 @@ static void DYYYApplyNormalPlaybackSpeedToNativeDPlayer(AWEDPlayerSpeedControlle
 
 %end
 
+// 【弹幕穿透】老板需求：抖音弹幕点击后会"暂停视频 + 弹出 喜欢/不喜欢/恢复/举报 菜单"，
+// 播放中极易误触。对策 = 让弹幕视图对触摸【透明】（pointInside: 返回 NO），
+// 事件直接穿透到下层视频交互层（双击点赞 / 上下滑切视频 / 单击暂停 全部不受影响）。
+// 实现要点：
+//   · 三个类都挂：XIGDanmakuPlayerView / DDanmakuPlayerView（弹幕容器，主战场）
+//     + AWEDanmakuContentLabel（单条弹幕 label，兜底 —— 某些版本弹幕直接挂在播放器视图上）；
+//   · 只在开关打开时穿透，开关关闭走 %orig，不影响原有行为；
+//   · pointInside: 是每次触摸都会走的高频方法，【绝不能每次打日志】——
+//     用 dispatch_once 只记一条"已生效 + 类名"，用于验证类名在当前版本真实存在。
+// 默认值：NSUserDefaults 从未写入过该键时默认【开启】（装上去即生效），
+// 用户在设置页动过一次后就完全听用户的。
+static BOOL DYYYDanmakuTapDisabled(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if ([d objectForKey:@"DYYYDisableDanmakuTap"] == nil) {
+        return YES;   // 未设置过 = 默认开启穿透
+    }
+    return [d boolForKey:@"DYYYDisableDanmakuTap"];
+}
+
+// 首次命中留痕（每类只记一次，证明 hook 挂对了类）
+static void DYYYDanmakuPassthroughHit(const char *cls) {
+    static NSMutableSet *dyyyHitClasses = nil;
+    static dispatch_once_t dyyyHitOnce;
+    dispatch_once(&dyyyHitOnce, ^{
+        dyyyHitClasses = [NSMutableSet set];
+    });
+    @synchronized(dyyyHitClasses) {
+        NSString *key = [NSString stringWithUTF8String:cls];
+        if ([dyyyHitClasses containsObject:key]) {
+            return;   // 已记录过，直接返回（高频路径零开销）
+        }
+        [dyyyHitClasses addObject:key];
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[danmu] 弹幕穿透已生效 class=%s（该类触摸已透明）", cls]);
+}
+
 %hook AWEDanmakuContentLabel
+
+// 单条弹幕的点击穿透：返回 NO 后该 label 区域不再接收触摸，
+// 点下去直接落到下层视频交互层，不会触发弹幕点击菜单。
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    if (DYYYDanmakuTapDisabled()) {
+        DYYYDanmakuPassthroughHit("AWEDanmakuContentLabel");
+        return NO;
+    }
+    return %orig(pointInside, point, event);
+}
+
 - (void)setTextColor:(UIColor *)textColor {
     if (DYYYGetBool(@"DYYYEnableDanmuColor")) {
         NSString *danmuColor = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYDanmuColor"];
@@ -4511,6 +4558,17 @@ static void DYYYApplyNormalPlaybackSpeedToNativeDPlayer(AWEDPlayerSpeedControlle
     }
 }
 
+// ⭐ 弹幕容器级穿透（主战场）：整个弹幕层对触摸透明。
+// 播放中点到/划过弹幕区域 → 事件穿透到视频层，不再触发"暂停 + 喜欢/不喜欢/恢复/举报"菜单，
+// 同时不影响双击点赞、上下滑切视频、单击暂停这些下层交互。
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    if (DYYYDanmakuTapDisabled()) {
+        DYYYDanmakuPassthroughHit("XIGDanmakuPlayerView");
+        return NO;
+    }
+    return %orig(pointInside, point, event);
+}
+
 %end
 
 %hook DDanmakuPlayerView
@@ -4521,6 +4579,15 @@ static void DYYYApplyNormalPlaybackSpeedToNativeDPlayer(AWEDPlayerSpeedControlle
     } else {
         %orig(alpha);
     }
+}
+
+// ⭐ 同上：DDanmakuPlayerView 容器级触摸穿透（部分版本走这个类）。
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    if (DYYYDanmakuTapDisabled()) {
+        DYYYDanmakuPassthroughHit("DDanmakuPlayerView");
+        return NO;
+    }
+    return %orig(pointInside, point, event);
 }
 
 %end
