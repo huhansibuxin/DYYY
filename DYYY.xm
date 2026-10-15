@@ -4240,68 +4240,205 @@ static void DYYYLPExitClassScanOnce(void) {
                    hit.count ? [hit componentsJoinedByString:@" ; "] : @"（无）"]);
 }
 
-// ④ 退出后的自愈：竖屏 feed 有时会停在两个 cell 中间，表现为「上面一半视频、下面一半视频」
-//    （截图实锤：上半是刚才那个视频的横屏构图残留 + 下半是相邻视频）。
-//    dismiss 之后延时两次，把 feed 对齐回「离屏幕中心最近」的那个 cell。
-static void DYYYLPExitRealignFeed(void) {
-    UIWindow *win = [DYYYUtils getActiveWindow];
-    if (!win) win = [UIApplication sharedApplication].keyWindow;
-    if (!win) return;
-    UICollectionView *best = nil;
-    CGFloat bestH = 0;
+// 读手势识别器的 _targets（真正的处理者就藏在这）——拿到 (target 对象, action SEL, 手势自身)。
+// _action 是 SEL ivar，KVC 取不到，必须按 ivar 偏移直接读内存。
+static NSString *DYYYLPExitGRTargets(UIGestureRecognizer *gr, NSMutableArray *store) {
+    NSMutableString *out = [NSMutableString string];
+    NSArray *arr = nil;
+    @try { arr = [gr valueForKey:@"_targets"]; } @catch (__unused NSException *e) {}
+    if (![arr isKindOfClass:[NSArray class]]) return out;
+    for (id t in arr) {
+        id tgt = nil;
+        SEL act = NULL;
+        for (Class c = object_getClass(t); c && c != [NSObject class]; c = class_getSuperclass(c)) {
+            unsigned int cnt = 0;
+            Ivar *iv = class_copyIvarList(c, &cnt);
+            for (unsigned int k = 0; iv && k < cnt; k++) {
+                const char *enc = ivar_getTypeEncoding(iv[k]);
+                if (!enc) continue;
+                if (strcmp(enc, ":") == 0) {
+                    act = *(SEL *)((uint8_t *)(__bridge void *)t + ivar_getOffset(iv[k]));
+                } else if (enc[0] == '@') {
+                    id val = nil;
+                    @try { val = object_getIvar(t, iv[k]); } @catch (__unused NSException *e) {}
+                    if (val) tgt = val;
+                }
+            }
+            if (iv) free(iv);
+        }
+        NSString *tn = tgt ? NSStringFromClass([tgt class]) : @"nil";
+        NSString *an = act ? NSStringFromSelector(act) : @"?";
+        [out appendFormat:@"%@ -%@ ; ", tn, an];
+        if (store && tgt && act) [store addObject:@[tgt, an, gr]];
+    }
+    return out;
+}
+
+// ①-E 直接触发「返回键上的 tap 手势」——抖音横屏的点击全是手势派发（按钮都没有 target-action），
+//      返回键自身没挂 target-action，但极可能被交互层挂了一只 tap 手势，
+//      手势的 _targets 就是真正的处理者 → 用真实手势对象当参数调用它 = 等价于点了一下返回键。
+static BOOL DYYYLPExitFireCornerTapGesture(UIView *backView, NSString **what) {
+    if (!backView) return NO;
+    NSMutableArray *cand = [NSMutableArray array];
+    // 只看返回键自己 + 小的祖先容器（避开"全屏容器上的通用 tap"，那类调了会误触）
+    NSMutableArray<UIView *> *views = [NSMutableArray arrayWithObject:backView];
+    for (UIView *v = backView.superview; v && views.count < 4; v = v.superview) {
+        if (v.bounds.size.width > 200 || v.bounds.size.height > 200) break;   // 到全屏容器就停
+        [views addObject:v];
+    }
+    for (UIView *v in views) {
+        for (UIGestureRecognizer *gr in v.gestureRecognizers) {
+            NSString *cn = NSStringFromClass([gr class]);
+            if (![cn containsString:@"Tap"]) continue;      // 只认 tap，别的（长按/拖拽）不动
+            NSMutableArray *store = [NSMutableArray array];
+            NSString *ts = DYYYLPExitGRTargets(gr, store);
+            DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ①-E 手势 %@ @%@ → %@",
+                           cn, NSStringFromClass([v class]), ts.length ? ts : @"（无 target）"]);
+            [cand addObjectsFromArray:store];
+        }
+    }
+    if (cand.count == 0) return NO;
+    // 优先调「横屏/交互/元素」这一族的 target
+    NSMutableArray *ordered = [NSMutableArray array];
+    for (NSArray *p in cand) {
+        if (DYYYLPExitClassLooksLikeLandscape([p[0] class], NO)) [ordered addObject:p];
+    }
+    for (NSArray *p in cand) if (![ordered containsObject:p]) [ordered addObject:p];
+    NSArray *pick = ordered.firstObject;
+    if (!pick) return NO;
+    id tgt = pick[0];
+    SEL act = NSSelectorFromString(pick[1]);
+    UIGestureRecognizer *owner = pick[2];
+    if (!tgt || !act) return NO;
+    if (what) *what = [NSString stringWithFormat:@"%@ -%@（手势 %@）",
+                       NSStringFromClass([tgt class]), pick[1], NSStringFromClass([owner class])];
+    @try { ((void (*)(id, SEL, id))objc_msgSend)(tgt, act, owner); } @catch (__unused NSException *e) {
+        DYYYSpeedDiag(@"[lp-exit] ①-E 调用抛异常，忽略");
+        return NO;
+    }
+    return YES;
+}
+
+// 诊断：把横屏页所有手势（类名 + 挂在哪 + target/action）打出来，①-E 没命中时靠这条定位。
+static void DYYYLPExitDumpGestures(UIView *root) {
+    if (!root) return;
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+    while (stack.count > 0 && lines.count < 25) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        for (UIView *s in v.subviews) [stack addObject:s];
+        for (UIGestureRecognizer *gr in v.gestureRecognizers) {
+            NSString *ts = DYYYLPExitGRTargets(gr, nil);
+            [lines addObject:[NSString stringWithFormat:@"%@@%@[%@]",
+                              NSStringFromClass([gr class]), NSStringFromClass([v class]),
+                              ts.length ? ts : @"无"]];
+        }
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] 横屏手势（%lu）：%@",
+                   (unsigned long)lines.count, lines.count ? [lines componentsJoinedByString:@" | "] : @"（无）"]);
+}
+
+// ④ 退出后的自愈：竖屏 feed 的「错位」实测有两种表现 ——
+//    (a) 滚动停在两个 cell 中间；(b) cell/itemSize 还是横屏尺寸（一屏塞两个"半屏"视频）。
+//    关键：必须等窗口真正转回竖屏再动手，所以这里会重试；成功判据 = 只剩 1 个 cell 且铺满视口。
+static BOOL DYYYLPExitHealFeed(void) {
+    // 先找「竖屏主窗口」——转屏过程中窗口还是横屏尺寸，这时什么都不动，等下一轮
+    UIWindow *mainWin = nil;
+    CGSize mainSize = CGSizeZero;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w.windowLevel != UIWindowLevelNormal || !w.rootViewController) continue;
+        if (w.bounds.size.height < w.bounds.size.width) continue;      // 不是竖屏
+        if (w.bounds.size.height > mainSize.height) { mainWin = w; mainSize = w.bounds.size; }
+    }
+    if (!mainWin) {
+        DYYYSpeedDiag(@"[lp-exit] ④ 还没有竖屏主窗口，稍后重试");
+        return NO;
+    }
+    UICollectionView *cv = nil;
     NSMutableArray<NSString *> *diag = [NSMutableArray array];
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:win];
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:mainWin];
     while (stack.count > 0) {
         UIView *v = stack.lastObject;
         [stack removeLastObject];
-        if ([v isKindOfClass:[UICollectionView class]]) {
-            UICollectionView *cv = (UICollectionView *)v;
-            // 竖屏 feed 的特征：纵向内容远超一屏、且不在横屏那棵树里。
-            // ⚠️ 上一版用「窗口尺寸 0.8 倍」当判据，转屏期间窗口还是横屏尺寸 → 一个都匹配不到。
-            if (cv.window && cv.bounds.size.height > 100 && cv.bounds.size.width > 100 &&
-                cv.contentSize.height > cv.bounds.size.height * 1.5 &&
-                !DYYYLPExitHasLandscapeAncestor(cv)) {
-                [diag addObject:[NSString stringWithFormat:@"%@%@ c=%.0f",
-                                 NSStringFromClass([cv class]), NSStringFromCGRect(cv.bounds),
-                                 cv.contentSize.height]];
-                if (cv.contentSize.height > bestH) { bestH = cv.contentSize.height; best = cv; }
-            }
-        }
         for (UIView *s in v.subviews) [stack addObject:s];
+        if (![v isKindOfClass:[UICollectionView class]]) continue;
+        UICollectionView *c = (UICollectionView *)v;
+        if (!c.window || c.bounds.size.width < 100 || c.bounds.size.height < 100) continue;
+        if (DYYYLPExitHasLandscapeAncestor(c)) continue;
+        BOOL full = (c.bounds.size.height >= mainSize.height * 0.9 && c.bounds.size.width >= mainSize.width * 0.9);
+        [diag addObject:[NSString stringWithFormat:@"%@%@%@", NSStringFromClass([c class]),
+                         NSStringFromCGRect(c.bounds), full ? @"(满屏)" : @""]];
+        if (full) cv = c;
     }
-    if (!best) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ④ 没找到竖屏 feed 的 collectionView（候选：%@）",
+    if (!cv) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ④ 没找到铺满竖屏的 feed collectionView（候选：%@）",
                        diag.count ? [diag componentsJoinedByString:@", "] : @"无"]);
-        return;
+        return NO;
     }
-    // 先让布局重算，把 cell 里残留的横屏 frame 冲掉
-    [best.collectionViewLayout invalidateLayout];
-    [best setNeedsLayout];
-    [best layoutIfNeeded];
-    CGFloat mid = best.contentOffset.y + best.bounds.size.height / 2.0;
+    [cv.collectionViewLayout invalidateLayout];
+    [cv setNeedsLayout];
+    [cv layoutIfNeeded];
+
+    NSArray<UICollectionViewCell *> *cells = [cv visibleCells];
+    NSString *itemStr = @"-";
+    UICollectionViewFlowLayout *fl = [cv.collectionViewLayout isKindOfClass:[UICollectionViewFlowLayout class]]
+        ? (UICollectionViewFlowLayout *)cv.collectionViewLayout : nil;
+    if (fl) itemStr = NSStringFromCGSize(fl.itemSize);
+    NSMutableArray<NSString *> *frames = [NSMutableArray array];
+    for (UICollectionViewCell *c in cells) [frames addObject:NSStringFromCGRect(c.frame)];
+    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ④ feed bounds=%@ itemSize=%@ 可见%lu个 cell=%@",
+                   NSStringFromCGRect(cv.bounds), itemStr, (unsigned long)cells.count,
+                   [frames componentsJoinedByString:@" "]]);
+
+    BOOL recovered = (cells.count == 1 &&
+                      fabs(cells.firstObject.frame.size.height - cv.bounds.size.height) < 2.0 &&
+                      fabs(cells.firstObject.frame.size.width - cv.bounds.size.width) < 2.0);
+    if (recovered) {
+        DYYYSpeedDiag(@"[lp-exit] ④ feed 已恢复（1 个 cell 铺满视口）");
+        return YES;
+    }
+    // itemSize 还是横屏尺寸（宽>高）→ 直接纠回视口尺寸（= 抖音转屏后该有的值）
+    if (fl && fl.itemSize.width > fl.itemSize.height && fl.itemSize.width > cv.bounds.size.width + 2.0) {
+        fl.itemSize = cv.bounds.size;
+        [fl invalidateLayout];
+        [cv setNeedsLayout];
+        [cv layoutIfNeeded];
+        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ④ itemSize 是横屏尺寸，已纠正为 %@",
+                       NSStringFromCGRect(cv.bounds)]);
+    }
+    for (UICollectionViewCell *c in [cv visibleCells]) {
+        [c setNeedsLayout];
+        [c layoutIfNeeded];
+    }
+    // 再把离视口中心最近的 cell 居中
+    CGFloat mid = cv.contentOffset.y + cv.bounds.size.height / 2.0;
     NSIndexPath *pick = nil;
     CGFloat bestD = CGFLOAT_MAX;
-    for (NSIndexPath *ip in [best indexPathsForVisibleItems]) {
-        UICollectionViewLayoutAttributes *a = [best.collectionViewLayout layoutAttributesForItemAtIndexPath:ip];
+    for (NSIndexPath *ip in [cv indexPathsForVisibleItems]) {
+        UICollectionViewLayoutAttributes *a = [cv.collectionViewLayout layoutAttributesForItemAtIndexPath:ip];
         if (!a) continue;
         CGFloat d = fabs(CGRectGetMidY(a.frame) - mid);
         if (d < bestD) { bestD = d; pick = ip; }
     }
-    if (!pick) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ④ %@ 没有可见 cell（offset=%.1f）",
-                       NSStringFromClass([best class]), best.contentOffset.y]);
-        return;
+    if (pick && bestD >= 2.0) {
+        CGFloat before = cv.contentOffset.y;
+        [cv scrollToItemAtIndexPath:pick atScrollPosition:UICollectionViewScrollPositionCenteredVertically animated:NO];
+        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ④ 已居中 feed（%@ 第 %ld 项，offset %.1f → %.1f）",
+                       NSStringFromClass([cv class]), (long)pick.item, before, cv.contentOffset.y]);
     }
-    if (bestD < 2.0) {
-        DYYYSpeedDiag(@"[lp-exit] ④ feed 位置本来就是正的，不用动");
-        return;
-    }
-    CGFloat before = best.contentOffset.y;
-    [best scrollToItemAtIndexPath:pick atScrollPosition:UICollectionViewScrollPositionCenteredVertically animated:NO];
-    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ④ 已对齐 feed（%@ 第 %ld 项，offset %.1f → %.1f，原偏 %.1f）",
-                   NSStringFromClass([best class]), (long)pick.item, before, best.contentOffset.y, bestD]);
+    return NO;
 }
 
+// ④ 重试调度：每 0.6s 一次，直到 feed 恢复（或试满 9 次）
+static void DYYYLPExitHealSchedule(int attempt) {
+    if (attempt > 9) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (DYYYLPExitHealFeed()) return;
+        DYYYLPExitHealSchedule(attempt + 1);
+    });
+}
 // （原「横屏页控件类名 dump」已被 ①-C 的更详细版本取代：带 window 坐标 + 注册的 action）
 
 // ② 兜底的通用退出 —— 复刻「先转竖屏、再收起」的时序。
@@ -4322,11 +4459,8 @@ static void DYYYLPExitFallbackDismiss(UIViewController *top) {
                            NSStringFromClass([t class])]);
         });
         DYYYSpeedDiag(@"[lp-exit] ② 已转竖屏，0.35s 后收起横屏页");
-        // ④ 退出后自愈：多跑几次，等窗口真正转回竖屏后再对齐
-        for (double d = 0.7; d <= 2.6; d += 0.6) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ DYYYLPExitRealignFeed(); });
-        }
+        // ④ 退出后自愈：每 0.6s 重试，直到 feed 恢复「1 个 cell 铺满竖屏」
+        DYYYLPExitHealSchedule(1);
         return;
     }
     UINavigationController *nc = top.navigationController;
@@ -4412,14 +4546,42 @@ static BOOL DYYYLPExitLandscape(void) {
             UIViewController *t = wtop;
             if (!t || !t.presentingViewController) {
                 DYYYSpeedDiag(@"[lp-exit] ①-D 退出成功（横屏页已自己收起）");
+                DYYYLPExitHealSchedule(1);
                 return;
             }
-            DYYYSpeedDiag(@"[lp-exit] ①-D 没退出，转 ②");
+            DYYYSpeedDiag(@"[lp-exit] ①-D 没退出，转 ①-E");
+            NSString *what2 = nil;
+            if (DYYYLPExitFireCornerTapGesture(backView, &what2)) {
+                DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ①-E 已触发返回键手势 %@", what2]);
+                DYYYLPExitHealSchedule(1);
+                return;
+            }
+            DYYYSpeedDiag(@"[lp-exit] ①-E 没触发，转 ②");
             DYYYLPExitFallbackDismiss(t);
         });
         return YES;
     }
-    DYYYSpeedDiag(@"[lp-exit] ①-D 没找到返回键处理方法，直接走 ②");
+    DYYYSpeedDiag(@"[lp-exit] ①-D 没找到返回键处理方法");
+
+    // ①-E 触发返回键上的 tap 手势（横屏点击是手势派发，真正的处理者挂在手势 target 上）
+    if (DYYYLPExitFireCornerTapGesture(backView, &what)) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ①-E 已触发返回键手势 %@", what]);
+        __weak UIViewController *wtop2 = top;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            UIViewController *t = wtop2;
+            if (!t || !t.presentingViewController) {
+                DYYYSpeedDiag(@"[lp-exit] ①-E 退出成功（横屏页已自己收起）");
+                DYYYLPExitHealSchedule(1);
+                return;
+            }
+            DYYYSpeedDiag(@"[lp-exit] ①-E 没退出，转 ②");
+            DYYYLPExitFallbackDismiss(t);
+        });
+        return YES;
+    }
+    DYYYLPExitDumpGestures(top.view);      // ①-E 也没命中 → 把手势清单打出来（下一版照它调）
+    DYYYSpeedDiag(@"[lp-exit] ①-E 没触发，直接走 ②");
 
     // ② 兜底通用返回
     if (top.presentingViewController) {
