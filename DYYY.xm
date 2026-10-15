@@ -3910,7 +3910,7 @@ static id DYYYLPExitBlockHolderInVC(UIViewController *vc) {
             const char *enc = ivar_getTypeEncoding(ivars[i]);
             if (!enc || enc[0] != '@') continue;
             id v = nil;
-            @try { v = (__bridge id)object_getIvar(vc, ivars[i]); } @catch (__unused NSException *e) {}
+            @try { v = object_getIvar(vc, ivars[i]); } @catch (__unused NSException *e) {}
             if (!v) continue;
             if ([v respondsToSelector:NSSelectorFromString(kBlockKey)]) found = v;
         }
