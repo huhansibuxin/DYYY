@@ -4034,24 +4034,106 @@ static BOOL DYYYLPExitDumpBackButton(UIView *root) {
     return NO;
 }
 
-// 诊断：列出横屏页视图树里的 UIControl 类名。
-// 用途：① 没命中时，靠它精确定位抖音自己的「返回/收起」按钮（下一步就能直接触发它）。
-static void DYYYLPExitLogControls(UIView *root) {
-    if (!root) return;
-    NSMutableArray<NSString *> *names = [NSMutableArray array];
+// ①-C 横屏页里「名字像返回」的按钮 —— 直接给它发点击事件（= 用户手点返回）。
+// 判据只认 action 名（back/exit/close/quit/dismiss/finish），不靠猜位置，避免误点其它按钮。
+// 每次都会把横屏页所有 UIControl 的「类名(window坐标) + 注册的 action」打进日志，便于核实。
+static BOOL DYYYLPExitTapNamedBackControl(UIView *root) {
+    if (!root) return NO;
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
-    while (stack.count > 0 && names.count < 30) {
+    NSMutableArray<NSString *> *dump = [NSMutableArray array];
+    while (stack.count > 0) {
         UIView *v = stack.lastObject;
         [stack removeLastObject];
-        if ([v isKindOfClass:[UIControl class]]) {
-            NSString *n = NSStringFromClass([v class]);
-            if (n.length > 0 && ![names containsObject:n]) [names addObject:n];
+        for (UIView *s in v.subviews) [stack addObject:s];
+        if (![v isKindOfClass:[UIControl class]]) continue;
+        UIControl *c = (UIControl *)v;
+        NSString *where = NSStringFromCGRect([c convertRect:c.bounds toView:nil]);
+        NSMutableArray<NSString *> *acts = [NSMutableArray array];
+        for (id t in c.allTargets) {
+            for (NSUInteger e = 1; e <= (NSUInteger)(1u << 16); e <<= 1) {
+                NSArray<NSString *> *as = [c actionsForTarget:t forControlEvent:(UIControlEvents)e];
+                for (NSString *a in as) {
+                    [acts addObject:[NSString stringWithFormat:@"%@.%@", NSStringFromClass([t class]), a]];
+                }
+            }
+        }
+        // iOS 14+ 的 UIAction 不走 allTargets，单独取
+        @try {
+            id pa = [c valueForKey:@"primaryAction"];
+            if (pa) [acts addObject:[NSString stringWithFormat:@"primaryAction:%@", pa]];
+        } @catch (__unused NSException *e) {}
+        [dump addObject:[NSString stringWithFormat:@"%@%@ %@", NSStringFromClass([c class]), where,
+                         acts.count ? [acts componentsJoinedByString:@"|"] : @"(无action)"]];
+        for (NSString *n in acts) {
+            NSString *low = n.lowercaseString;
+            if ([low containsString:@"back"] || [low containsString:@"exit"] || [low containsString:@"close"] ||
+                [low containsString:@"quit"] || [low containsString:@"dismiss"] || [low containsString:@"finish"]) {
+                [c sendActionsForControlEvents:UIControlEventTouchUpInside];
+                DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ①-C 命中返回键 → sendActions（%@ %@）",
+                               NSStringFromClass([c class]), n]);
+                return YES;
+            }
+        }
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ①-C 横屏页控件：%@", [dump componentsJoinedByString:@" ; "]]);
+    return NO;
+}
+
+// ④ 退出后的自愈：竖屏 feed 有时会停在两个 cell 中间，表现为「上面一半视频、下面一半视频」
+//    （截图实锤：上半是刚才那个视频的横屏构图残留 + 下半是相邻视频）。
+//    dismiss 之后延时两次，把 feed 对齐回「离屏幕中心最近」的那个 cell。
+static void DYYYLPExitRealignFeed(void) {
+    UIWindow *win = [DYYYUtils getActiveWindow];
+    if (!win) win = [UIApplication sharedApplication].keyWindow;
+    if (!win) return;
+    CGSize winSize = win.bounds.size;
+    UICollectionView *best = nil;
+    CGFloat bestH = 0;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:win];
+    while (stack.count > 0) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        if ([v isKindOfClass:[UICollectionView class]]) {
+            UICollectionView *cv = (UICollectionView *)v;
+            // 竖屏 feed 的特征：几乎铺满窗口、且纵向内容远超一屏
+            if (cv.bounds.size.height > winSize.height * 0.8 &&
+                cv.bounds.size.width > winSize.width * 0.8 &&
+                cv.contentSize.height > cv.bounds.size.height) {
+                if (cv.contentSize.height > bestH) { bestH = cv.contentSize.height; best = cv; }
+            }
         }
         for (UIView *s in v.subviews) [stack addObject:s];
     }
-    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] 横屏页控件：%@",
-                   names.count ? [names componentsJoinedByString:@", "] : @"（没找到 UIControl）"]);
+    if (!best) {
+        DYYYSpeedDiag(@"[lp-exit] ④ 没找到竖屏 feed 的 collectionView，跳过对齐");
+        return;
+    }
+    // 先让布局重算，把 cell 里残留的横屏 frame 冲掉
+    [best.collectionViewLayout invalidateLayout];
+    [best setNeedsLayout];
+    [best layoutIfNeeded];
+    CGFloat before = best.contentOffset.y;
+    CGPoint center = CGPointMake(best.contentOffset.x + best.bounds.size.width / 2.0,
+                                 best.contentOffset.y + best.bounds.size.height / 2.0);
+    NSIndexPath *ip = [best indexPathForItemAtPoint:center];
+    if (!ip || ip.item == NSNotFound) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ④ %@ 中心点取不到 item（offset=%.1f）",
+                       NSStringFromClass([best class]), before]);
+        return;
+    }
+    UICollectionViewLayoutAttributes *attr =
+        [best.collectionViewLayout layoutAttributesForItemAtIndexPath:ip];
+    CGFloat screenMid = best.contentOffset.y + best.bounds.size.height / 2.0;
+    if (attr && fabs(CGRectGetMidY(attr.frame) - screenMid) < 2.0) {
+        DYYYSpeedDiag(@"[lp-exit] ④ feed 位置本来就是正的，不用动");
+        return;
+    }
+    [best scrollToItemAtIndexPath:ip atScrollPosition:UICollectionViewScrollPositionCenteredVertically animated:NO];
+    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ④ 已对齐 feed（%@ 第 %ld 项，offset %.1f → %.1f）",
+                   NSStringFromClass([best class]), (long)ip.item, before, best.contentOffset.y]);
 }
+
+// （原「横屏页控件类名 dump」已被 ①-C 的更详细版本取代：带 window 坐标 + 注册的 action）
 
 // 退出横屏全屏：三条路依次试，成功即停
 static BOOL DYYYLPExitLandscape(void) {
@@ -4111,14 +4193,16 @@ static BOOL DYYYLPExitLandscape(void) {
         }
     }
 
-    // ①-B 探明横屏页返回按钮的可用入口（只记日志，不调用、不阻断 ②）
+    // ①-B 探明 AWENoxusHighlightButton 的可用入口（只记日志，不调用、不阻断后面的路）
     DYYYLPExitDumpBackButton(top.view);
+
+    // ①-C 真正的返回键：按 action 名认出它并直接发点击 —— 用户手点返回走的就是这条
+    if (DYYYLPExitTapNamedBackControl(top.view)) return YES;
 
     // ② 通用返回 —— 复刻抖音返回键的时序：先把设备转回竖屏，再收起横屏页。
     //    ⚠️ 实测：横屏状态下直接 dismiss，转场按横屏尺寸算，竖屏 feed 布局随之算错 →
     //       上下界面错位、落到相邻视频、回不到原视频。先转竖屏即可对齐抖音自己的行为。
     if (top.presentingViewController) {
-        DYYYLPExitLogControls(top.view);
         [[UIDevice currentDevice] setValue:@(UIInterfaceOrientationPortrait) forKey:@"orientation"];
         [UIViewController attemptRotationToDeviceOrientation];
         __weak UIViewController *weakTop = top;
@@ -4131,6 +4215,11 @@ static BOOL DYYYLPExitLandscape(void) {
                            NSStringFromClass([t class])]);
         });
         DYYYSpeedDiag(@"[lp-exit] ② 已转竖屏，0.35s 后收起横屏页");
+        // ④ 退出后自愈：把竖屏 feed 对齐回一个完整的 cell（修「上面一半视频、下面一半视频」）
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ DYYYLPExitRealignFeed(); });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ DYYYLPExitRealignFeed(); });
         return YES;
     }
     UINavigationController *nc = top.navigationController;
