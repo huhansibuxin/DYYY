@@ -111,85 +111,8 @@ static void DYYYFSRequestOrientationOnce(UIInterfaceOrientation target) {
     }
 }
 
-// ---- 方向收紧：唯一会碰到抖音行为的地方，且【只在「反向全屏」动作期间】生效 ----
-// 原理：抖音横屏入口自身会请求左侧；把 App 允许方向临时收紧成「仅横屏右」，
-// iOS 就必须让这次旋转直接落到右边 —— 一次到位，不再"先进左边再翻 180°"（那正是转两圈的来源）。
-// 老入口「全屏观看」完全不经过这里，零改动。
-// ⚠️ v35 关键修复：抖音真正的 UIApplicationDelegate 是 **AWEAppDelegate**，
-//    二进制里另有一个同名的 AppDelegate（别的类），v34 挂它 → 方向收紧从未被调用过。
-//    现在改为：优先挂「当前 App 的 delegate 类」，再兜底 AWEAppDelegate / AppDelegate。
-static BOOL gDYYYFSForceReverse = NO;
-static NSInteger gDYYYFSMaskHits = 0;
-
-static IMP gDYYYFSSupportedOrientOrig = NULL;
-
-// 若 delegate 没实现该方法，系统用的就是 Info.plist 的值 → 原样返回，避免多放开方向
-static UIInterfaceOrientationMask DYYYFSBundleMask(void) {
-    static UIInterfaceOrientationMask mask;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        mask = UIInterfaceOrientationMaskAllButUpsideDown;
-        NSBundle *b = [NSBundle mainBundle];
-        NSArray *v = [b objectForInfoDictionaryKey:@"UISupportedInterfaceOrientations~iphone"];
-        if (![v isKindOfClass:[NSArray class]])
-            v = [b objectForInfoDictionaryKey:@"UISupportedInterfaceOrientations"];
-        if (![v isKindOfClass:[NSArray class]]) return;
-        UIInterfaceOrientationMask r = 0;
-        for (NSString *s in v) {
-            if ([s isEqualToString:@"UIInterfaceOrientationPortrait"]) r |= UIInterfaceOrientationMaskPortrait;
-            else if ([s isEqualToString:@"UIInterfaceOrientationPortraitUpsideDown"]) r |= UIInterfaceOrientationMaskPortraitUpsideDown;
-            else if ([s isEqualToString:@"UIInterfaceOrientationLandscapeLeft"]) r |= UIInterfaceOrientationMaskLandscapeLeft;
-            else if ([s isEqualToString:@"UIInterfaceOrientationLandscapeRight"]) r |= UIInterfaceOrientationMaskLandscapeRight;
-        }
-        if (r) mask = r;
-    });
-    return mask;
-}
-
-static UIInterfaceOrientationMask DYYYFSSupportedOrient(id self, SEL _cmd, UIApplication *app, UIWindow *win) {
-    if (gDYYYFSForceReverse) {
-        if (gDYYYFSMaskHits < 3) {
-            gDYYYFSMaskHits++;
-            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] mask 被咨询 #%ld -> 仅横屏右", (long)gDYYYFSMaskHits]);
-        }
-        return UIInterfaceOrientationMaskLandscapeRight;
-    }
-    if (gDYYYFSSupportedOrientOrig) {
-        return ((UIInterfaceOrientationMask (*)(id, SEL, UIApplication *, UIWindow *))gDYYYFSSupportedOrientOrig)(self, _cmd, app, win);
-    }
-    return DYYYFSBundleMask();
-}
-
-// 惰性接管 delegate 的方向方法（首次用到「反向全屏」时才装，无加载期开销）
-static void DYYYFSInstallOrientationHook(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        SEL sel = NSSelectorFromString(@"application:supportedInterfaceOrientationsForWindow:");
-        id delegate = [UIApplication sharedApplication].delegate;
-        Class ad = delegate ? object_getClass(delegate) : Nil;
-        if (!ad) ad = objc_getClass("AWEAppDelegate");
-        if (!ad) ad = objc_getClass("AppDelegate");
-        if (!ad) {
-            DYYYFSDiag(@"[fs-rev] 未找到 AppDelegate，方向收紧不可用");
-            return;
-        }
-        Method m = class_getInstanceMethod(ad, sel);
-        if (m) {
-            gDYYYFSSupportedOrientOrig = method_getImplementation(m);
-            // 若该方法是【本类】实现的 → class_addMethod 会失败，直接换 IMP；
-            // 若只是【从父类继承】的 → class_addMethod 成功，在本类新增覆盖（不动父类）。
-            if (!class_addMethod(ad, sel, (IMP)DYYYFSSupportedOrient, method_getTypeEncoding(m))) {
-                method_setImplementation(m, (IMP)DYYYFSSupportedOrient);
-            }
-            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 已接管方向 mask 于 %@（原实现保留）",
-                        NSStringFromClass(ad)]);
-        } else {
-            class_addMethod(ad, sel, (IMP)DYYYFSSupportedOrient, "Q@:@@");
-            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] %@ 无该方向方法，已新增",
-                        NSStringFromClass(ad)]);
-        }
-    });
-}
+// 说明：v34/v35 的「临时收紧 delegate mask 让抖音一次落右」路线已实测证伪并整段删除 ——
+// 日志证明 mask 被咨询了但结果不被采纳（抖音是显式强推方向），落点始终是左。
 
 // 取当前最上层的 VC（用于 setNeedsUpdateOfSupportedInterfaceOrientations）
 static UIViewController *DYYYFSTopViewController(void) {
@@ -252,9 +175,6 @@ static void DYYYFSFlipToRight(void) {
 // ——老板口径：允许"多转一下"，但全屏观看（老入口）绝不能被翻。
 static void DYYYFSEnterReverse(UIView *entryView) {
     if (!entryView) return;
-    DYYYFSInstallOrientationHook();
-    gDYYYFSMaskHits = 0;
-    gDYYYFSForceReverse = YES;  // 收紧（抖音会绕开，但能压制它把方向自动拨回左）
     DYYYFSDiag(@"[fs-rev] 反向全屏：先进横屏，稳定后翻到右");
     simulateTapOnEntryView(entryView);
 
@@ -269,15 +189,11 @@ static void DYYYFSEnterReverse(UIView *entryView) {
                 });
                 return;
             }
-            gDYYYFSForceReverse = NO;
             DYYYFSDiag(@"[fs-rev] 2.1s 未进横屏，放弃");
             return;
         }
         if (cur == UIInterfaceOrientationLandscapeRight) {
             DYYYFSDiag(@"[fs-rev] 一进来就在右边，无需翻转");
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                gDYYYFSForceReverse = NO;
-            });
             return;
         }
         // 已经横屏左：连续两次读到同一个方向才算动画停稳（否则请求会被系统打包成迟到效应）
@@ -290,17 +206,9 @@ static void DYYYFSEnterReverse(UIView *entryView) {
         }
         DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 已稳定在左 n=%ld，开始翻右", (long)n]);
         DYYYFSFlipToRight();
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            gDYYYFSForceReverse = NO;
-            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 已放开收紧 cur=%ld",
-                        (long)DYYYFSCurrentOrientation()]);
-        });
     };
     poll(1, 0);
 }
-
-// 说明：v34/v35 走的「收紧 mask 一次落右」路线已证伪 —— 抖音横屏是显式强推方向，
-// delegate 的 mask 会被咨询但不被采纳，故删除该实现，不再保留死代码。
 
 // 「反向全屏」菜单项开关：未设置过 = 默认显示（老板要求默认打开）
 static BOOL DYYYFSReverseItemEnabled(void) {
