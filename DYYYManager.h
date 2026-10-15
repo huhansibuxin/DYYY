@@ -49,6 +49,18 @@
 + (void)downloadMedia:(NSURL *)url mediaType:(MediaType)mediaType audio:(NSURL *)audioURL completion:(void (^)(BOOL success))completion;
 
 /**
+ * 多候选 URL 下载：依次尝试全部候选地址，首个成功即返回，全部失败回调 NO
+ * @param urls 候选 URL 数组（originURLList 的全部条目）
+ * @param mediaType 媒体类型
+ * @param audioURL 音频 URL（视频下载时用于合成，单源）
+ * @param completion 完成回调
+ */
++ (void)downloadMediaFromURLs:(NSArray<NSURL *> *)urls
+                    mediaType:(MediaType)mediaType
+                        audio:(NSURL *)audioURL
+                   completion:(void (^)(BOOL success))completion;
+
+/**
  * 带进度的媒体下载
  * @param url 媒体URL
  * @param mediaType 媒体类型

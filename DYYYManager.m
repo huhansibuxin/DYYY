@@ -498,6 +498,59 @@
                          }];
 }
 
+// 多候选 URL 下载：依次尝试 originURLList 中的全部地址，首个成功即返回，
+// 全部失败才回调 NO。底层仍复用 downloadMedia: 的完整管线
+// （进度条 / 音频合并 / 保存到相册 / 分享面板），无需改动下载核心。
++ (void)downloadMediaFromURLs:(NSArray<NSURL *> *)urls
+                    mediaType:(MediaType)mediaType
+                        audio:(NSURL *)audioURL
+                   completion:(void (^)(BOOL success))completion {
+    NSMutableArray<NSURL *> *validURLs = [NSMutableArray array];
+    NSMutableSet<NSString *> *seenURLs = [NSMutableSet set];
+    for (NSURL *candidateURL in urls) {
+        if (![candidateURL isKindOfClass:[NSURL class]] || candidateURL.absoluteString.length == 0) {
+            continue;
+        }
+        NSString *urlString = candidateURL.absoluteString;
+        if ([seenURLs containsObject:urlString]) {
+            continue;
+        }
+        [seenURLs addObject:urlString];
+        [validURLs addObject:candidateURL];
+    }
+
+    if (validURLs.count == 0) {
+        [DYYYUtils showToast:@"没有找到可用的下载地址"];
+        if (completion) {
+            completion(NO);
+        }
+        return;
+    }
+
+    // 依次尝试候选 URL，首个成功即返回；全部失败才回调 NO
+    void (^attempt)(NSInteger) = ^(NSInteger index) {
+        if (index >= validURLs.count) {
+            if (completion) {
+                completion(NO);
+            }
+            return;
+        }
+        [self downloadMedia:validURLs[index]
+                  mediaType:mediaType
+                      audio:audioURL
+                 completion:^(BOOL success) {
+                     if (success) {
+                         if (completion) {
+                             completion(YES);
+                         }
+                     } else {
+                         attempt(index + 1);
+                     }
+                 }];
+    };
+    attempt(0);
+}
+
 + (void)downloadMediaWithProgress:(NSURL *)url
                         mediaType:(MediaType)mediaType
                             audio:(NSURL *)audioURL

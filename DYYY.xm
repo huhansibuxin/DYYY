@@ -5622,12 +5622,30 @@ static void DYYYBlockUpdateClassesOnce(void) {
 
 %end
 
+static char kDYYYOffsetOriginalTransformKey;
+
+// 给容器施加/撤销 DYYY 的下移偏移。首次施加时记下原 transform，
+// 偏移关闭时只复原被 DYYY 动过的容器，不误伤抖音自身的 transform。
+static void DYYYSetOffsetTransform(UIView *view, BOOL enabled, CGAffineTransform transform) {
+    if (!view) {
+        return;
+    }
+    NSValue *original = objc_getAssociatedObject(view, &kDYYYOffsetOriginalTransformKey);
+    if (enabled) {
+        if (!original) {
+            objc_setAssociatedObject(view, &kDYYYOffsetOriginalTransformKey, [NSValue valueWithCGAffineTransform:view.transform], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        view.transform = transform;
+    } else if (original) {
+        view.transform = [original CGAffineTransformValue];
+        objc_setAssociatedObject(view, &kDYYYOffsetOriginalTransformKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
 %hook AWEPlayInteractionDescriptionScrollView
 
 - (void)layoutSubviews {
     %orig;
-
-    self.transform = CGAffineTransformIdentity;
 
     NSString *descriptionOffsetValue = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYDescriptionVerticalOffset"];
     CGFloat verticalOffset = 0;
@@ -5635,17 +5653,16 @@ static void DYYYBlockUpdateClassesOnce(void) {
         verticalOffset = [descriptionOffsetValue floatValue];
     }
 
-    UIView *parentView = self.superview;
-    UIView *grandParentView = nil;
-
-    if (parentView) {
-        grandParentView = parentView.superview;
+    // 未设置偏移时透传，只复原之前被 DYYY 偏移过的容器，
+    // 避免重置抖音自身的布局 transform 导致文章/描述整页跳动
+    UIView *grandParentView = self.superview.superview;
+    if (verticalOffset == 0) {
+        DYYYSetOffsetTransform(grandParentView, NO, CGAffineTransformIdentity);
+        return;
     }
 
-    if (grandParentView && verticalOffset != 0) {
-        CGAffineTransform translationTransform = CGAffineTransformMakeTranslation(0, verticalOffset);
-        grandParentView.transform = translationTransform;
-    }
+    self.transform = CGAffineTransformIdentity;
+    DYYYSetOffsetTransform(grandParentView, YES, CGAffineTransformMakeTranslation(0, verticalOffset));
 }
 
 %end
@@ -5726,25 +5743,22 @@ static NSString *const kDYYYLongPressCopyEnabledKey = @"DYYYLongPressCopyTextEna
 - (void)layoutSubviews {
     %orig;
 
-    self.transform = CGAffineTransformIdentity;
-
     NSString *descriptionOffsetValue = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYDescriptionVerticalOffset"];
     CGFloat verticalOffset = 0;
     if (descriptionOffsetValue.length > 0) {
         verticalOffset = [descriptionOffsetValue floatValue];
     }
 
-    UIView *parentView = self.superview;
-    UIView *grandParentView = nil;
-
-    if (parentView) {
-        grandParentView = parentView.superview;
+    // 未设置偏移时透传，只复原之前被 DYYY 偏移过的容器，
+    // 避免重置抖音自身的布局 transform 导致文章/描述整页跳动
+    UIView *grandParentView = self.superview.superview;
+    if (verticalOffset == 0) {
+        DYYYSetOffsetTransform(grandParentView, NO, CGAffineTransformIdentity);
+        return;
     }
 
-    if (grandParentView && verticalOffset != 0) {
-        CGAffineTransform translationTransform = CGAffineTransformMakeTranslation(0, verticalOffset);
-        grandParentView.transform = translationTransform;
-    }
+    self.transform = CGAffineTransformIdentity;
+    DYYYSetOffsetTransform(grandParentView, YES, CGAffineTransformMakeTranslation(0, verticalOffset));
 }
 
 %end
@@ -5754,8 +5768,6 @@ static NSString *const kDYYYLongPressCopyEnabledKey = @"DYYYLongPressCopyTextEna
 - (void)layoutSubviews {
     %orig;
 
-    self.transform = CGAffineTransformIdentity;
-
     // 添加垂直偏移支持
     NSString *verticalOffsetValue = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYNicknameVerticalOffset"];
     CGFloat verticalOffset = 0;
@@ -5763,20 +5775,22 @@ static NSString *const kDYYYLongPressCopyEnabledKey = @"DYYYLongPressCopyTextEna
         verticalOffset = [verticalOffsetValue floatValue];
     }
 
-    UIView *parentView = self.superview;
-    UIView *grandParentView = nil;
-
-    if (parentView) {
-        grandParentView = parentView.superview;
+    // 未设置偏移时透传，只复原之前被 DYYY 偏移过的容器，
+    // 避免重置抖音自身的布局 transform 导致昵称/文章容器整页跳动
+    UIView *grandParentView = self.superview.superview;
+    if (verticalOffset == 0) {
+        DYYYSetOffsetTransform(grandParentView, NO, CGAffineTransformIdentity);
+        return;
     }
+
+    self.transform = CGAffineTransformIdentity;
 
     // 检查祖父视图是否为 AWEBaseElementView 类型
     if (grandParentView && [grandParentView.superview isKindOfClass:%c(AWEBaseElementView)]) {
         CGRect scaledFrame = grandParentView.frame;
         CGFloat translationX = -scaledFrame.origin.x;
 
-        CGAffineTransform translationTransform = CGAffineTransformMakeTranslation(translationX, verticalOffset);
-        grandParentView.transform = translationTransform;
+        DYYYSetOffsetTransform(grandParentView, YES, CGAffineTransformMakeTranslation(translationX, verticalOffset));
     }
 }
 
