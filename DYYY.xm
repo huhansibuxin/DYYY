@@ -3871,7 +3871,9 @@ static NSArray<UIViewController *> *DYYYLPExitCollectVCs(UIViewController *root)
     return out;
 }
 
-// 只调用「无参无返回」的 block：签名必须是 v8@?0，不符就绝不冒险调（调错签名直接崩）
+// 只调用「无参无返回」的 block：签名必须是 v8@?0，不符就绝不冒险调（调错签名直接崩）。
+// 调用方式走 block 的 invoke 指针（隐藏首参 = block 自身）：
+// ARC 下不让把 id 直接 __bridge 成 block 类型，这样写既合法也绕开类型检查（签名已自校验过）。
 static BOOL DYYYLPExitCallVoidBlock(id blk) {
     if (!blk) return NO;
     Class blockClass = NSClassFromString(@"NSBlock");
@@ -3879,12 +3881,12 @@ static BOOL DYYYLPExitCallVoidBlock(id blk) {
     struct DYYYLPBlockHeader { void *isa; int flags; int reserved; void *invoke; void *descriptor; };
     struct DYYYLPBlockDesc2 { unsigned long reserved; unsigned long size; const char *signature; const char *layout; };
     struct DYYYLPBlockHeader *h = (struct DYYYLPBlockHeader *)(__bridge void *)blk;
+    if (!h->invoke) return NO;
     if (!(h->flags & (1 << 30))) return NO;                 // BLOCK_HAS_SIGNATURE
     const char *sig = ((struct DYYYLPBlockDesc2 *)h->descriptor)->signature;
     if (!sig) return NO;
     if (!(sig[0] == 'v' && sig[1] == '8' && sig[2] == '@' && sig[3] == '?' && sig[4] == '0' && sig[5] == '\0')) return NO;
-    void (^fn)(void) = (__bridge void (^)(void))blk;
-    fn();
+    ((void (*)(void *))h->invoke)(h);
     return YES;
 }
 
