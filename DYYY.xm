@@ -3826,7 +3826,13 @@ static BOOL dyyyTagVolumeFromDYYYGesture = NO;
 // 热区抢到相邻按钮点击无所谓（老板确认）。默认直接生效，无开关。
 %hook AWENoxusHighlightButton
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    if (%orig) {
+    // ⚠️ 必须写成"先赋值再用"：%orig 出现在 if(...) 表达式位置是 Logos 边缘用法，
+    // 同一文件里再新增别的 pointInside:withEvent: hook（如弹幕穿透）会改变 Logos
+    // 对同签名方法的生成路径，把它触发成畸形 wrapper（v29 实测：报
+    // expected expression / use of undeclared identifier 'self'，行号指到这附近）。
+    // 赋值语句位置是 %orig 最标准的用法，不受影响。
+    BOOL origInside = %orig;
+    if (origInside) {
         return YES;
     }
     const CGFloat expand = 60.0;
