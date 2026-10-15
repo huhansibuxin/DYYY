@@ -1,7 +1,5 @@
 #import "AwemeHeaders.h"
 #import <objc/message.h>
-#import <objc/runtime.h>
-#import <stdlib.h>
 #import "DYYYBottomAlertView.h"
 #import "DYYYConfirmCloseView.h"
 #import "DYYYCustomInputView.h"
@@ -22,12 +20,12 @@ static UIView *findLandscapeEntryViewInView(UIView *view) {
     return nil;
 }
 
-static void DYYYFSResetBeforeEntry(void);   // 定义见下方 DYYYFS 区
+static void DYYYFSClearOrientationBias(void);   // 定义见下方 DYYYFS 区
 
 static void simulateTapOnEntryView(UIView *entryView) {
     if (!entryView) return;
-    // 进屏前先复位残留的旋转状态（否则「全屏观看」会被上一次「反向全屏」带偏）
-    DYYYFSResetBeforeEntry();
+    // 进全屏前先清掉「反向全屏」遗留在进程里的设备方向残留（否则「全屏观看」也被带偏，详见 DYYYFSClearOrientationBias）
+    DYYYFSClearOrientationBias();
     if ([entryView respondsToSelector:@selector(sendActionsForControlEvents:)]) {
         [(UIControl *)entryView sendActionsForControlEvents:UIControlEventTouchUpInside];
         return;
@@ -50,14 +48,13 @@ static void simulateTapOnEntryView(UIView *entryView) {
 }
 
 // ======================= 【反向全屏】 =======================
-// 需求：长按菜单「全屏观看」之外，再提供一个【方向相反】的全屏入口，且不要"转两圈"。
-// 现状：进全屏靠模拟点击抖音原生横屏入口 AWELandscapeFeedEntryView，抖音固定落在同一侧(3)。
-// 做法（v39 起）：进屏【之前】把 scene 几何偏好收窄成「竖屏 + 仅目标横屏侧」，再点原生入口 ——
-//      抖音入口转横屏时唯一可选项就是目标侧，于是一次到位落到 4，不再需要"先进左再翻右"的第二段旋转。
-//      万一入口没按预置落，才退回翻面兜底（geometry + KVC + attemptRotationToDeviceOrientation 三件套）。
+// 需求：长按菜单「全屏观看」之外，再提供一个【方向相反】的全屏入口。
+// 现状：进全屏靠模拟点击抖音原生横屏入口 AWELandscapeFeedEntryView，方向由抖音自己定
+//      （固定在同一侧），我们此前没有任何方向干预代码。
+// 做法：不改进入方式（不破坏抖音流程），在【进入横屏之后】把界面强制翻到另一侧。
 // 依据：AwemeCore 二进制核验到 Landscape_right 常量 + AWEXPlayOrientationManager /
 //      LandscapeFeedAutoRotateController，抖音内部本就区分左右两向，翻面不破坏布局。
-// 探针：`入口准备 seed/mask` / `✅ 入口一次落到目标侧` / `翻面兜底` / `1.0s 复核`。
+// 探针：每次反向操作记 3~4 行（进横屏时 / 0.5s / 1.2s），用来确认抖音有没有把方向拨回。
 
 // 精简诊断日志（DYYYSpeedDiag 在 DYYY.xm 里是 static，本编译单元看不到，故另写一份）
 static void DYYYFSDiag(NSString *msg) {
@@ -86,16 +83,16 @@ static void DYYYFSDiag(NSString *msg) {
     } @catch (__unused NSException *e) {}
 }
 
-// 两个目标侧，按老板肉眼方向命名：
-//   「左」= UIInterfaceOrientationLandscapeRight(3) —— 抖音原生入口默认会落的那一侧
-//   「右」= UIInterfaceOrientationLandscapeLeft(4)  —— 「反向全屏」要的那一侧
-static UIInterfaceOrientation DYYYFSReverseTarget(void) { return UIInterfaceOrientationLandscapeLeft;  }
-
-// ⚠️【进全屏前的复位】——长按菜单刚收起、界面还是竖屏时执行，无感。
-// 为什么需要：「反向全屏」为了落右，会把"要落哪一侧"写进 UIKit 的持久状态（实机已确认会留下来），
-//            不复位的话下一次点「全屏观看」也会被带成右侧（老板实测）。v38 用这套复位时正向是正常的。
-// 做法：把 UIDevice.orientation 写回竖屏 + 把 scene 的允许方向复位成"全竖屏 + 两横屏"（抖音原生默认）。
-static void DYYYFSResetBeforeEntry(void) {
+// ⚠️「方向粘住」修复：「反向全屏」靠 KVC 改 UIDevice.orientation 实现，而这个值会【留在进程里】——
+//    之后每一次点「全屏观看」都被带成横屏同一侧，必须杀后台才恢复
+//    （老板实测：全屏观看→左；反向全屏→右；退出来再点全屏观看→也右；杀后台才回到左）。
+//    v37 曾用「读 .orientation 判断是否为横屏」当开关 → 实测一次都没触发：
+//    读回来的值跟我们写进去的对不上（UIDevice 的 getter 在没 beginGeneratingDeviceOrientationNotifications
+//    时给出的是陈旧值）。所以这里【不再读、直接写死清回竖屏】，另外把 iOS16 scene 的几何偏好一并复位，两条路都堵。
+//    调用时机是长按菜单刚收起、界面还在竖屏时 → 「清回竖屏」无感；不调 attemptRotationToDeviceOrientation，
+//    避免这一下自己触发旋转。
+static void DYYYFSClearOrientationBias(void) {
+    UIDeviceOrientation before = [UIDevice currentDevice].orientation;
     [[UIDevice currentDevice] setValue:@(UIDeviceOrientationPortrait) forKey:@"orientation"];
     if (@available(iOS 16.0, *)) {
         for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
@@ -108,126 +105,8 @@ static void DYYYFSResetBeforeEntry(void) {
             }
         }
     }
-}
-
-// ===================== 【源头指定方向】=====================
-// 目标：让「反向全屏」的旋转**一次就落到横屏右**，不再有我们事后补的第二段（老板说的"转圈"）。
-//
-// 原理：UIKit 决定"这次能转到哪些方向"要问两处 ——
-//   ① app 的 `application:supportedInterfaceOrientationsForWindow:`（delegate mask）
-//   ② 目标 VC 的 `supportedInterfaceOrientations`
-//   两者取交集后唯一可行方向就是最终落点。所以只要在"进屏前"把这两处都收窄成【只允许横屏右】，
-//   抖音自己的旋转动画一开始就只有一个可选方向 → 直接落右，全程一段动画。
-//
-// ⚠️ 历史坑（v35 那次的教训）：当时只挂了 delegate、而且给的值是「横屏右(3)」——
-//    那正好是抖音默认就落的那一侧，所以"看起来没用"其实可能是**测试本身无效**。这次两个都挂、且给「横屏左(4)」。
-//
-// 挂谁：不猜类名。运行时遍历所有类，只挂「自己在自己类里实现了 supportedInterfaceOrientations」的类；
-//      调用时**先把原实现调一遍**，只有原返回值包含横屏的才覆盖 → 竖屏锁定的信息流 VC 天然被排除，不会误伤。
-static BOOL gDYYYFSOrientForceLeft = NO;          // YES = 本次只允许「横屏右(LandscapeLeft)」
-static BOOL gDYYYFSOrientHooked = NO;
-static NSUInteger gDYYYFSOrientHookCount = 0;
-static NSMutableDictionary<NSString *, NSValue *> *gDYYYFSOrientOrigIMPs = nil;   // "Class|sel" -> 原 IMP
-
-static NSString *DYYYFSOrientKey(Class c, SEL s) {
-    return [NSString stringWithFormat:@"%@|%@", NSStringFromClass(c), NSStringFromSelector(s)];
-}
-
-// 沿继承链找本类注册过的原 IMP（self 的实际类可能比注册的更派生）
-static IMP DYYYFSOrientOrigIMP(id self, SEL _cmd) {
-    for (Class c = object_getClass(self); c; c = class_getSuperclass(c)) {
-        NSValue *v = gDYYYFSOrientOrigIMPs[DYYYFSOrientKey(c, _cmd)];
-        if (v) return (IMP)v.pointerValue;
-    }
-    return NULL;
-}
-
-static UIInterfaceOrientationMask DYYYFSSupportOrientSwizzled(id self, SEL _cmd) {
-    IMP o = DYYYFSOrientOrigIMP(self, _cmd);
-    UIInterfaceOrientationMask orig = o ? ((UIInterfaceOrientationMask (*)(id, SEL))o)(self, _cmd)
-                                        : UIInterfaceOrientationMaskAllButUpsideDown;
-    // 只覆盖"本来就允许横屏"的 VC；竖屏锁定的（信息流等）原样返回，绝不误伤
-    if (gDYYYFSOrientForceLeft && (orig & UIInterfaceOrientationMaskLandscape)) {
-        return UIInterfaceOrientationMaskLandscapeLeft;
-    }
-    return orig;
-}
-
-static UIInterfaceOrientation DYYYFSPreferredOrientSwizzled(id self, SEL _cmd) {
-    IMP o = DYYYFSOrientOrigIMP(self, _cmd);
-    UIInterfaceOrientation orig = o ? ((UIInterfaceOrientation (*)(id, SEL))o)(self, _cmd)
-                                    : UIInterfaceOrientationPortrait;
-    // 注意：这个方法的返回值是【单个方向】不是 mask，别拿它去按位与
-    if (gDYYYFSOrientForceLeft &&
-        (orig == UIInterfaceOrientationLandscapeLeft || orig == UIInterfaceOrientationLandscapeRight)) {
-        return UIInterfaceOrientationLandscapeLeft;
-    }
-    return orig;
-}
-
-static UIInterfaceOrientationMask DYYYFSDelegateMaskSwizzled(id self, SEL _cmd, UIApplication *app, UIWindow *win) {
-    if (gDYYYFSOrientForceLeft) return UIInterfaceOrientationMaskLandscapeLeft;
-    IMP o = DYYYFSOrientOrigIMP(self, _cmd);
-    return o ? ((UIInterfaceOrientationMask (*)(id, SEL, UIApplication *, UIWindow *))o)(self, _cmd, app, win)
-             : UIInterfaceOrientationMaskAllButUpsideDown;
-}
-
-// 惰性安装（首次用到「反向全屏」时才做，无加载期开销）
-static void DYYYFSInstallSourceOrientationHook(void) {
-    if (gDYYYFSOrientHooked) return;
-    gDYYYFSOrientHooked = YES;
-    gDYYYFSOrientOrigIMPs = [NSMutableDictionary dictionary];
-
-    // ① app delegate 的 mask
-    SEL dsel = NSSelectorFromString(@"application:supportedInterfaceOrientationsForWindow:");
-    id delegate = [UIApplication sharedApplication].delegate;
-    Class ad = delegate ? object_getClass(delegate) : Nil;
-    if (!ad) ad = objc_getClass("AppDelegate");
-    if (ad) {
-        Method m = class_getInstanceMethod(ad, dsel);
-        if (m) {
-            gDYYYFSOrientOrigIMPs[DYYYFSOrientKey(ad, dsel)] = [NSValue valueWithPointer:(const void *)method_getImplementation(m)];
-            if (!class_addMethod(ad, dsel, (IMP)DYYYFSDelegateMaskSwizzled, method_getTypeEncoding(m))) {
-                method_setImplementation(m, (IMP)DYYYFSDelegateMaskSwizzled);
-            }
-            gDYYYFSOrientHookCount++;
-        }
-    }
-
-    // ② 全类扫描：支持方向 / 首选方向
-    int count = objc_getClassList(NULL, 0);
-    if (count > 0) {
-        Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
-        if (classes) {
-            count = objc_getClassList(classes, count);
-            SEL sSupport = @selector(supportedInterfaceOrientations);
-            SEL sPreferred = @selector(preferredInterfaceOrientationForPresentation);
-            for (int i = 0; i < count; i++) {
-                Class c = classes[i];
-                if (!c) continue;
-                unsigned int n = 0;
-                Method *ms = class_copyMethodList(c, &n);
-                if (!ms) continue;
-                for (unsigned int j = 0; j < n; j++) {
-                    SEL s = method_getName(ms[j]);
-                    BOOL isSupport = (s == sSupport);
-                    BOOL isPreferred = (s == sPreferred);
-                    if (!isSupport && !isPreferred) continue;
-                    IMP imp = method_getImplementation(ms[j]);
-                    if (!imp || imp == (IMP)DYYYFSSupportOrientSwizzled || imp == (IMP)DYYYFSPreferredOrientSwizzled) continue;
-                    NSString *k = DYYYFSOrientKey(c, s);
-                    if (gDYYYFSOrientOrigIMPs[k]) continue;
-                    gDYYYFSOrientOrigIMPs[k] = [NSValue valueWithPointer:(const void *)imp];
-                    method_setImplementation(ms[j], isSupport ? (IMP)DYYYFSSupportOrientSwizzled
-                                                              : (IMP)DYYYFSPreferredOrientSwizzled);
-                    gDYYYFSOrientHookCount++;
-                }
-                free(ms);
-            }
-            free(classes);
-        }
-    }
-    DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 源头方向 hook 已装：%lu 处", (unsigned long)gDYYYFSOrientHookCount]);
+    DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 入口复位 UIDevice %ld→%ld",
+                (long)before, (long)[UIDevice currentDevice].orientation]);
 }
 
 // 读当前界面方向（iOS13+ 取前台活跃 windowScene；老系统回落 statusBarOrientation）
@@ -243,9 +122,9 @@ static UIInterfaceOrientation DYYYFSCurrentOrientation(void) {
     return [UIApplication sharedApplication].statusBarOrientation;
 }
 
-// 【兜底】强制界面旋转到指定方向 —— 三件套（geometry 请求 + KVC + attemptRotationToDeviceOrientation）。
-// ⚠️ 这是带旋转动画的那一套（老板说的"转圈"），只在私有瞬时 API 不可用时才走。
-// ⚠️ 第一次（v33）反向全屏真的能翻过去，靠的就是最后那句 attemptRotationToDeviceOrientation。
+// 强制界面旋转到指定方向 —— 三件套一起上（geometry 请求 + KVC 老法 + attemptRotationToDeviceOrientation）。
+// ⚠️ 第一次（v33）反向全屏真的能翻过去，靠的就是最后那句 attemptRotationToDeviceOrientation；
+//    后面几版把它删了，KVC 那档因此形同虚设。
 static void DYYYFSApplyOrientation(UIInterfaceOrientation target) {
     UIInterfaceOrientationMask mask = (target == UIInterfaceOrientationLandscapeLeft)
         ? UIInterfaceOrientationMaskLandscapeLeft : UIInterfaceOrientationMaskLandscapeRight;
@@ -266,58 +145,45 @@ static void DYYYFSApplyOrientation(UIInterfaceOrientation target) {
     [UIViewController attemptRotationToDeviceOrientation];
 }
 
-// 反向全屏：进屏【前】把所有方向来源收窄成「只允许横屏右」→ 点抖音原生入口
-// => UIKit 这次唯一可行方向就是右侧，抖音那一段旋转直接落右，**没有第二段旋转**（不转圈）。
-// 收窄在进屏后 ~1.6s 关掉（正常路径此时按钮/播放器已完成布局，不再需要）。
-// 只有入口没落右（说明抖音绕开了方向协商）时才事后补一次，属极端兜底。
+// 反向全屏：点抖音原生入口 → 进横屏 → 翻到【另一侧】（0.5s / 1.2s 各补确认一次）。
+// 只有一条判断：目标 = 当前方向的反面。不做"是不是已经在右边"之类的判断。
 static void DYYYFSEnterReverse(UIView *entryView) {
     if (!entryView) return;
-    UIInterfaceOrientation target = DYYYFSReverseTarget();
-
-    DYYYFSInstallSourceOrientationHook();
-    gDYYYFSOrientForceLeft = YES;              // ⬅️ 关键：进屏前收窄为"仅横屏右"
-    DYYYFSDiag(@"[fs-rev] 反向全屏：收窄为仅横屏右后进入");
+    DYYYFSDiag(@"[fs-rev] 反向全屏：进横屏后翻到另一侧");
     simulateTapOnEntryView(entryView);
 
-    __block void (^poll)(NSInteger, NSInteger);
-    poll = ^(NSInteger n, NSInteger stable) {
+    __block void (^poll)(NSInteger);
+    poll = ^(NSInteger n) {
         UIInterfaceOrientation cur = DYYYFSCurrentOrientation();
         BOOL isLand = (cur == UIInterfaceOrientationLandscapeLeft || cur == UIInterfaceOrientationLandscapeRight);
-        if (!isLand) {
-            if (n < 14) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    poll(n + 1, 0);
-                });
-                return;
-            }
-            gDYYYFSOrientForceLeft = NO;
-            DYYYFSDiag(@"[fs-rev] 2.1s 未进横屏，放弃");
-            return;
-        }
-        // 连续两次读到同一个横屏方向 = 抖音的旋转动画已停稳（动画途中的瞬时读数不作数）
-        if (stable < 2) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                poll(n + 1, stable + 1);
+        if (isLand) {
+            UIInterfaceOrientation target = (cur == UIInterfaceOrientationLandscapeLeft)
+                ? UIInterfaceOrientationLandscapeRight : UIInterfaceOrientationLandscapeLeft;
+            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 已进横屏 cur=%ld → 翻到 %ld", (long)cur, (long)target]);
+            DYYYFSApplyOrientation(target);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                UIInterfaceOrientation a = DYYYFSCurrentOrientation();
+                DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 0.5s cur=%ld (目标%ld)", (long)a, (long)target]);
+                if (a != target) DYYYFSApplyOrientation(target);
+            });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                UIInterfaceOrientation b = DYYYFSCurrentOrientation();
+                DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 1.2s cur=%ld (目标%ld) UIDevice=%ld%@",
+                            (long)b, (long)target, (long)[UIDevice currentDevice].orientation,
+                            (b == target ? @" ✓稳定" : @" ✗被拨回")]);
+                if (b != target) DYYYFSApplyOrientation(target);
             });
             return;
         }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            gDYYYFSOrientForceLeft = NO;
-        });
-        if (cur == target) {
-            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] ✅ 收窄生效：一次落到右侧 cur=%ld（无第二段旋转）", (long)cur]);
+        if (n < 8) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                poll(n + 1);
+            });
             return;
         }
-        DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 收窄无效：入口落在 cur=%ld（目标%ld）→ 事后补一次", (long)cur, (long)target]);
-        DYYYFSApplyOrientation(target);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            UIInterfaceOrientation b = DYYYFSCurrentOrientation();
-            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 0.8s 复核 cur=%ld (目标%ld)%@",
-                        (long)b, (long)target, (b == target ? @" ✓" : @" ✗")]);
-            if (b != target) DYYYFSApplyOrientation(target);
-        });
+        DYYYFSDiag(@"[fs-rev] 1.6s 内未进入横屏，放弃翻面");
     };
-    poll(1, 0);
+    poll(1);
 }
 
 // 「反向全屏」菜单项开关：未设置过 = 默认显示（老板要求默认打开）
