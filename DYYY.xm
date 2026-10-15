@@ -3813,6 +3813,214 @@ static BOOL DYYYIsLandscapeFullscreenNow(void) {
     return win != nil && win.bounds.size.width > win.bounds.size.height;
 }
 
+// =============== 横屏全屏下「长按 = 返回竖屏」 ===============
+// 老板口径：进了横屏全屏之后，长按不要再触发原生 2 倍速，改成直接退出全屏回竖屏；
+//          竖屏下的长按 2 倍速保持原样，一律不动。
+// 做法（不猜类名、不留持久副作用）：
+//  ① 在横屏 VC 自己的 view 上挂一个我们自己的长按手势（0.30s 识别，比抖音原生 0.5s 更早），
+//     回调里执行退出。离开横屏即摘掉 → 竖屏不受影响。
+//  ② 抑制原生 2 倍速：用 UIGestureRecognizerDelegate 的「动态失败依赖」回调
+//     gestureRecognizer:shouldBeRequiredToFailByGestureRecognizer: —— 命中时返回 YES，
+//     原生那个长按就必须等我们失败；我们一识别，它永远 begin 不了。
+//     ⚠️ 这里刻意【不用】requireGestureRecognizerToFail:（那是永久依赖，摘掉手势后
+//        原生长期处于"等一个永不失败的对手"状态，会连带废掉竖屏长按 2 倍速）。
+//        动态回调是每次识别实时求值，离开横屏自动失效，没有残留。
+//  ③ 兜底：AWEPlayInteractionSpeedController 的长按处理函数在横屏直接 return（见下方 hook）。
+// 退出动作本身：按「最贴合原生 → 最通用」依次试，成功即停，日志记下用的哪条。
+
+// 原生长按是否值得抑制：只碰播放器/交互容器上的，避免误伤其它长按（头像、文案长按、DYYY 自己的长按）
+static BOOL DYYYLPExitShouldSilence(UILongPressGestureRecognizer *gr) {
+    NSString *cls = NSStringFromClass([gr.view class]);
+    if (cls.length == 0) return NO;
+    NSArray<NSString *> *hints = @[@"Player", @"Play", @"Interaction", @"Landscape", @"Container", @"Video"];
+    for (NSString *h in hints) {
+        if ([cls rangeOfString:h].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
+@class DYYYLPExitGestureTarget;
+static __weak UILongPressGestureRecognizer *gDYYYLPExitGesture = nil;   // 我们的长按手势（仅横屏期间挂上）
+static DYYYLPExitGestureTarget *gDYYYLPExitTarget = nil;                // 手势的 target + delegate
+// ⚠️ 必须【强引用】持有：UIGestureRecognizer.delegate 是 weak，target 也不保证强持有，
+//    只让手势自己拿着会随作用域结束被释放 → 手势变成没人响应的空壳。
+
+// 顶层 VC（沿 presented 链走到最上层）
+static UIViewController *DYYYLPExitTopViewController(void) {
+    UIWindow *win = [DYYYUtils getActiveWindow];
+    if (!win) win = [UIApplication sharedApplication].keyWindow;
+    UIViewController *vc = win.rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
+}
+
+// 收集一棵 VC 树里的全部 VC（子 VC + 导航栈 + 弹出链），用于找抖音自己的退出回调
+static NSArray<UIViewController *> *DYYYLPExitCollectVCs(UIViewController *root) {
+    NSMutableArray<UIViewController *> *out = [NSMutableArray array];
+    if (!root) return out;
+    NSMutableArray<UIViewController *> *stack = [NSMutableArray arrayWithObject:root];
+    while (stack.count > 0) {
+        UIViewController *vc = stack.lastObject;
+        [stack removeLastObject];
+        if ([out containsObject:vc]) continue;
+        [out addObject:vc];
+        for (UIViewController *c in vc.childViewControllers) [stack addObject:c];
+        for (UIViewController *c in vc.navigationController.viewControllers) [stack addObject:c];
+        if (vc.presentedViewController) [stack addObject:vc.presentedViewController];
+    }
+    return out;
+}
+
+// 只调用「无参无返回」的 block：签名必须是 v8@?0，不符就绝不冒险调（调错签名直接崩）
+static BOOL DYYYLPExitCallVoidBlock(id blk) {
+    if (!blk) return NO;
+    Class blockClass = NSClassFromString(@"NSBlock");
+    if (blockClass && ![blk isKindOfClass:blockClass]) return NO;
+    struct DYYYLPBlockHeader { void *isa; int flags; int reserved; void *invoke; void *descriptor; };
+    struct DYYYLPBlockDesc2 { unsigned long reserved; unsigned long size; const char *signature; const char *layout; };
+    struct DYYYLPBlockHeader *h = (struct DYYYLPBlockHeader *)(__bridge void *)blk;
+    if (!(h->flags & (1 << 30))) return NO;                 // BLOCK_HAS_SIGNATURE
+    const char *sig = ((struct DYYYLPBlockDesc2 *)h->descriptor)->signature;
+    if (!sig) return NO;
+    if (!(sig[0] == 'v' && sig[1] == '8' && sig[2] == '@' && sig[3] == '?' && sig[4] == '0' && sig[5] == '\0')) return NO;
+    void (^fn)(void) = (__bridge void (^)(void))blk;
+    fn();
+    return YES;
+}
+
+// 退出横屏全屏：三条路依次试，成功即停
+static BOOL DYYYLPExitLandscape(void) {
+    UIViewController *top = DYYYLPExitTopViewController();
+    if (!top) {
+        DYYYSpeedDiag(@"[lp-exit] 没拿到顶层 VC，放弃");
+        return NO;
+    }
+    if (top.presentedViewController) {
+        DYYYSpeedDiag(@"[lp-exit] 顶层有弹出面板，跳过退出");
+        return NO;
+    }
+    // 更准的一道：当前最上层 VC 的视图必须还在我们挂手势的那棵视图树里。
+    // 弹了评论/设置等面板时它是另一支，这里就会判否 → 不误退。
+    UIView *host = gDYYYLPExitGesture.view;
+    if (!host || host.window == nil ||
+        !([top.view isDescendantOfView:host] || [host isDescendantOfView:top.view])) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] 最上层是 %@（不在横屏视图树内），跳过退出",
+                       NSStringFromClass([top class])]);
+        return NO;
+    }
+    NSArray<UIViewController *> *vcs = DYYYLPExitCollectVCs(top);
+
+    // ① 抖音自己的退出回调（属性 exitLandscapeBlock，签名不符不调）
+    for (UIViewController *vc in vcs) {
+        if (![vc respondsToSelector:NSSelectorFromString(@"exitLandscapeBlock")]) continue;
+        id blk = nil;
+        @try { blk = [vc valueForKey:@"exitLandscapeBlock"]; } @catch (__unused NSException *e) {}
+        if (DYYYLPExitCallVoidBlock(blk)) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ① exitLandscapeBlock 生效（%@）",
+                           NSStringFromClass([vc class])]);
+            return YES;
+        }
+        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ① %@ 有 exitLandscapeBlock 但不可用（nil/签名不符）",
+                       NSStringFromClass([vc class])]);
+    }
+
+    // ② 通用返回：presented 就 dismiss，否则导航栈 pop
+    if (top.presentingViewController) {
+        [top dismissViewControllerAnimated:YES completion:nil];
+        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ② dismiss 生效（%@）", NSStringFromClass([top class])]);
+        return YES;
+    }
+    UINavigationController *nc = top.navigationController;
+    if (nc && nc.viewControllers.count > 1) {
+        [nc popViewControllerAnimated:YES];
+        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ② pop 生效（%@）", NSStringFromClass([top class])]);
+        return YES;
+    }
+
+    // ③ 返回键动作
+    NSArray<NSString *> *sels = @[@"clickBackButton", @"didClickBackButton", @"handleBackButton", @"onClickBackButton"];
+    for (UIViewController *vc in vcs) {
+        for (NSString *name in sels) {
+            SEL s = NSSelectorFromString(name);
+            if (![vc respondsToSelector:s]) continue;
+            ((void (*)(id, SEL))objc_msgSend)(vc, s);
+            DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ③ %@ -%@ 生效", NSStringFromClass([vc class]), name]);
+            return YES;
+        }
+    }
+
+    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ❌ 三条路都没走通（顶层=%@ 共搜到 %lu 个 VC）",
+                   NSStringFromClass([top class]), (unsigned long)vcs.count]);
+    return NO;
+}
+
+@interface DYYYLPExitGestureTarget : NSObject <UIGestureRecognizerDelegate>
+@end
+
+@implementation DYYYLPExitGestureTarget
+
+- (void)handleLongPress:(UILongPressGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateBegan) return;
+    if (!DYYYIsLandscapeFullscreenNow()) return;   // 已经退出横屏就什么都不做
+    DYYYSpeedDiag(@"[lp-exit] 横屏长按触发 → 退出全屏");
+    DYYYLPExitLandscape();
+}
+
+// 动态失败依赖：只在横屏 + 对手是播放器/交互容器上的长按时成立 → 原生 2 倍速永远 begin 不了
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
+shouldBeRequiredToFailByGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
+    if (gestureRecognizer != gDYYYLPExitGesture) return NO;
+    if (!DYYYIsLandscapeFullscreenNow()) return NO;
+    if (![otherGestureRecognizer isKindOfClass:[UILongPressGestureRecognizer class]]) return NO;
+    BOOL silence = DYYYLPExitShouldSilence((UILongPressGestureRecognizer *)otherGestureRecognizer);
+    if (silence) {
+        static NSTimeInterval dyyyLastLPSilenceLog = 0;
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if (now - dyyyLastLPSilenceLog > 1.0) {
+            dyyyLastLPSilenceLog = now;
+            DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] 已拦住原生长按（%@）",
+                           NSStringFromClass([otherGestureRecognizer.view class])]);
+        }
+    }
+    return silence;
+}
+
+@end
+
+// 挂上「横屏长按退出」手势（幂等）
+static void DYYYLPExitArm(UIView *host) {
+    if (!host) return;
+    if (gDYYYLPExitGesture) return;
+    DYYYLPExitGestureTarget *t = [DYYYLPExitGestureTarget new];
+    UILongPressGestureRecognizer *g =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:t action:@selector(handleLongPress:)];
+    g.minimumPressDuration = 0.30;    // 比抖音原生 0.5s 早识别 → 抢在 2 倍速之前
+    g.allowableMovement = 40.0;
+    g.cancelsTouchesInView = NO;      // 不吃掉其它触摸
+    g.delegate = t;
+    [host addGestureRecognizer:g];
+    gDYYYLPExitGesture = g;
+    gDYYYLPExitTarget = t;
+    DYYYSpeedDiag(@"[lp-exit] 横屏长按退出已就绪（0.30s）");
+}
+
+static void DYYYLPExitDisarm(void) {
+    UILongPressGestureRecognizer *g = gDYYYLPExitGesture;
+    if (g && g.view) [g.view removeGestureRecognizer:g];
+    gDYYYLPExitGesture = nil;
+    gDYYYLPExitTarget = nil;
+}
+
+// 横屏下「跳过原生长按倍速」的节流日志（同一秒内只记一条）
+static void DYYYLPExitLogSpeedSkip(NSString *who) {
+    static NSTimeInterval dyyyLastSkipLog = 0;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - dyyyLastSkipLog > 1.0) {
+        dyyyLastSkipLog = now;
+        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] 横屏：跳过原生长按倍速（%@）", who]);
+    }
+}
+
 // DYYY 自己边缘手势（DYYYVideoGesture）打标：置 YES 表示本次亮度/音量设置来自
 // DYYY 边缘手势，效果层拦截 hook 要放行（横屏下边缘手势已禁用，此打标为竖屏路径保留）
 static BOOL dyyyTagBrightFromDYYYGesture = NO;
@@ -3869,6 +4077,18 @@ static BOOL dyyyTagVolumeFromDYYYGesture = NO;
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     DYYYReapplySpeedToCurrentPlayer(@"landscape");
+    // 横屏全屏期间挂上「长按 = 返回竖屏」手势（离开横屏会摘掉，竖屏长按 2 倍速不受影响）
+    DYYYLPExitArm(self.view);
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    %orig;
+    DYYYLPExitDisarm();
+}
+
+- (void)viewDidDisappear:(BOOL)animated {
+    %orig;
+    DYYYLPExitDisarm();
 }
 %end
 
@@ -6425,6 +6645,11 @@ static BOOL isGestureActive = NO;
 }
 
 - (void)handleLongPressFastSpeed:(UILongPressGestureRecognizer *)gesture {
+    // 横屏全屏：长按不触发 2 倍速（改由 DYYYLPExit* 处理成「退出全屏回竖屏」）
+    if (DYYYIsLandscapeFullscreenNow()) {
+        DYYYLPExitLogSpeedSkip(@"fastSpeed");
+        return;
+    }
     BOOL enableSpeedGesture = DYYYGetBool(@"DYYYEnableLongPressSpeedGesture");
     CGPoint location = [gesture locationInView:gesture.view];
     static CGFloat initialTouchY = 0;
@@ -6484,18 +6709,30 @@ static BOOL isGestureActive = NO;
 }
 
 - (void)handleLongPressLockedSpeedBegan {
+    if (DYYYIsLandscapeFullscreenNow()) {   // 横屏：长按不做倍速（改走退出全屏）
+        DYYYLPExitLogSpeedSkip(@"lockedBegan");
+        return;
+    }
     dyyyLongPressFastSpeedActive = YES;
     dyyyLongPressLockedSpeedActive = NO;
     %orig;
 }
 
 - (void)handleLongPressLockedDoubleSpeedChanged:(id)arg1 gesture:(UIGestureRecognizer *)gesture {
+    if (DYYYIsLandscapeFullscreenNow()) {   // 横屏：长按不做倍速（改走退出全屏）
+        DYYYLPExitLogSpeedSkip(@"lockedChanged");
+        return;
+    }
     dyyyLongPressFastSpeedActive = YES;
     dyyyLongPressLockedSpeedActive = NO;
     %orig(arg1, gesture);
 }
 
 - (void)handleLongPressLockedDoubleSpeedEnded:(id)arg1 gesture:(UIGestureRecognizer *)gesture {
+    if (DYYYIsLandscapeFullscreenNow()) {   // 横屏：长按不做倍速（改走退出全屏）
+        DYYYLPExitLogSpeedSkip(@"lockedEnded");
+        return;
+    }
     %orig(arg1, gesture);
     dyyyLongPressFastSpeedActive = NO;
     dyyyLongPressLockedSpeedActive = YES;

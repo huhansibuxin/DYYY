@@ -22,10 +22,19 @@ static UIView *findLandscapeEntryViewInView(UIView *view) {
 
 static void DYYYFSClearOrientationBias(void);   // 定义见下方 DYYYFS 区
 
+// 「上一次用过反向全屏、进程里可能留下方向残留」标记 —— 只有它为 YES 时才在进屏前做复位。
+// 理由：复位里那次 scene 几何请求是【异步】的，普通「全屏观看」进屏时做它纯属无谓动作
+//      （实测会带出「先转零点零几秒再瞬间弹回」的抖动）；没有反向残留时根本不需要它。
+// 由 DYYYFSEnterReverse 置 YES，复位执行后自清。
+static BOOL gDYYYFSNeedReset = NO;
+
 static void simulateTapOnEntryView(UIView *entryView) {
     if (!entryView) return;
-    // 进全屏前先清掉「反向全屏」遗留在进程里的设备方向残留（否则「全屏观看」也被带偏，详见 DYYYFSClearOrientationBias）
-    DYYYFSClearOrientationBias();
+    // 只有上一次反向全屏可能留下残留时才复位（否则「全屏观看」也会被带偏，详见 DYYYFSClearOrientationBias）
+    if (gDYYYFSNeedReset) {
+        gDYYYFSNeedReset = NO;
+        DYYYFSClearOrientationBias();
+    }
     if ([entryView respondsToSelector:@selector(sendActionsForControlEvents:)]) {
         [(UIControl *)entryView sendActionsForControlEvents:UIControlEventTouchUpInside];
         return;
@@ -54,7 +63,8 @@ static void simulateTapOnEntryView(UIView *entryView) {
 //      翻面用 DYYYFSApplyOrientation（geometry 请求 + KVC + attemptRotationToDeviceOrientation 三件套），
 //      完成后 0.5s / 1.2s 各补确认一次，被抖音拨回就再翻。
 // 代价：反向全屏会有第二段旋转动画（老板已确认可接受）；「全屏观看」保持原生行为不受影响。
-// 遗留降噪：DYYYFSClearOrientationBias 在每次进屏前把方向状态复位，避免上次翻面残留把后续入口带偏。
+// 遗留降噪：DYYYFSClearOrientationBias 会把上次翻面残留的方向状态复位，避免后续入口被带偏；
+//          只在「上次用过反向全屏」时才执行（普通「全屏观看」零额外动作）。
 
 // 精简诊断日志（DYYYSpeedDiag 在 DYYY.xm 里是 static，本编译单元看不到，故另写一份）
 static void DYYYFSDiag(NSString *msg) {
@@ -156,6 +166,7 @@ static void DYYYFSEnterReverse(UIView *entryView) {
             UIInterfaceOrientation target = (cur == UIInterfaceOrientationLandscapeLeft)
                 ? UIInterfaceOrientationLandscapeRight : UIInterfaceOrientationLandscapeLeft;
             DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 已进横屏 cur=%ld → 翻到 %ld", (long)cur, (long)target]);
+            gDYYYFSNeedReset = YES;   // 翻过面 → 下次进屏前需要复位（见 gDYYYFSNeedReset 注释）
             DYYYFSApplyOrientation(target);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 UIInterfaceOrientation a = DYYYFSCurrentOrientation();
