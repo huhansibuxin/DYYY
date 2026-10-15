@@ -10,6 +10,9 @@
 #define DYYYGetString(key) [[NSUserDefaults standardUserDefaults] stringForKey:key]
 #define DYYY_IGNORE_GLOBAL_ALPHA_TAG 114514
 
+// 弹幕穿透开关缓存失效入口（定义在 DYYY.xm，设置页开关变更时由 DYYYSettingsHelper 调用）
+void DYYYDanmakuTapPrefsChanged(void);
+
 typedef NS_ENUM(NSInteger, MediaType) { MediaTypeVideo, MediaTypeImage, MediaTypeAudio, MediaTypeHeic };
 
 // 调节模式&全局状态
@@ -307,8 +310,6 @@ typedef NS_ENUM(NSUInteger, DYEdgeMode) {
 - (void)setType:(long long)arg0;
 @end
 
-@interface XIGDanmakuPlayerView : UIView
-@end
 @interface DDanmakuPlayerView : UIView
 @end
 

@@ -473,6 +473,12 @@ static NSArray *allSettingsViewControllers(void) {
     item.colorStyle = 0;
     item.isEnable = YES;
     item.isSwitchOn = [self getUserDefaults:item.identifier];
+    // 弹幕穿透：未设置过 = 默认开启（与 DYYY.xm 高频路径同款默认语义），
+    // 否则新装时开关显示"关"但功能实际开着，且首次点击会写出相反的值
+    if ([item.identifier isEqualToString:@"DYYYDisableDanmakuTap"] &&
+        [[NSUserDefaults standardUserDefaults] objectForKey:item.identifier] == nil) {
+        item.isSwitchOn = YES;
+    }
 
     [self applyDependencyRulesForItem:item];
     if ((item.cellType == 20 || item.cellType == 26) && cellTapHandlers != nil) {
@@ -508,6 +514,11 @@ static NSArray *allSettingsViewControllers(void) {
               BOOL isSwitchOn = !strongItem.isSwitchOn;
               strongItem.isSwitchOn = isSwitchOn;
               [self setUserDefaults:@(isSwitchOn) forKey:strongItem.identifier];
+              // 弹幕穿透开关：DYYY.xm 的 pointInside 高频路径读的是静态缓存，
+              // 这里直调失效入口（同进程事件驱动，零轮询）
+              if ([strongItem.identifier isEqualToString:@"DYYYDisableDanmakuTap"]) {
+                  DYYYDanmakuTapPrefsChanged();
+              }
               [self handleConflictsAndDependenciesForSetting:strongItem.identifier isEnabled:isSwitchOn];
           }
         };

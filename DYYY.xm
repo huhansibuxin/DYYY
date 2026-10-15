@@ -4472,35 +4472,52 @@ static void DYYYApplyNormalPlaybackSpeedToNativeDPlayer(AWEDPlayerSpeedControlle
 // 播放中极易误触。对策 = 让弹幕视图对触摸【透明】（pointInside: 返回 NO），
 // 事件直接穿透到下层视频交互层（双击点赞 / 上下滑切视频 / 单击暂停 全部不受影响）。
 // 实现要点：
-//   · 三个类都挂：XIGDanmakuPlayerView / DDanmakuPlayerView（弹幕容器，主战场）
-//     + AWEDanmakuContentLabel（单条弹幕 label，兜底 —— 某些版本弹幕直接挂在播放器视图上）；
-//   · 只在开关打开时穿透，开关关闭走 %orig，不影响原有行为；
-//   · pointInside: 是每次触摸都会走的高频方法，【绝不能每次打日志】——
-//     用 dispatch_once 只记一条"已生效 + 类名"，用于验证类名在当前版本真实存在。
+//   · 类名清单经 AwemeCore 二进制核验（2026-10-15）：
+//     - DDanmakuPlayerView：弹幕最外层容器，实测唯一命中类（设备日志 [danmu] 已确认）；
+//     - AWEDanmakuContentLabel：二进制存在，单条弹幕兜底（外层失效时由它接住）；
+//     - XIGDanmakuPlayerView：全 Frameworks grep 0 处，该类在当前版本不存在，已删；
+//     - DDanmakuContainerView / DDanmakuItemView 是内层，外层返回 NO 后 hitTest 不下探，无需挂。
+//   · pointInside: 是每次触摸都会走的高频路径：
+//     - 开关值缓存成静态 BOOL，不能每次现读 NSUserDefaults（CFPreferences 查找+锁）；
+//     - 缓存失效 = 事件驱动：设置页动开关时由 DYYYSettingsHelper 直接调
+//       DYYYDanmakuTapPrefsChanged()（同进程直调，零轮询、零加载期副作用）。
+//       ⚠️ v30 曾在 %ctor 里 registerDefaults + NSUserDefaultsDidChangeNotification 观察者，
+//       结果重启必崩（watchdog 0x8BADF00D，死锁在抖音启动初始化里）——加载期别碰
+//       NSUserDefaults/通知注册，缓存失效只走设置页直调这一条路。
+//     - 留痕函数只记一条"已生效 + 类名"，且不加锁（UIKit 主线程专用路径）。
 // 默认值：NSUserDefaults 从未写入过该键时默认【开启】（装上去即生效），
 // 用户在设置页动过一次后就完全听用户的。
-static BOOL DYYYDanmakuTapDisabled(void) {
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    if ([d objectForKey:@"DYYYDisableDanmakuTap"] == nil) {
-        return YES;   // 未设置过 = 默认开启穿透
-    }
-    return [d boolForKey:@"DYYYDisableDanmakuTap"];
+static BOOL dyyyDanmakuTapDisabledCache = YES;
+static BOOL dyyyDanmakuTapDisabledCacheValid = NO;
+
+// 缓存失效入口：设置页开关变更时由 DYYYSettingsHelper.m 调用（声明在 AwemeHeaders.h）
+void DYYYDanmakuTapPrefsChanged(void) {
+    dyyyDanmakuTapDisabledCacheValid = NO;
 }
 
-// 首次命中留痕（每类只记一次，证明 hook 挂对了类）
+static BOOL DYYYDanmakuTapDisabled(void) {
+    if (!dyyyDanmakuTapDisabledCacheValid) {
+        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+        id saved = [d objectForKey:@"DYYYDisableDanmakuTap"];
+        // 未设置过 = 默认开启穿透；设置过就完全听用户的
+        dyyyDanmakuTapDisabledCache = (saved == nil) ? YES : [saved boolValue];
+        dyyyDanmakuTapDisabledCacheValid = YES;
+    }
+    return dyyyDanmakuTapDisabledCache;
+}
+
+// 首次命中留痕（每类只记一次，证明 hook 挂对了类）。
+// pointInside:withEvent: 是 UIKit 主线程专用路径（hit-testing 只在主线程发生），无需加锁。
 static void DYYYDanmakuPassthroughHit(const char *cls) {
     static NSMutableSet *dyyyHitClasses = nil;
-    static dispatch_once_t dyyyHitOnce;
-    dispatch_once(&dyyyHitOnce, ^{
+    if (!dyyyHitClasses) {
         dyyyHitClasses = [NSMutableSet set];
-    });
-    @synchronized(dyyyHitClasses) {
-        NSString *key = [NSString stringWithUTF8String:cls];
-        if ([dyyyHitClasses containsObject:key]) {
-            return;   // 已记录过，直接返回（高频路径零开销）
-        }
-        [dyyyHitClasses addObject:key];
     }
+    NSString *key = [NSString stringWithUTF8String:cls];
+    if ([dyyyHitClasses containsObject:key]) {
+        return;   // 已记录过，直接返回（高频路径零开销）
+    }
+    [dyyyHitClasses addObject:key];
     DYYYSpeedDiag([NSString stringWithFormat:@"[danmu] 弹幕穿透已生效 class=%s（该类触摸已透明）", cls]);
 }
 
@@ -4542,37 +4559,6 @@ static void DYYYDanmakuPassthroughHit(const char *cls) {
     } else {
         %orig(strokeColor);
     }
-}
-
-%end
-
-%hook XIGDanmakuPlayerView
-
-- (id)initWithFrame:(CGRect)frame {
-    id orig = %orig;
-
-    ((UIView *)orig).tag = DYYY_IGNORE_GLOBAL_ALPHA_TAG;
-
-    return orig;
-}
-
-- (void)setAlpha:(CGFloat)alpha {
-    if (DYYYGetBool(@"DYYYCommentShowDanmaku") && alpha == 0.0) {
-        return;
-    } else {
-        %orig(alpha);
-    }
-}
-
-// ⭐ 弹幕容器级穿透（主战场）：整个弹幕层对触摸透明。
-// 播放中点到/划过弹幕区域 → 事件穿透到视频层，不再触发"暂停 + 喜欢/不喜欢/恢复/举报"菜单，
-// 同时不影响双击点赞、上下滑切视频、单击暂停这些下层交互。
-- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    if (DYYYDanmakuTapDisabled()) {
-        DYYYDanmakuPassthroughHit("XIGDanmakuPlayerView");
-        return NO;
-    }
-    return %orig;
 }
 
 %end
