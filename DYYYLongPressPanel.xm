@@ -20,13 +20,14 @@ static UIView *findLandscapeEntryViewInView(UIView *view) {
     return nil;
 }
 
-// 进全屏前要落的目标方向（0 = 不预置，只清场）。由「反向全屏」在点击前设置，simulateTapOnEntryView 消费一次即清空。
-static UIInterfaceOrientation gDYYYFSEntrySeed = 0;
+// 进全屏前要落的目标方向（Unknown = 不预置，只清场）。由「反向全屏」在点击前设置，simulateTapOnEntryView 消费一次即清空。
+// 注意：本文件编成 .mm（Objective-C++），int 不能隐式转枚举，一律用枚举常量，别写 0。
+static UIInterfaceOrientation gDYYYFSEntrySeed = UIInterfaceOrientationUnknown;
 static void DYYYFSPrepareEntryOrientation(UIInterfaceOrientation seed);   // 定义见下方 DYYYFS 区
 
 static void simulateTapOnEntryView(UIView *entryView) {
     UIInterfaceOrientation seed = gDYYYFSEntrySeed;
-    gDYYYFSEntrySeed = 0;
+    gDYYYFSEntrySeed = UIInterfaceOrientationUnknown;
     if (!entryView) return;
     // 进全屏前先清掉上一次「反向全屏」留在 scene 上的方向偏好，并按需预置本次目标侧
     // （否则「全屏观看」会被带偏，详见 DYYYFSPrepareEntryOrientation 注释）
