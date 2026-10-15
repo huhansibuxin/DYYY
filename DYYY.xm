@@ -10591,11 +10591,13 @@ static NSHashTable *processedParentViews = nil;
 - (UIColor *)awe_smartBackgroundColor {
     NSString *colorHex = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYVideoBGColor"];
     if (colorHex && colorHex.length > 0) {
-        CGSize screenSize = [UIScreen mainScreen].bounds.size;
-        if (screenSize.width > screenSize.height) {
+        // 方向判据用活跃窗口（DYYYIsLandscapeFullscreenNow）而非 UIScreen.bounds：
+        // 后者不随抖音进入横屏而更新，系统自动旋转路径下会取到与当前方向相反的值，
+        // 导致背景色与全屏状态搞反。活跃窗口判据在两种进全屏方式下都实时准确。
+        if (DYYYIsLandscapeFullscreenNow()) {
             return [UIColor blackColor];
         }
-        CGFloat screenWidth = screenSize.width;
+        CGFloat screenWidth = [UIScreen mainScreen].bounds.size.width;
         UIColor *customColor = [DYYYUtils colorFromSchemeHexString:colorHex targetWidth:screenWidth];
         if (customColor)
             return customColor;
