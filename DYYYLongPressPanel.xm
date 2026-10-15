@@ -20,12 +20,18 @@ static UIView *findLandscapeEntryViewInView(UIView *view) {
     return nil;
 }
 
-static void DYYYFSResetBeforeEntry(void);   // 定义见下方 DYYYFS 区
+// 「本次进屏要落的方向」——由「反向全屏」在点击前设置，simulateTapOnEntryView 消费一次后自清。
+// 注意：本文件编成 .mm（Objective-C++），int 不能隐式转枚举，一律用枚举常量。
+static UIInterfaceOrientation gDYYYFSEntrySeed = UIInterfaceOrientationUnknown;
+static void DYYYFSSetEntryOrientation(UIInterfaceOrientation seed);   // 定义见下方 DYYYFS 区
 
 static void simulateTapOnEntryView(UIView *entryView) {
+    UIInterfaceOrientation seed = gDYYYFSEntrySeed;
+    gDYYYFSEntrySeed = UIInterfaceOrientationUnknown;
     if (!entryView) return;
-    // 进全屏前先清掉上一次「反向全屏」残留的旋转状态（否则「全屏观看」会被带偏一下，详见 DYYYFSResetBeforeEntry）
-    DYYYFSResetBeforeEntry();
+    // 进屏【之前】先把"本次要落的方向"确定下来：写 UIDevice.orientation + attemptRotationToDeviceOrientation。
+    // 这样抖音入口自己就会直接转到指定那侧 —— 全程只有抖音自己那一段旋转，没有我们事后补的第二段（不转圈）。
+    DYYYFSSetEntryOrientation(seed);
     if ([entryView respondsToSelector:@selector(sendActionsForControlEvents:)]) {
         [(UIControl *)entryView sendActionsForControlEvents:UIControlEventTouchUpInside];
         return;
@@ -84,50 +90,34 @@ static void DYYYFSDiag(NSString *msg) {
     } @catch (__unused NSException *e) {}
 }
 
-// 目标侧，按老板肉眼方向命名：
-//   「右」= UIInterfaceOrientationLandscapeLeft(4) —— 反向全屏要的那一侧（日志里换边成功后 cur=4）
-//   抖音原生入口自己会落的那一侧是 LandscapeRight(3)，老板称「左」。
+// 两个目标侧，按老板肉眼方向命名：
+//   「左」= UIInterfaceOrientationLandscapeRight(3) —— 抖音原生入口默认会落的那一侧
+//   「右」= UIInterfaceOrientationLandscapeLeft(4)  —— 「反向全屏」要的那一侧
+static UIInterfaceOrientation DYYYFSNormalTarget(void)  { return UIInterfaceOrientationLandscapeRight; }
 static UIInterfaceOrientation DYYYFSReverseTarget(void) { return UIInterfaceOrientationLandscapeLeft;  }
 
-// ⚠️【进全屏前的一次性复位】——长按菜单刚收起、界面还在竖屏时执行，无感。
-// 存在的理由：「反向全屏」要把界面强推到另一侧，这个"已被推过去"的状态会残留在 UIKit 的旋转状态机里；
-//            不清理的话，下一次点「全屏观看」会先被残留带偏一下再弹回来（老板实测）。
-// 做法：**无条件**把 UIDevice.orientation 写回竖屏 —— 不读、不判断。
-//   证据链：v37 用"读 UIDevice.orientation 判断是否横屏"当开关，日志里一次都没触发；
-//           v38 证明 UIDevice.orientation 是【写不可读】（写 4 读回来恒为 1），用读值当门必然失效。
-// 注意：这里【不发任何 geometry 旋转请求】—— 见下方 DYYYFSInstantRotate 顶部说明，那是"立即旋转"而非"设置偏好"。
-static void DYYYFSResetBeforeEntry(void) {
-    [[UIDevice currentDevice] setValue:@(UIDeviceOrientationPortrait) forKey:@"orientation"];
-}
-
-// 瞬时换到指定横屏侧：优先走私有 API `_setRotatableViewOrientation:duration:force:`（duration=0 → 无旋转动画）。
-// ⭐ 为什么不用 scene 几何偏好（v39 的做法已实测证伪）：
-//    `requestGeometryUpdateWithPreferences` 是【立即执行一次旋转】，不是【设置一个持续生效的偏好】。
-//    在竖屏时请求「竖屏|目标侧」，当前状态本就满足 → 等于空操作，也不会对抖音后续的旋转产生任何约束。
-//    实测日志：请求「竖屏+右」之后，抖音入口照样落在左边(3) —— 偏好路线不通。
-// 命中私有 API 就**完全不碰 UIDevice**（不碰 = 不留残留）；没这条 API 才退回 KVC + attemptRotationToDeviceOrientation
-// （那一套带旋转动画，也就是老板说的"转圈"）。
-static BOOL DYYYFSInstantRotate(UIInterfaceOrientation target) {
-    SEL s1 = NSSelectorFromString(@"_setRotatableViewOrientation:duration:force:");
-    SEL s2 = NSSelectorFromString(@"_setRotatableViewOrientation:duration:");
-    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-        for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-            if ([w respondsToSelector:s1]) {
-                void (*fn)(id, SEL, UIInterfaceOrientation, NSTimeInterval, BOOL) =
-                    (void (*)(id, SEL, UIInterfaceOrientation, NSTimeInterval, BOOL))objc_msgSend;
-                fn(w, s1, target, 0.0, YES);
-                return YES;
-            }
-            if ([w respondsToSelector:s2]) {
-                void (*fn)(id, SEL, UIInterfaceOrientation, NSTimeInterval) =
-                    (void (*)(id, SEL, UIInterfaceOrientation, NSTimeInterval))objc_msgSend;
-                fn(w, s2, target, 0.0);
-                return YES;
-            }
-        }
-    }
-    return NO;
+// ⭐⭐【进全屏前设定本次要落的方向】——这是唯一被实机验证有效、且**不产生第二段旋转**的做法。
+//
+// 做法：在长按菜单刚收起、界面还是竖屏的那一刻，先写 `UIDevice.orientation = 目标横屏侧`，
+//      再 `[UIViewController attemptRotationToDeviceOrientation]` —— 注意**这两句必须成对**：
+//        · 只写不改（v39 试过）→ 抖音入口照样落左，等于没写；
+//        · 写上再 attemptRotation（v40 的兜底路径试过）→ 状态被 UIKit 真正接受，**之后每次进屏都落指定侧**。
+//      信息流本身是竖屏锁定的，所以这两句在竖屏时不会把界面转走（无感）；等抖音入口一触发，
+//      它读到的就是"手机朝目标侧" → **入口自己一段动画直接转到目标侧**，没有我们事后补的第二段（不转圈）。
+//
+// 为什么不是别的办法（都已实测证伪，别回头再试）：
+//   · app delegate 的 supportedInterfaceOrientationsForWindow（v35）：mask 被咨询 3 次，抖音仍落左 —— 咨询结果不被采纳。
+//   · scene 几何偏好 requestGeometryUpdateWithPreferences（v39）：它是"立即旋转一次"、不是"设置偏好"，
+//     竖屏时请求等于空操作，对抖音后续旋转零约束。
+//   · 私有 `_setRotatableViewOrientation:duration:force:`（v40）：方法存在、能调用，但 0.7s 后自己弹回，不落地。
+//
+// ⚠️ 每次进屏【都无条件重设】：上次设成 4 的状态会一直留着，不重设的话下一次点「全屏观看」也会落右侧（老板实测过）。
+static void DYYYFSSetEntryOrientation(UIInterfaceOrientation seed) {
+    if (seed == UIInterfaceOrientationUnknown) seed = DYYYFSNormalTarget();   // 未指定 = 抖音原生那一侧（左）
+    [[UIDevice currentDevice] setValue:@(seed) forKey:@"orientation"];
+    [UIViewController attemptRotationToDeviceOrientation];
+    DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 进屏前设定方向=%ld(%@)",
+                (long)seed, (seed == DYYYFSReverseTarget() ? @"右/反向" : @"左/全屏")]);
 }
 
 // 读当前界面方向（iOS13+ 取前台活跃 windowScene；老系统回落 statusBarOrientation）
@@ -166,14 +156,14 @@ static void DYYYFSApplyOrientation(UIInterfaceOrientation target) {
     [UIViewController attemptRotationToDeviceOrientation];
 }
 
-// 反向全屏：点抖音原生入口进横屏（必定成功）→ 等旋转停稳 → 【瞬时】换到另一侧（无动画）。
-// 说明：抖音横屏是【显式强推方向】——既不看 app delegate 的 mask（v35 实测：mask 被咨询 3 次仍落左），
-//      也不认 scene 几何偏好（v39 实测：请求「竖屏+右」照样落左）。所以"预置偏好一次到位"不通，
-//      只能事后换边；而换边用私有 API 可以做到【瞬时】，不再有第二段旋转动画。
+// 反向全屏：进屏【前】把方向设定成右侧（见 DYYYFSSetEntryOrientation），再点抖音原生入口
+// => 抖音入口自己一段旋转直接落到右侧，正常情况下**没有第二段旋转**（不转圈）。
+// 只有入口没按设定落（仍落左侧）时才事后补一次（会有动画），属极端兜底。
 static void DYYYFSEnterReverse(UIView *entryView) {
     if (!entryView) return;
     UIInterfaceOrientation target = DYYYFSReverseTarget();
-    DYYYFSDiag(@"[fs-rev] 反向全屏：进横屏后瞬时换到另一侧");
+    DYYYFSDiag(@"[fs-rev] 反向全屏：进屏前设定右侧");
+    gDYYYFSEntrySeed = target;                 // 由 simulateTapOnEntryView 消费
     simulateTapOnEntryView(entryView);
 
     __block void (^poll)(NSInteger, NSInteger);
@@ -198,20 +188,15 @@ static void DYYYFSEnterReverse(UIView *entryView) {
             return;
         }
         if (cur == target) {
-            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] ✅ 已在目标侧 cur=%ld，无需换边", (long)cur]);
+            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] ✅ 入口一次落到右侧 cur=%ld（无第二段旋转）", (long)cur]);
             return;
         }
-        DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 已停稳 cur=%ld → 瞬时换到 %ld", (long)cur, (long)target]);
-        BOOL instant = DYYYFSInstantRotate(target);
-        if (!instant) {
-            DYYYFSDiag(@"[fs-rev] 私有瞬时 API 未命中，退回 KVC 兜底（这次会有旋转动画）");
-            DYYYFSApplyOrientation(target);
-        }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 入口落在 cur=%ld（目标%ld）→ 事后补一次", (long)cur, (long)target]);
+        DYYYFSApplyOrientation(target);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             UIInterfaceOrientation b = DYYYFSCurrentOrientation();
-            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 0.7s 复核 cur=%ld (目标%ld) 方式=%@%@",
-                        (long)b, (long)target, instant ? @"瞬时API" : @"KVC兜底",
-                        (b == target ? @" ✓" : @" ✗")]);
+            DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 0.8s 复核 cur=%ld (目标%ld)%@",
+                        (long)b, (long)target, (b == target ? @" ✓" : @" ✗")]);
             if (b != target) DYYYFSApplyOrientation(target);
         });
     };
