@@ -99,7 +99,11 @@ static void DYYYFSDiag(NSString *msg) {
 //      所以这里不读、不判断，直接写），同时把 iOS16 scene 的几何偏好复位。
 // 注意：不调 attemptRotationToDeviceOrientation，避免复位这一下自己触发旋转。
 static void DYYYFSClearOrientationBias(void) {
-    UIDeviceOrientation before = [UIDevice currentDevice].orientation;
+    // ⚠️ 这里刻意【不读】UIDevice.orientation：
+    //   ① 读它本身就会把设备方向服务（CoreMotion 侧）拉起来，是这函数里唯一有实际代价的动作，
+    //      而本函数只需要"写"；
+    //   ② 该读值本来就不可靠（写进去的值读回来对不上，见下方说明），拿它做日志也没有信息量。
+    //   所以复位只用一次 KVC 写 + 一次 scene 几何请求，不再取 before 值。
     [[UIDevice currentDevice] setValue:@(UIDeviceOrientationPortrait) forKey:@"orientation"];
     if (@available(iOS 16.0, *)) {
         for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
@@ -112,8 +116,7 @@ static void DYYYFSClearOrientationBias(void) {
             }
         }
     }
-    DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 入口复位 UIDevice %ld→%ld",
-                (long)before, (long)[UIDevice currentDevice].orientation]);
+    DYYYFSDiag(@"[fs-rev] 入口复位：UIDevice → 竖屏 + scene 几何偏好复位");
 }
 
 // 读当前界面方向（iOS13+ 取前台活跃 windowScene；老系统回落 statusBarOrientation）
@@ -175,9 +178,9 @@ static void DYYYFSEnterReverse(UIView *entryView) {
             });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 UIInterfaceOrientation b = DYYYFSCurrentOrientation();
-                DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 1.2s cur=%ld (目标%ld) UIDevice=%ld%@",
-                            (long)b, (long)target, (long)[UIDevice currentDevice].orientation,
-                            (b == target ? @" ✓稳定" : @" ✗被拨回")]);
+                DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 1.2s cur=%ld (目标%ld) %@",
+                            (long)b, (long)target,
+                            (b == target ? @"✓稳定" : @"✗被拨回")]);
                 if (b != target) DYYYFSApplyOrientation(target);
             });
             return;
