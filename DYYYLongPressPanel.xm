@@ -186,7 +186,7 @@ static void DYYYFSInstallSourceOrientationHook(void) {
     if (ad) {
         Method m = class_getInstanceMethod(ad, dsel);
         if (m) {
-            gDYYYFSOrientOrigIMPs[DYYYFSOrientKey(ad, dsel)] = [NSValue valueWithPointer:method_getImplementation(m)];
+            gDYYYFSOrientOrigIMPs[DYYYFSOrientKey(ad, dsel)] = [NSValue valueWithPointer:(const void *)method_getImplementation(m)];
             if (!class_addMethod(ad, dsel, (IMP)DYYYFSDelegateMaskSwizzled, method_getTypeEncoding(m))) {
                 method_setImplementation(m, (IMP)DYYYFSDelegateMaskSwizzled);
             }
@@ -217,7 +217,7 @@ static void DYYYFSInstallSourceOrientationHook(void) {
                     if (!imp || imp == (IMP)DYYYFSSupportOrientSwizzled || imp == (IMP)DYYYFSPreferredOrientSwizzled) continue;
                     NSString *k = DYYYFSOrientKey(c, s);
                     if (gDYYYFSOrientOrigIMPs[k]) continue;
-                    gDYYYFSOrientOrigIMPs[k] = [NSValue valueWithPointer:imp];
+                    gDYYYFSOrientOrigIMPs[k] = [NSValue valueWithPointer:(const void *)imp];
                     method_setImplementation(ms[j], isSupport ? (IMP)DYYYFSSupportOrientSwizzled
                                                               : (IMP)DYYYFSPreferredOrientSwizzled);
                     gDYYYFSOrientHookCount++;
