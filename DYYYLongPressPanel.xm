@@ -83,16 +83,30 @@ static void DYYYFSDiag(NSString *msg) {
     } @catch (__unused NSException *e) {}
 }
 
-// ⚠️「方向粘住」修复（v37）：「反向全屏」靠 KVC 改 UIDevice.orientation 实现，而这个值会【留在进程里】——
-//    之后每一次点「全屏观看」都被带成横屏右，必须杀后台才恢复
+// ⚠️「方向粘住」修复：「反向全屏」靠 KVC 改 UIDevice.orientation 实现，而这个值会【留在进程里】——
+//    之后每一次点「全屏观看」都被带成横屏同一侧，必须杀后台才恢复
 //    （老板实测：全屏观看→左；反向全屏→右；退出来再点全屏观看→也右；杀后台才回到左）。
-//    对策：任何入口进全屏之前，先把残留的横屏值清回竖屏。长按菜单此时是在竖屏信息流上弹出的，
-//    所以「清回竖屏」是无感的；不调 attemptRotationToDeviceOrientation，避免这一下自己触发旋转。
+//    v37 曾用「读 .orientation 判断是否为横屏」当开关 → 实测一次都没触发：
+//    读回来的值跟我们写进去的对不上（UIDevice 的 getter 在没 beginGeneratingDeviceOrientationNotifications
+//    时给出的是陈旧值）。所以这里【不再读、直接写死清回竖屏】，另外把 iOS16 scene 的几何偏好一并复位，两条路都堵。
+//    调用时机是长按菜单刚收起、界面还在竖屏时 → 「清回竖屏」无感；不调 attemptRotationToDeviceOrientation，
+//    避免这一下自己触发旋转。
 static void DYYYFSClearOrientationBias(void) {
-    UIDeviceOrientation cur = [UIDevice currentDevice].orientation;
-    if (cur != UIDeviceOrientationLandscapeLeft && cur != UIDeviceOrientationLandscapeRight) return;
+    UIDeviceOrientation before = [UIDevice currentDevice].orientation;
     [[UIDevice currentDevice] setValue:@(UIDeviceOrientationPortrait) forKey:@"orientation"];
-    DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 清除方向残留 %ld → 1", (long)cur]);
+    if (@available(iOS 16.0, *)) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]] &&
+                scene.activationState == UISceneActivationStateForegroundActive) {
+                UIWindowSceneGeometryPreferencesIOS *prefs =
+                    [[UIWindowSceneGeometryPreferencesIOS alloc]
+                        initWithInterfaceOrientations:UIInterfaceOrientationMaskAllButUpsideDown];
+                [(UIWindowScene *)scene requestGeometryUpdateWithPreferences:prefs errorHandler:nil];
+            }
+        }
+    }
+    DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 入口复位 UIDevice %ld→%ld",
+                (long)before, (long)[UIDevice currentDevice].orientation]);
 }
 
 // 读当前界面方向（iOS13+ 取前台活跃 windowScene；老系统回落 statusBarOrientation）
@@ -154,8 +168,9 @@ static void DYYYFSEnterReverse(UIView *entryView) {
             });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 UIInterfaceOrientation b = DYYYFSCurrentOrientation();
-                DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 1.2s cur=%ld (目标%ld)%@",
-                            (long)b, (long)target, (b == target ? @" ✓稳定" : @" ✗被拨回")]);
+                DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 1.2s cur=%ld (目标%ld) UIDevice=%ld%@",
+                            (long)b, (long)target, (long)[UIDevice currentDevice].orientation,
+                            (b == target ? @" ✓稳定" : @" ✗被拨回")]);
                 if (b != target) DYYYFSApplyOrientation(target);
             });
             return;
