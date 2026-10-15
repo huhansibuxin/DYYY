@@ -11,7 +11,15 @@
 #define DYYY_IGNORE_GLOBAL_ALPHA_TAG 114514
 
 // 弹幕穿透开关缓存失效入口（定义在 DYYY.xm，设置页开关变更时由 DYYYSettingsHelper 调用）
+// ⚠️ 必须 extern "C"：DYYY.xm 经 Logos 编成 .mm（C++ 修饰符号），
+// DYYYSettingsHelper.m 是 ObjC（C 符号），不加桥接会链接报 undefined symbol
+#ifdef __cplusplus
+extern "C" {
+#endif
 void DYYYDanmakuTapPrefsChanged(void);
+#ifdef __cplusplus
+}
+#endif
 
 typedef NS_ENUM(NSInteger, MediaType) { MediaTypeVideo, MediaTypeImage, MediaTypeAudio, MediaTypeHeic };
 
