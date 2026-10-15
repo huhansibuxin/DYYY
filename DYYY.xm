@@ -3871,6 +3871,55 @@ static NSArray<UIViewController *> *DYYYLPExitCollectVCs(UIViewController *root)
     return out;
 }
 
+// 收集【整个 App】的 VC 树（含每一层 presented 链）。
+// 横屏全屏页是 present 出来的，抖音的退出回调未必挂在它那棵树上（更可能挂在竖屏 feed 侧），
+// 只扫顶层那棵树会整片漏掉 → 这里从各 window 的 rootViewController 全量收。
+static NSArray<UIViewController *> *DYYYLPExitAllVCs(void) {
+    NSMutableArray<UIViewController *> *out = [NSMutableArray array];
+    NSMutableArray<UIViewController *> *stack = [NSMutableArray array];
+    UIWindow *win = [DYYYUtils getActiveWindow];
+    if (!win) win = [UIApplication sharedApplication].keyWindow;
+    if (win.rootViewController) [stack addObject:win.rootViewController];
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w.rootViewController) [stack addObject:w.rootViewController];
+    }
+    while (stack.count > 0) {
+        UIViewController *vc = stack.lastObject;
+        [stack removeLastObject];
+        if ([out containsObject:vc]) continue;
+        [out addObject:vc];
+        for (UIViewController *c in vc.childViewControllers) [stack addObject:c];
+        for (UIViewController *c in vc.navigationController.viewControllers) [stack addObject:c];
+        if (vc.presentedViewController) [stack addObject:vc.presentedViewController];
+    }
+    return out;
+}
+
+// 在某个 VC 上找持有 exitLandscapeBlock 的对象。
+// 先看 VC 自己，再把它声明的每个对象型 ivar 翻一遍（抖音把这个回调放在
+// 非 VC 的 helper / viewModel / context 上是常态，光看 VC 会漏）。
+static id DYYYLPExitBlockHolderInVC(UIViewController *vc) {
+    static NSString *const kBlockKey = @"exitLandscapeBlock";
+    if ([vc respondsToSelector:NSSelectorFromString(kBlockKey)]) return vc;
+    for (Class c = object_getClass(vc); c && c != [NSObject class]; c = class_getSuperclass(c)) {
+        unsigned int count = 0;
+        Ivar *ivars = class_copyIvarList(c, &count);
+        if (!ivars) continue;
+        id found = nil;
+        for (unsigned int i = 0; i < count && !found; i++) {
+            const char *enc = ivar_getTypeEncoding(ivars[i]);
+            if (!enc || enc[0] != '@') continue;
+            id v = nil;
+            @try { v = (__bridge id)object_getIvar(vc, ivars[i]); } @catch (__unused NSException *e) {}
+            if (!v) continue;
+            if ([v respondsToSelector:NSSelectorFromString(kBlockKey)]) found = v;
+        }
+        free(ivars);
+        if (found) return found;
+    }
+    return nil;
+}
+
 // 只调用「无参无返回」的 block：签名必须是 v8@?0，不符就绝不冒险调（调错签名直接崩）。
 // 调用方式走 block 的 invoke 指针（隐藏首参 = block 自身）：
 // ARC 下不让把 id 直接 __bridge 成 block 类型，这样写既合法也绕开类型检查（签名已自校验过）。
@@ -3888,6 +3937,25 @@ static BOOL DYYYLPExitCallVoidBlock(id blk) {
     if (!(sig[0] == 'v' && sig[1] == '8' && sig[2] == '@' && sig[3] == '?' && sig[4] == '0' && sig[5] == '\0')) return NO;
     ((void (*)(void *))h->invoke)(h);
     return YES;
+}
+
+// 诊断：列出横屏页视图树里的 UIControl 类名。
+// 用途：① 没命中时，靠它精确定位抖音自己的「返回/收起」按钮（下一步就能直接触发它）。
+static void DYYYLPExitLogControls(UIView *root) {
+    if (!root) return;
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+    while (stack.count > 0 && names.count < 30) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        if ([v isKindOfClass:[UIControl class]]) {
+            NSString *n = NSStringFromClass([v class]);
+            if (n.length > 0 && ![names containsObject:n]) [names addObject:n];
+        }
+        for (UIView *s in v.subviews) [stack addObject:s];
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] 横屏页控件：%@",
+                   names.count ? [names componentsJoinedByString:@", "] : @"（没找到 UIControl）"]);
 }
 
 // 退出横屏全屏：三条路依次试，成功即停
@@ -3912,22 +3980,30 @@ static BOOL DYYYLPExitLandscape(void) {
     }
     NSArray<UIViewController *> *vcs = DYYYLPExitCollectVCs(top);
 
-    // ① 抖音自己的退出回调（属性 exitLandscapeBlock，签名不符不调）
-    for (UIViewController *vc in vcs) {
-        if (![vc respondsToSelector:NSSelectorFromString(@"exitLandscapeBlock")]) continue;
+    // ① 抖音自己的退出回调（属性 exitLandscapeBlock，签名不符不调）。
+    //    这是【唯一】能保证 feed 状态被抖音自己收尾（回到原视频、位置不错位）的路径，
+    //    所以扫描范围放到整个 App 的 VC 树 + 每个 VC 的对象型 ivar，尽力找到它。
+    NSMutableArray<UIViewController *> *scan = [NSMutableArray arrayWithArray:vcs];
+    for (UIViewController *vc in DYYYLPExitAllVCs()) {
+        if (![scan containsObject:vc]) [scan addObject:vc];
+    }
+    for (UIViewController *vc in scan) {
+        id holder = DYYYLPExitBlockHolderInVC(vc);
+        if (!holder) continue;
         id blk = nil;
-        @try { blk = [vc valueForKey:@"exitLandscapeBlock"]; } @catch (__unused NSException *e) {}
+        @try { blk = [holder valueForKey:@"exitLandscapeBlock"]; } @catch (__unused NSException *e) {}
         if (DYYYLPExitCallVoidBlock(blk)) {
-            DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ① exitLandscapeBlock 生效（%@）",
-                           NSStringFromClass([vc class])]);
+            DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ① exitLandscapeBlock 生效（持有者=%@，扫到 VC %lu 个）",
+                           NSStringFromClass([holder class]), (unsigned long)scan.count]);
             return YES;
         }
-        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ① %@ 有 exitLandscapeBlock 但不可用（nil/签名不符）",
-                       NSStringFromClass([vc class])]);
+        DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ① %@ 上拿到 exitLandscapeBlock 但不可用（nil/签名不符）",
+                       NSStringFromClass([holder class])]);
     }
 
     // ② 通用返回：presented 就 dismiss，否则导航栈 pop
     if (top.presentingViewController) {
+        DYYYLPExitLogControls(top.view);
         [top dismissViewControllerAnimated:YES completion:nil];
         DYYYSpeedDiag([NSString stringWithFormat:@"[lp-exit] ② dismiss 生效（%@）", NSStringFromClass([top class])]);
         return YES;
