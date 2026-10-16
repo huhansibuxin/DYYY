@@ -118,7 +118,7 @@ static void DYYYApplyTabBarHeightToCurrentABTestDataIfNeeded(void) {
     s_isApplyingFixedData = YES;
     [manager setAbTestData:patchedData];
     s_isApplyingFixedData = NO;
-    NSLog(@"[DYYY] 已通过 ABTest 注入底栏高度: %@", contentHeight);
+    DYYYLog(@"[DYYY] 已通过 ABTest 注入底栏高度: %@", contentHeight);
 }
 
 @implementation DYYYABTestHook
@@ -201,7 +201,7 @@ static void DYYYApplyTabBarHeightToCurrentABTestDataIfNeeded(void) {
     dispatch_async(DYYYABTestQueue(), ^{
       s_localABTestData = nil;
       s_loadOnceToken = 0;
-      NSLog(@"[DYYY] 本地ABTest配置已清除");
+      DYYYLog(@"[DYYY] 本地ABTest配置已清除");
     });
 }
 
@@ -226,7 +226,7 @@ static void DYYYApplyTabBarHeightToCurrentABTestDataIfNeeded(void) {
             NSError *error = nil;
             [fileManager createDirectoryAtPath:dyyyFolderPath withIntermediateDirectories:YES attributes:nil error:&error];
             if (error) {
-                NSLog(@"[DYYY] 创建DYYY目录失败: %@", error.localizedDescription);
+                DYYYLog(@"[DYYY] 创建DYYY目录失败: %@", error.localizedDescription);
             }
         }
 
@@ -249,13 +249,13 @@ static void DYYYApplyTabBarHeightToCurrentABTestDataIfNeeded(void) {
                     actualData = [tmp copy];
                 }
                 s_localABTestData = [actualData copy];
-                NSLog(@"[DYYY] ABTest本地配置已从文件加载成功");
+                DYYYLog(@"[DYYY] ABTest本地配置已从文件加载成功");
                 return;
             } else {
-                NSLog(@"[DYYY] ABTest本地配置解析失败: %@", error.localizedDescription);
+                DYYYLog(@"[DYYY] ABTest本地配置解析失败: %@", error.localizedDescription);
             }
         } else {
-            NSLog(@"[DYYY] ABTest本地配置文件不存在或无法读取");
+            DYYYLog(@"[DYYY] ABTest本地配置文件不存在或无法读取");
         }
 
         // 加载失败时的处理
@@ -272,14 +272,14 @@ static void DYYYApplyTabBarHeightToCurrentABTestDataIfNeeded(void) {
 + (void)applyFixedABTestData {
     dispatch_async(DYYYABTestQueue(), ^{
       if (!s_abTestBlockEnabled || !s_localABTestData) {
-          NSLog(@"[DYYY] 不满足应用本地配置的条件 (禁止下发=%@, 数据是否为空=%@)", s_abTestBlockEnabled ? @"开启" : @"关闭", s_localABTestData ? @"否" : @"是");
+          DYYYLog(@"[DYYY] 不满足应用本地配置的条件 (禁止下发=%@, 数据是否为空=%@)", s_abTestBlockEnabled ? @"开启" : @"关闭", s_localABTestData ? @"否" : @"是");
           s_isApplyingFixedData = NO; // 确保标志关闭
           return;
       }
 
       AWEABTestManager *manager = [%c(AWEABTestManager) sharedManager];
       if (!manager) {
-          NSLog(@"[DYYY] 无法应用本地配置：AWEABTestManager 实例不可用");
+          DYYYLog(@"[DYYY] 无法应用本地配置：AWEABTestManager 实例不可用");
           s_isApplyingFixedData = NO; // 确保标志关闭
           return;
       }
@@ -312,7 +312,7 @@ static void DYYYApplyTabBarHeightToCurrentABTestDataIfNeeded(void) {
       // 重置状态标志
       s_isApplyingFixedData = NO;
 
-      NSLog(@"[DYYY] ABTest本地配置已应用");
+      DYYYLog(@"[DYYY] ABTest本地配置已应用");
     });
 }
 
@@ -422,7 +422,7 @@ static void DYYYApplyTabBarHeightToCurrentABTestDataIfNeeded(void) {
     });
 
     if (shouldBlock) {
-        NSLog(@"[DYYY] 阻止ABTest数据更新 (启用了禁止下发配置且非本地应用)");
+        DYYYLog(@"[DYYY] 阻止ABTest数据更新 (启用了禁止下发配置且非本地应用)");
         return;
     }
 
@@ -449,7 +449,7 @@ static void DYYYApplyTabBarHeightToCurrentABTestDataIfNeeded(void) {
     });
 
     if (shouldBlock) {
-        NSLog(@"[DYYY] 阻止增量更新ABTest数据 (启用了禁止下发配置)");
+        DYYYLog(@"[DYYY] 阻止增量更新ABTest数据 (启用了禁止下发配置)");
         return;
     }
     %orig;
@@ -467,7 +467,7 @@ static void DYYYApplyTabBarHeightToCurrentABTestDataIfNeeded(void) {
     });
 
     if (shouldBlock) {
-        NSLog(@"[DYYY] 阻止从网络获取ABTest配置 (启用了禁止下发配置)");
+        DYYYLog(@"[DYYY] 阻止从网络获取ABTest配置 (启用了禁止下发配置)");
         if (completion && [completion isKindOfClass:%c(NSBlock)]) {
             dispatch_async(dispatch_get_main_queue(), ^{
               ((void (^)(id))completion)(nil);
@@ -490,7 +490,7 @@ static void DYYYApplyTabBarHeightToCurrentABTestDataIfNeeded(void) {
     });
 
     if (shouldBlock) {
-        NSLog(@"[DYYY] 阻止从网络获取ABTest配置 (启用了禁止下发配置)");
+        DYYYLog(@"[DYYY] 阻止从网络获取ABTest配置 (启用了禁止下发配置)");
         return;
     }
     %orig;
@@ -508,7 +508,7 @@ static void DYYYApplyTabBarHeightToCurrentABTestDataIfNeeded(void) {
     });
 
     if (shouldBlock) {
-        NSLog(@"[DYYY] 阻止重写ABTest数据 (启用了禁止下发配置)");
+        DYYYLog(@"[DYYY] 阻止重写ABTest数据 (启用了禁止下发配置)");
         return;
     }
     %orig;
@@ -526,7 +526,7 @@ static void DYYYApplyTabBarHeightToCurrentABTestDataIfNeeded(void) {
     });
 
     if (shouldBlock) {
-        NSLog(@"[DYYY] 阻止保存ABTest数据 (启用了禁止下发配置)");
+        DYYYLog(@"[DYYY] 阻止保存ABTest数据 (启用了禁止下发配置)");
         return;
     }
     %orig;
@@ -551,7 +551,7 @@ static void DYYYApplyTabBarHeightToCurrentABTestDataIfNeeded(void) {
           currentMode = [DYYYABTestHook isPatchMode] ? @"覆写模式" : @"替换模式";
       }
 
-      NSLog(@"[DYYY] ABTest Hook已启动: 禁止下发=%@, 当前模式=%@", s_abTestBlockEnabled ? @"开启" : @"关闭", currentMode);
+      DYYYLog(@"[DYYY] ABTest Hook已启动: 禁止下发=%@, 当前模式=%@", s_abTestBlockEnabled ? @"开启" : @"关闭", currentMode);
 
       [DYYYABTestHook loadLocalABTestConfig];
       [DYYYABTestHook applyFixedABTestData];

@@ -3428,7 +3428,7 @@ void showDYYYSettingsVC(UIViewController *rootVC, BOOL hasAgreed) {
           @{
               @"identifier" : @"DYYYDiagLog",
               @"title" : @"诊断日志",
-              @"subTitle" : @"关闭后 DYYY 停止写入全部调试日志（speed_diag.log），开启后恢复写入，实时生效",
+              @"subTitle" : @"DYYY 全部日志的总开关。关闭后停止写入调试日志（speed_diag.log）与系统日志（NSLog），零输出；开启后恢复写入。实时生效，默认开启",
               @"detail" : @"",
               @"cellType" : @37,
               @"imageName" : @"ic_gearsimplify_outlined_20"

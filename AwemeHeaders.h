@@ -8,6 +8,13 @@
 #define DYYYGetFloat(key) [[NSUserDefaults standardUserDefaults] floatForKey:key]
 #define DYYYGetInteger(key) [[NSUserDefaults standardUserDefaults] integerForKey:key]
 #define DYYYGetString(key) [[NSUserDefaults standardUserDefaults] stringForKey:key]
+
+// 【统一日志出口】受设置页「诊断日志」总开关（DYYYDiagLog，默认开）控制。
+// 关闭后 DYYY 的日志【零输出】——既包括写入 speed_diag.log 的诊断行
+// （DYYYSpeedDiag / DYYYFSDiag，它们的门控在各自函数开头），也包括这里的 NSLog（系统日志/Console）。
+// ⚠️ 约定：本项目新增任何日志，一律走 DYYYLog(...) 或 DYYYSpeedDiag(...)，
+//    不要直接写裸 NSLog —— 否则会绕过总开关（历史上就漏了 36 处）。
+#define DYYYLog(fmt, ...) do { if (DYYYGetBool(@"DYYYDiagLog")) NSLog(fmt, ##__VA_ARGS__); } while (0)
 #define DYYY_IGNORE_GLOBAL_ALPHA_TAG 114514
 
 // 弹幕穿透开关缓存失效入口（定义在 DYYY.xm，设置页开关变更时由 DYYYSettingsHelper 调用）

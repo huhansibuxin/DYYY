@@ -549,7 +549,10 @@ static double DYYYPreparedPlaybackSpeedForPlayer(id playerViewController) {
 // （frida 不可用、dylib NSLog 不被 oslog 捕获，只能写文件拿证据）
 // 性能：文件打开/写入/关闭全部丢到后台串行队列，主线程只做一次字符串拼接；
 // 串行队列保证日志顺序与调用顺序一致，时间戳在调用时刻取。
-// 门控：设置页"诊断日志"开关（DYYYDiagLog，默认开）——关掉后所有 DYYY 日志停写、零文件 IO。
+// 门控：设置页"诊断日志"开关（DYYYDiagLog，默认开）——关掉后 DYYY 全部日志零输出：
+//   ① 本函数（speed_diag.log 文件行）；② 姊妹函数 DYYYFSDiag（DYYYLongPressPanel.xm，同一文件）；
+//   ③ 系统日志 NSLog —— 全部统一走 AwemeHeaders.h 的 DYYYLog 宏，同一开关。
+//   开关判断放在函数最前面 → 关闭时连字符串拼接都不做，零文件 IO、零开销。
 static void DYYYSpeedDiag(NSString *msg) {
     @try {
         if (!DYYYGetBool(@"DYYYDiagLog")) {
@@ -4195,7 +4198,7 @@ static BOOL DYYYApplyPlaybackRateToNativeDPlayer(AWEDPlayerSpeedController *spee
         return YES;
     } @catch (NSException *exception) {
         dyyyApplyingNativeDPlayerSpeed = NO;
-        NSLog(@"[DYYY][Speed397] native setPlaybackRate failed on %@: %@",
+        DYYYLog(@"[DYYY][Speed397] native setPlaybackRate failed on %@: %@",
               NSStringFromClass([speedController class]),
               exception.reason);
         return NO;
@@ -6161,7 +6164,7 @@ static NSString *const kDYYYLongPressCopyEnabledKey = @"DYYYLongPressCopyTextEna
     if (!disablePCDN) {
         %orig;
     } else {
-        NSLog(@"[DYYY] HTSLiveStreamPcdnManager start blocked");
+        DYYYLog(@"[DYYY] HTSLiveStreamPcdnManager start blocked");
     }
 }
 
@@ -6170,7 +6173,7 @@ static NSString *const kDYYYLongPressCopyEnabledKey = @"DYYYLongPressCopyTextEna
     if (!disablePCDN) {
         %orig;
     } else {
-        NSLog(@"[DYYY] HTSLiveStreamPcdnManager configAndStartLiveIO blocked");
+        DYYYLog(@"[DYYY] HTSLiveStreamPcdnManager configAndStartLiveIO blocked");
     }
 }
 
@@ -6182,7 +6185,7 @@ static NSString *const kDYYYLongPressCopyEnabledKey = @"DYYYLongPressCopyTextEna
 - (void)excute {
     BOOL disablePCDN = DYYYGetBool(@"DYYYDisableLivePCDN");
     if (disablePCDN) {
-        NSLog(@"[DYYY] IESLiveLaunchTaskPcdn excute blocked");
+        DYYYLog(@"[DYYY] IESLiveLaunchTaskPcdn excute blocked");
         return;
     }
     %orig;
@@ -6280,12 +6283,12 @@ static NSArray<NSString *> *dyyy_qualityRank = nil;
 
     NSString *preferredQuality = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYLiveQuality"];
     if (!preferredQuality || [preferredQuality isEqualToString:@"自动"]) {
-        NSLog(@"[DYYY] Live quality auto - skipping hook");
+        DYYYLog(@"[DYYY] Live quality auto - skipping hook");
         return;
     }
 
     BOOL preferLower = YES;
-    NSLog(@"[DYYY] preferredQuality=%@ preferLower=%@", preferredQuality, @(preferLower));
+    DYYYLog(@"[DYYY] preferredQuality=%@ preferLower=%@", preferredQuality, @(preferLower));
 
     NSArray *qualities = self.streamQualityArray;
     if (!qualities || qualities.count == 0) {
@@ -6321,7 +6324,7 @@ static NSArray<NSString *> *dyyy_qualityRank = nil;
             }
         }
     }
-    NSLog(@"[DYYY] available qualities: %@", availableNames);
+    DYYYLog(@"[DYYY] available qualities: %@", availableNames);
 
     BOOL qualityDesc = YES; // ranks ascending -> high to low
     BOOL qualityAsc = YES;  // ranks descending -> low to high
@@ -6349,14 +6352,14 @@ static NSArray<NSString *> *dyyy_qualityRank = nil;
     NSNumber *indexToUse = nameToIndex[preferredQuality];
     if (indexToUse) {
         NSInteger finalIdx = convertIndex(indexToUse.integerValue);
-        NSLog(@"[DYYY] exact quality %@ found at index %ld", preferredQuality, (long)finalIdx);
+        DYYYLog(@"[DYYY] exact quality %@ found at index %ld", preferredQuality, (long)finalIdx);
         [self setResolutionWithIndex:finalIdx isManual:YES beginChange:nil completion:nil];
         return;
     }
 
     NSInteger targetPos = [orderedNames indexOfObject:preferredQuality];
     if (targetPos == NSNotFound) {
-        NSLog(@"[DYYY] preferred quality %@ not in list", preferredQuality);
+        DYYYLog(@"[DYYY] preferred quality %@ not in list", preferredQuality);
         return;
     }
 
@@ -6367,14 +6370,14 @@ static NSArray<NSString *> *dyyy_qualityRank = nil;
         NSNumber *idx = nameToIndex[candidate];
         if (idx) {
             NSInteger finalIdx = convertIndex(idx.integerValue);
-            NSLog(@"[DYYY] fallback quality %@ at index %ld", candidate, (long)finalIdx);
+            DYYYLog(@"[DYYY] fallback quality %@ at index %ld", candidate, (long)finalIdx);
             [self setResolutionWithIndex:finalIdx isManual:YES beginChange:nil completion:nil];
             applied = YES;
             break;
         }
     }
     if (!applied) {
-        NSLog(@"[DYYY] no suitable fallback quality found");
+        DYYYLog(@"[DYYY] no suitable fallback quality found");
     }
 }
 
@@ -6673,7 +6676,7 @@ static BOOL dyyyShouldUseLastStickerURL = NO;
     if (gesture.state == UIGestureRecognizerStateBegan) {
         if ([gesture.view isKindOfClass:%c(YYAnimatedImageView)]) {
             targetStickerView = (YYAnimatedImageView *)gesture.view;
-            NSLog(@"DYYY 长按表情：%@", targetStickerView);
+            DYYYLog(@"DYYY 长按表情：%@", targetStickerView);
         } else {
             targetStickerView = nil;
         }
@@ -12453,24 +12456,24 @@ static Class tabBarButtonClass = nil;
         if (gCurrentTabBarHeight == kInvalidHeight) {
             gCurrentTabBarHeight = originalTabBarHeight;
         }
-        NSLog(@"[DYYY] initializeOriginalTabBarHeight: Skipped! originalTabBarHeight already initialized as %.1f.", originalTabBarHeight);
+        DYYYLog(@"[DYYY] initializeOriginalTabBarHeight: Skipped! originalTabBarHeight already initialized as %.1f.", originalTabBarHeight);
         return;
     }
 
     UIWindow *targetWindow = self.window ?: [DYYYUtils getActiveWindow];
     if (self.frame.size.height >= 30) {
         originalTabBarHeight = self.frame.size.height;
-        NSLog(@"[DYYY] initializeOriginalTabBarHeight: Success! originalTabBarHeight set to %.1f (from self.frame.size.height)", originalTabBarHeight);
+        DYYYLog(@"[DYYY] initializeOriginalTabBarHeight: Success! originalTabBarHeight set to %.1f (from self.frame.size.height)", originalTabBarHeight);
     } else if (targetWindow) {
         CGFloat bottomInset = targetWindow.safeAreaInsets.bottom;
         originalTabBarHeight = 49 + bottomInset;
-        NSLog(@"[DYYY] initializeOriginalTabBarHeight: Success! originalTabBarHeight set to %.1f (fallback calculation: 49.0 + %.1f)", originalTabBarHeight, bottomInset);
+        DYYYLog(@"[DYYY] initializeOriginalTabBarHeight: Success! originalTabBarHeight set to %.1f (fallback calculation: 49.0 + %.1f)", originalTabBarHeight, bottomInset);
     } else {
-        NSLog(@"[DYYY] initializeOriginalTabBarHeight: Failed! No window available.");
+        DYYYLog(@"[DYYY] initializeOriginalTabBarHeight: Failed! No window available.");
     }
     if (originalTabBarHeight != kInvalidHeight) {
         gCurrentTabBarHeight = originalTabBarHeight;
-        NSLog(@"[DYYY] initializeOriginalTabBarHeight: gCurrentTabBarHeight synced to %.1f.", gCurrentTabBarHeight);
+        DYYYLog(@"[DYYY] initializeOriginalTabBarHeight: gCurrentTabBarHeight synced to %.1f.", gCurrentTabBarHeight);
     }
 }
 
@@ -12485,13 +12488,13 @@ static Class tabBarButtonClass = nil;
     %orig;
 
     if (originalTabBarHeight == kInvalidHeight) {
-        NSLog(@"[DYYY] layoutSubviews: Fallback! originalTabBarHeight initialization triggered.");
+        DYYYLog(@"[DYYY] layoutSubviews: Fallback! originalTabBarHeight initialization triggered.");
         [self initializeOriginalTabBarHeight];
     }
 
     if (gCurrentTabBarHeight == kInvalidHeight) {
         gCurrentTabBarHeight = originalTabBarHeight;
-        NSLog(@"[DYYY] layoutSubviews: gCurrentTabBarHeight fallback synced to %.1f.", gCurrentTabBarHeight);
+        DYYYLog(@"[DYYY] layoutSubviews: gCurrentTabBarHeight fallback synced to %.1f.", gCurrentTabBarHeight);
     }
 
     BOOL hideShop = DYYYGetBool(@"DYYYHideShopButton");
@@ -13803,7 +13806,7 @@ static void DYYYRemoveKeyboardObserver(void) {
     @try {
         [[NSUserDefaults standardUserDefaults] removeObserver:(NSObject *)self forKeyPath:kDYYYGlobalTransparencyKey context:DYYYGlobalTransparencyContext];
     } @catch (NSException *exception) {
-        NSLog(@"[DYYY] KVO removeObserver failed: %@", exception);
+        DYYYLog(@"[DYYY] KVO removeObserver failed: %@", exception);
     } 
     %orig;
 }
