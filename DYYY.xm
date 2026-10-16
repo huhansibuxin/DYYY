@@ -1297,8 +1297,28 @@ static void DYYYHandleCurrentSpeedAwemeChanged(id aweme) {
 // 重入标记：我们自己声明 playbackState 时置位，避免被自己的调用再次触发
 static BOOL dyyyNpSelfWrite = NO;
 
+// 【v17 根治】前置声明：定义在下方的横屏区块。用途见 DYYYShouldHoldNowPlaying。
+static BOOL DYYYIsLandscapeFullscreenNow(void);
+
 static BOOL DYYYShouldHoldNowPlaying(void) {
-    return DYYYGetBool(@"DYYYKeepNowPlayingInBackground");
+    if (!DYYYGetBool(@"DYYYKeepNowPlayingInBackground")) {
+        return NO;
+    }
+    // 【v17 根治·横屏放行】前台横屏全屏期间，整块 NowPlaying 托管一律不生效。
+    // 理由（2026-10-16 设备日志实锤）—— 抖音在【本条播完自动切下一条】与【进/出横屏重建播放器】
+    // 时走的收摊链与"用户暂停"完全同形。日志同一簇（07:12:33）：
+    //   [npv] 暂停检测：setCurrentNowPlayingInfo 空信息（吞掉）
+    //   [npv] 拦 setPlayingPlayer:nil            ← 吞掉了"旧播放器下岗"
+    //   [npv] 拦 AWENPC setNowPlayingInfo:nil
+    //   [npv] Boost 已发 update=1 resign=1       ← 往抖音状态机灌"App 即将退非活跃"
+    //   紧跟着 → [fs-rev] 反向全屏：进横屏后翻到另一侧
+    // = 我们把抖音自己的播放器交接打断了，表现为"横屏下偶尔不会自动播放下一条"。
+    // 横屏全屏时用户正在看画面，控制中心卡片毫无意义 → 放行零代价，
+    // 收益是抖音的交接链在横屏下 100% 干净（一次都不被触碰）。
+    if (DYYYIsLandscapeFullscreenNow()) {
+        return NO;
+    }
+    return YES;
 }
 
 // 运行时取系统当前 nowPlayingInfo 的键数。
@@ -1476,6 +1496,9 @@ static void DYYYBoostNowPlayingAfterPause(void) {
             // ① 先声明继续接收远程控制（拉控制中心时抖音走的第一步）
             DYYYForceBeginReceivingRemoteControlEvents();
             // ② 让抖音重新组装并发布当前视频的 now playing 信息
+            //    注：日志显示前台这一步常"发不出去"（抖音内部有闸门），但保留原行为 ——
+            //    它不影响抖音的播放交接（交接被 v17 的横屏放行与 setPlayingPlayer 放行保护），
+            //    且后台场景确实靠它生效，不做行为改动。
             BOOL didUpdate = [m respondsToSelector:updateSel];
             BOOL didResign = [m respondsToSelector:resignSel];
             if (didUpdate) {
@@ -1484,7 +1507,8 @@ static void DYYYBoostNowPlayingAfterPause(void) {
             if (didResign) {
                 ((void (*)(id, SEL))objc_msgSend)(m, resignSel);
             }
-            DYYYSpeedDiag([NSString stringWithFormat:@"[npv] Boost 已发 update=%d resign=%d", didUpdate, didResign]);
+            DYYYSpeedDiag([NSString stringWithFormat:@"[npv] Boost 已发 update=%d resign=%d st=%ld vote=%ld",
+                           didUpdate, didResign, (long)DYYYAppStateRaw(), (long)dyyyBoostVote]);
         } @catch (NSException *e) {
             DYYYSpeedDiag([NSString stringWithFormat:@"[npv] Boost exception: %@", e.reason ?: @"unknown"]);
         }
@@ -1707,7 +1731,21 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
 // 所以判据不能要求"非前台"，否则永远晚一步。
 - (void)setPlayingPlayer:(id)player {
     if (!player && DYYYShouldHoldNowPlaying()) {
-        DYYYSpeedDiag(@"[npv] 拦 setPlayingPlayer:nil");
+        // 【v17 根治】前台 + 抖音自己报告"仍在播放" → 放行这个 nil。
+        // 这是抖音【播放器交接链】的第一步：切下一条 / 进出横屏时它先把旧播放器置 nil，
+        // 新播放器随后才上岗。吞掉这个 nil 会让它内部状态停在"旧播放器还在"，
+        // 新视频接不上 → 表现就是"偶尔不自动切下一条"。
+        // 边界：后台托管照旧（那才是本功能主战场，暂停态退后台卡片不能掉）；
+        //      前台真暂停时投票为负（不在播）→ 照拦，卡片保活完全不受影响。
+        NSInteger dyyySt = DYYYAppStateRaw();
+        NSInteger dyyyVote = DYYYReadDouyinPlayState();
+        if (dyyySt == 0 && dyyyVote == 1) {
+            DYYYSpeedDiag(@"[npv] 放行 setPlayingPlayer:nil（前台在播=抖音交接链）");
+            %orig;
+            return;
+        }
+        DYYYSpeedDiag([NSString stringWithFormat:@"[npv] 拦 setPlayingPlayer:nil st=%ld vote=%ld",
+                       (long)dyyySt, (long)dyyyVote]);
         return;
     }
     // 【v16 诊断】非 nil"上岗"同样记录（限流 0.5s）。缺了这条，就无法判断
