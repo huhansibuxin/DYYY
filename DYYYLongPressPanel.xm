@@ -86,8 +86,8 @@ static NSString *DYYYFSDiagDirectory(void) {
 static void DYYYFSDiagImpl(NSString *msg);
 #define DYYYFSDiag(...) do { if (DYYYGetBool(@"DYYYDiagLog")) DYYYFSDiagImpl(__VA_ARGS__); } while (0)
 static void DYYYFSDiagImpl(NSString *msg) {
+    // 开关判断已由上面 DYYYFSDiag 宏完成，此处不重复读 NSUserDefaults（避免开关打开时双读）。
     @try {
-        if (!DYYYGetBool(@"DYYYDiagLog")) return;
         NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
         static dispatch_queue_t q;
         static dispatch_once_t once;

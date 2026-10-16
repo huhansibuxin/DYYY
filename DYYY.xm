@@ -578,10 +578,10 @@ static NSString *DYYYSpeedDiagDirectory(void) {
 static void DYYYSpeedDiagImpl(NSString *msg);
 #define DYYYSpeedDiag(...) do { if (DYYYGetBool(@"DYYYDiagLog")) DYYYSpeedDiagImpl(__VA_ARGS__); } while (0)
 static void DYYYSpeedDiagImpl(NSString *msg) {
+    // 开关判断已由上面的 DYYYSpeedDiag 宏完成（且本函数是唯一经宏进入的出口），
+    // 这里【不再重复读 NSUserDefaults】——否则开关打开时每条日志都会多一次 defaults 读
+    //（宏一次 + 这里一次 = 双读），把一个"降开销"改动变成微回归。
     @try {
-        if (!DYYYGetBool(@"DYYYDiagLog")) {
-            return;
-        }
         NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
         static dispatch_queue_t dyyyDiagWriteQueue;
         static dispatch_once_t dyyyDiagOnce;
