@@ -5246,7 +5246,14 @@ static void DYYYBlockUpdateClassesOnce(void) {
         return;
 
     if (speedButton && ![speedButton isDescendantOfView:self]) {
+        // 【同类隐患修复】延迟块里裸用 self（window）同样有野指针风险：块无 COPY_DISPOSE
+        // 时不 retain 捕获对象。speedButton 是全局变量、块内不捕获（每次读最新值），无需处理。
+        __weak __typeof(self) weakSelf = self;
         dispatch_async(dispatch_get_main_queue(), ^{
+          __strong __typeof(weakSelf) self = weakSelf;
+          if (!self) {
+              return;
+          }
           [self addSubview:speedButton];
           [speedButton loadSavedPosition];
           [speedButton resetFadeTimer];

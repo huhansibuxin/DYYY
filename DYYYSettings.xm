@@ -766,7 +766,15 @@ static void DYYYBuildSettingsSearchIndexIfNeeded(NSArray<AWESettingItemModel *> 
 
 - (void)didMoveToSuperview {
     %orig;
+    // 【崩溃修复】延迟 0.3s 的 block 必须弱引用 self：该 block 不带 BLOCK_HAS_COPY_DISPOSE，
+    // _Block_copy 不会 retain 捕获的 self；若 0.3s 内 view 被移除/复用/释放，
+    // block 执行时 self 即成野指针 → 首句消息发送 EXC_BAD_ACCESS(SIGSEGV/PAC 失败) 闪退。
+    __weak __typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong __typeof(weakSelf) self = weakSelf;
+        if (!self) {
+            return;
+        }
         NSString *accessibilityLabel = self.accessibilityLabel;
         if (![accessibilityLabel isEqualToString:@"设置"]) {
             return;
@@ -817,7 +825,14 @@ static void DYYYBuildSettingsSearchIndexIfNeeded(NSArray<AWESettingItemModel *> 
 
 - (void)didMoveToSuperview {
     %orig;
+    // 【崩溃修复】同上方 AWELeftSideBarTopIconHorizontalView：0.3s 延迟 block 无 COPY_DISPOSE，
+    // self 不被 retain，view 提前释放即野指针；一律弱引用 + 判空。
+    __weak __typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong __typeof(weakSelf) self = weakSelf;
+        if (!self) {
+            return;
+        }
         NSString *accessibilityLabel = self.accessibilityLabel;
         if (![accessibilityLabel isEqualToString:@"设置"]) {
             return;
