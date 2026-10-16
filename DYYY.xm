@@ -854,7 +854,68 @@ static void DYYYProbeEngineSpeedEntry(void) {
     }
 }
 
-// 进全屏/横屏时，按已知三个播放器类在视图层级里找当前播放器并把默认倍速重新焊上（幂等）
+// 收集「所有窗口」（全部 scene + shareApplication.windows，指针去重）。
+// 为什么不能只用 [DYYYUtils getActiveWindow]：横屏全屏页有自己的一层 window 层级
+// （AWEMaskWindow / 独立 scene window），只取"活动窗口"时横屏那棵树根本不在遍历范围里。
+static NSArray<UIWindow *> *DYYYSpeedAllWindows(void) {
+    NSMutableArray<UIWindow *> *wins = [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
+    void (^add)(UIWindow *) = ^(UIWindow *w) {
+        if (!w || [seen containsObject:w]) {
+            return;
+        }
+        [seen addObject:w];
+        [wins addObject:w];
+    };
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                add(w);
+            }
+        }
+    }
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        add(w);
+    }
+    return wins;
+}
+
+// 收集所有窗口下的全部 VC：childViewControllers **和** presentedViewController 双向都走（指针去重防环）。
+// ⚠️ 旧路径只从「活动窗口 root」沿 presented 上溯到最上层，再用 findViewControllersInHierarchy
+//    只往下走 childViewControllers —— 结果是「presented 链的下半层」（竖屏 feed 的播放器）永远遍历不到，
+//    而横屏页正是 present 在最上层的那一层，两层都覆盖不全。
+static NSArray<UIViewController *> *DYYYSpeedAllViewControllers(void) {
+    NSMutableArray<UIViewController *> *out = [NSMutableArray array];
+    NSMutableSet *visited = [NSMutableSet set];
+    __block void (^walk)(UIViewController *) = nil;
+    walk = ^(UIViewController *vc) {
+        if (!vc || [visited containsObject:vc]) {
+            return;
+        }
+        [visited addObject:vc];
+        [out addObject:vc];
+        for (UIViewController *child in vc.childViewControllers) {
+            walk(child);
+        }
+        walk(vc.presentedViewController);
+    };
+    for (UIWindow *w in DYYYSpeedAllWindows()) {
+        walk(w.rootViewController);
+    }
+    return out;
+}
+
+// 进全屏/横屏时，把目标倍速重新焊到【所有能找到的播放器 VC】上（幂等）。
+//
+// 修复记录（2026-10-16：横屏入口恒为 `players=()` handle=0）——两个原因叠加：
+//   ① 窗口/遍历范围不足：只取 activeWindow，且只沿 presented 上溯、只往下走 childViewControllers；
+//   ② 候选硬编码 3 个类名（AWEAwemePlayVideoViewController / AWEDPlayerFeedPlayerViewController /
+//      AWEDPlayerViewController_Merge），而横屏那一族是 AWELandscape*，名字对不上 → 必然 0 条。
+// 现改为：
+//   · 全窗口全树遍历（DYYYSpeedAllWindows / DYYYSpeedAllViewControllers）；
+//   · 候选 = 白名单 3 类 ∪「任何响应 setVideoControllerPlaybackRate: 的 VC」——
+//     后者是抖音自己用来判定"我是播放器"的方法，**不依赖类名**，横竖屏、跨版本通吃；
+//   · 命中的按可见性排序取前 4 个全部施速（幂等），来源与命中方式写进日志便于核验。
 static void DYYYReapplySpeedToCurrentPlayer(NSString *context) {
     if (!DYYYShouldHandleSpeedFeatures()) {
         return;
@@ -865,21 +926,46 @@ static void DYYYReapplySpeedToCurrentPlayer(NSString *context) {
         return;
     }
     dyyyReapplyingSpeed = YES;
-    UIWindow *win = [DYYYUtils getActiveWindow];
-    UIViewController *root = win.rootViewController;
-    while (root && root.presentedViewController) {
-        root = root.presentedViewController;
-    }
-    NSMutableArray *found = [NSMutableArray array];
-    for (UIViewController *vc in (root ? findViewControllersInHierarchy(root) : @[])) {
-        if ([vc isKindOfClass:NSClassFromString(@"AWEAwemePlayVideoViewController")] ||
-            [vc isKindOfClass:NSClassFromString(@"AWEDPlayerFeedPlayerViewController")] ||
-            [vc isKindOfClass:NSClassFromString(@"AWEDPlayerViewController_Merge")]) {
-            [found addObject:NSStringFromClass([vc class])];
-            DYYYApplyPreparedPlaybackSpeedToPlayer(vc);
+
+    NSArray<UIWindow *> *wins = DYYYSpeedAllWindows();
+    NSArray<UIViewController *> *allVCs = DYYYSpeedAllViewControllers();
+    Class cPlayVideo = NSClassFromString(@"AWEAwemePlayVideoViewController");
+    Class cFeedPlayer = NSClassFromString(@"AWEDPlayerFeedPlayerViewController");
+    Class cMerge = NSClassFromString(@"AWEDPlayerViewController_Merge");
+
+    NSMutableArray<NSArray *> *cands = [NSMutableArray array];   // @[可见性分, VC, 标签]
+    for (UIViewController *vc in allVCs) {
+        BOOL listed = (cPlayVideo && [vc isKindOfClass:cPlayVideo]) ||
+                      (cFeedPlayer && [vc isKindOfClass:cFeedPlayer]) ||
+                      (cMerge && [vc isKindOfClass:cMerge]);
+        BOOL canSetRate = [vc respondsToSelector:@selector(setVideoControllerPlaybackRate:)];
+        if (!listed && !canSetRate) {
+            continue;
         }
+        CGFloat vis = DYYYViewControllerVisibilityScore(vc);
+        NSString *label = [NSString stringWithFormat:@"%@(%@ vis=%.0f)", NSStringFromClass([vc class]),
+                           listed ? (canSetRate ? @"白名单+可设速率" : @"白名单") : @"可设速率", vis];
+        [cands addObject:@[@(vis), vc, label]];
     }
-    DYYYSpeedDiag([NSString stringWithFormat:@"[reapply:%@] players=%@ handle=%d", context, found, (int)found.count]);
+    [cands sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
+        return [(NSNumber *)b[0] compare:(NSNumber *)a[0]];   // 可见性降序
+    }];
+
+    NSUInteger applied = 0;
+    NSMutableArray<NSString *> *labels = [NSMutableArray array];
+    for (NSArray *item in cands) {
+        [labels addObject:(NSString *)item[2]];
+        if (applied >= 4) {   // 上限 4：正常场景只有 1~3 个，防止极端情况下刷屏
+            continue;
+        }
+        DYYYApplyPreparedPlaybackSpeedToPlayer(item[1]);
+        applied++;
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[reapply:%@] wins=%lu vcs=%lu 候选=%lu %@ 施速=%lu",
+                   context, (unsigned long)wins.count, (unsigned long)allVCs.count,
+                   (unsigned long)cands.count,
+                   labels.count ? [labels componentsJoinedByString:@", "] : @"（无）",
+                   (unsigned long)applied]);
     dyyyReapplyingSpeed = NO;
 }
 
@@ -3961,6 +4047,12 @@ static BOOL dyyyTagVolumeFromDYYYGesture = NO;
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     DYYYReapplySpeedToCurrentPlayer(@"landscape");
+    // 补一次延迟重扫：viewDidAppear 时刻横屏的播放器 VC 可能还没挂进层级，
+    // 重扫用同一份"全窗口全树 + 可设速率"判据，幂等（重复施速无害）。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        DYYYReapplySpeedToCurrentPlayer(@"landscape+0.35s");
+    });
 }
 %end
 
