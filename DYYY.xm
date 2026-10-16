@@ -1370,6 +1370,14 @@ static BOOL dyyyNpPublishedSinceBoost = NO;   // Boost 后系统侧是否出现�
 // 最新缓存（不会出现"上一条视频"）、rate 按投票补齐。
 static NSDictionary *dyyyLastGoodCurrentNPInfo = nil;
 
+// 【v16 根治·切视频识别】"本次疑似暂停"观察窗内，抖音是否又重新填入了【非空】的当前播放信息。
+// 用途：区分【真暂停】与【切视频】——
+//   切视频：先清空旧信息 → 随后立刻填入新视频信息；
+//   真暂停：清空后不再填回（直到用户重新播放）。
+// Boost 靠它避免在切视频时误介入抖音状态机（详见 DYYYBoostNowPlayingAfterPause）。
+// ⚠️ 定义必须在本变量区（Boost 与 hook 都要用），不能挪到后面的 v12 播放态镜像区。
+static BOOL dyyyNpSawNonEmptySinceEmpty = NO;
+
 // 前置声明（实现在下方 v12 播放态镜像区，Boost 兜底单发要用）
 static NSInteger DYYYReadDouyinPlayState(void);
 static NSDictionary *DYYYRateCorrectedNowPlayingInfo(NSDictionary *info, NSInteger state);
@@ -1411,6 +1419,7 @@ static void DYYYBoostNowPlayingAfterPause(void) {
     }
     lastBoost = now;
     dyyyNpPublishedSinceBoost = NO;
+    dyyyNpSawNonEmptySinceEmpty = NO;   // 【v16】开观察窗：0.25s 内若抖音填回非空信息 = 切视频
     DYYYSpeedDiag(@"[npv] Boost 触发(暂停检测)");
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
@@ -1422,6 +1431,28 @@ static void DYYYBoostNowPlayingAfterPause(void) {
         if (!m) {
             return;
         }
+
+        // ===== 【v16 根治】介入抖音状态机之前，必须先确认"这真的是暂停"。 =====
+        // 缺陷（v15 及以前）：真正危险的两步 —— updateNowPlayingInfoWhenResiginActive 与
+        //   appWillResignActiveNotification（= 抖音"App 即将退到非活跃"的处理入口）——
+        //   没有任何校验，而触发条件只是"setCurrentNowPlayingInfo: 收到空信息"。
+        //   可抖音【切下一条视频时同样先清空旧信息】→ 被误判为暂停 →
+        //   我们主动往它的模块灌"退非活跃"，打断前台 feed 的接力与自动切下一条。
+        //   （日志实测：暂停检测 98 次 vs 系统发布 72 次，误判量很大；现象正是"偶尔"失效。）
+        // 注意：1.2s 后的"兜底单发"本来就有 vote != 2 的门控，说明作者知道"切视频不能介入"，
+        //   只是漏在了这两步上。本版把同一判据前移到介入动作之前。
+        // 判据（任一命中即不介入）：
+        //   ① 观察窗内抖音已填回非空信息 → 是切视频（新视频已上岗）；
+        //   ② 多信号投票明确"在播"(1) → 不是在暂停。
+        //   证据不足(0) 时保持原行为，避免真暂停场景漏补卡片。
+        NSInteger dyyyBoostVote = DYYYReadDouyinPlayState();
+        if (dyyyNpSawNonEmptySinceEmpty || dyyyBoostVote == 1) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[npv] Boost 不介入（%@）sawNonEmpty=%d vote=%ld",
+                           dyyyNpSawNonEmptySinceEmpty ? @"切视频：已填回非空信息" : @"仍在播放",
+                           (int)dyyyNpSawNonEmptySinceEmpty, (long)dyyyBoostVote]);
+            return;
+        }
+
         SEL resignSel = NSSelectorFromString(@"appWillResignActiveNotification");
         SEL updateSel = NSSelectorFromString(@"updateNowPlayingInfoWhenResiginActive");
         // 【v15.2】催发布前先从模块现读一份当前信息缓存。实测（16:04 会话）：抖音填充
@@ -1465,6 +1496,14 @@ static void DYYYBoostNowPlayingAfterPause(void) {
                 if (dyyyNpPublishedSinceBoost) {
                     DYYYSpeedDiag(@"[npv] Boost 确认：发布已落地 ✓");
                 }
+                return;
+            }
+            // 【v16 根治】补一轮同样是"往抖音模块灌退非活跃"，必须先排除切视频/在播。
+            // （这里的判断取代了原先只有最后"兜底单发"才做的门控，语义一致、位置前移。）
+            if (dyyyNpSawNonEmptySinceEmpty || DYYYReadDouyinPlayState() == 1) {
+                DYYYSpeedDiag([NSString stringWithFormat:@"[npv] Boost 补一轮不介入（%@）sawNonEmpty=%d",
+                               dyyyNpSawNonEmptySinceEmpty ? @"切视频：已填回非空信息" : @"仍在播放",
+                               (int)dyyyNpSawNonEmptySinceEmpty]);
                 return;
             }
             // ① 原生链再催一轮
@@ -1671,7 +1710,18 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
         DYYYSpeedDiag(@"[npv] 拦 setPlayingPlayer:nil");
         return;
     }
-
+    // 【v16 诊断】非 nil"上岗"同样记录（限流 0.5s）。缺了这条，就无法判断
+    // "nil 被我们吞掉之后，抖音的新播放器到底有没有接上来"，
+    // 也就无法证伪/证实"吞 nil 会不会掐断切下一条的接力"。
+    if (player) {
+        static NSTimeInterval dyyyLastSetPlayerLog = 0;
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if (now - dyyyLastSetPlayerLog > 0.5) {
+            dyyyLastSetPlayerLog = now;
+            DYYYSpeedDiag([NSString stringWithFormat:@"[npv] setPlayingPlayer=非nil(%@) st=%ld",
+                           NSStringFromClass([player class]), (long)DYYYAppStateRaw()]);
+        }
+    }
     %orig;
 }
 
@@ -1763,6 +1813,7 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
     BOOL isEmpty = (![info isKindOfClass:[NSDictionary class]] || [(NSDictionary *)info count] == 0);
     if (!isEmpty) {
         dyyyLastGoodCurrentNPInfo = info;   // 非空即刷新缓存（Boost 兜底单发用，v15.1）
+        dyyyNpSawNonEmptySinceEmpty = YES;  // 【v16】清空后又填回非空 = 切视频，不是暂停
     }
     // 【v11】抖音把"当前播放信息"清空 = 用户暂停了。它的发布链此刻还没跑（要等 resignActive），
     // 我们主动替它补一次，让卡片当场挂上 —— 不必等用户去拉控制中心。
