@@ -67,7 +67,25 @@ static void simulateTapOnEntryView(UIView *entryView) {
 //          只在「上次用过反向全屏」时才执行（普通「全屏观看」零额外动作）。
 
 // 精简诊断日志（DYYYSpeedDiag 在 DYYY.xm 里是 static，本编译单元看不到，故另写一份）
-static void DYYYFSDiag(NSString *msg) {
+// 【优化】与 DYYY.xm 的 DYYYSpeedDiag 同构处理：函数改名 Impl + 变参宏包一层，
+//   让开关关闭时【调用点】的 [NSString stringWithFormat:...] 也不求值
+//   （原先是函数，拼接发生在调用方，函数体内的开关判断挡不住）。
+static NSString *DYYYFSDiagDirectory(void) {
+    static NSString *dir = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DYYY"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil
+                                                        error:nil];
+    });
+    return dir;
+}
+
+static void DYYYFSDiagImpl(NSString *msg);
+#define DYYYFSDiag(...) do { if (DYYYGetBool(@"DYYYDiagLog")) DYYYFSDiagImpl(__VA_ARGS__); } while (0)
+static void DYYYFSDiagImpl(NSString *msg) {
     @try {
         if (!DYYYGetBool(@"DYYYDiagLog")) return;
         NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
@@ -76,9 +94,7 @@ static void DYYYFSDiag(NSString *msg) {
         dispatch_once(&once, ^{ q = dispatch_queue_create("com.dyyy.fsdiag", DISPATCH_QUEUE_SERIAL); });
         dispatch_async(q, ^{
             @try {
-                NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DYYY"];
-                [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-                NSString *path = [dir stringByAppendingPathComponent:@"speed_diag.log"];
+                NSString *path = [DYYYFSDiagDirectory() stringByAppendingPathComponent:@"speed_diag.log"];
                 NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
                 if (fh) {
                     [fh seekToEndOfFile];

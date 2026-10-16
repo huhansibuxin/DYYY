@@ -552,8 +552,32 @@ static double DYYYPreparedPlaybackSpeedForPlayer(id playerViewController) {
 // 门控：设置页"诊断日志"开关（DYYYDiagLog，默认开）——关掉后 DYYY 全部日志零输出：
 //   ① 本函数（speed_diag.log 文件行）；② 姊妹函数 DYYYFSDiag（DYYYLongPressPanel.xm，同一文件）；
 //   ③ 系统日志 NSLog —— 全部统一走 AwemeHeaders.h 的 DYYYLog 宏，同一开关。
-//   开关判断放在函数最前面 → 关闭时连字符串拼接都不做，零文件 IO、零开销。
-static void DYYYSpeedDiag(NSString *msg) {
+//   开关判断放在【宏】最前面 → 关闭时连调用点的 [NSString stringWithFormat:] 都不求值，
+//   零拼接、零文件 IO、零开销。
+// 【优化】v55~v58 里本接口是"函数"，而 41 处调用写在【调用方主线程】先
+//   [NSString stringWithFormat:...] 拼好字符串再传进来 ⇒ 函数体内的开关判断【挡不住拼接】，
+//   与上面"关闭时零开销"的承诺不符。现改为变参宏包一层：C 语义保证 if 为假时实参表达式
+//   不求值；宏同名（Impl 后缀区分），调用点一行都不用改。
+//   注意必须用 (...) + __VA_ARGS__：预处理器只跟踪圆括号，写成单参数宏的话
+//   `[NSString stringWithFormat:@"x", a, b]` 里方括号内的逗号会被误当成参数分隔符。
+// 【优化】日志目录解析 + 创建只做一次（原先每写一行都重新走一遍 NSFileManager）。
+// NSTemporaryDirectory() 在进程生命周期内稳定，缓存安全。
+static NSString *DYYYSpeedDiagDirectory(void) {
+    static NSString *dir = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DYYY"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil
+                                                        error:nil];
+    });
+    return dir;
+}
+
+static void DYYYSpeedDiagImpl(NSString *msg);
+#define DYYYSpeedDiag(...) do { if (DYYYGetBool(@"DYYYDiagLog")) DYYYSpeedDiagImpl(__VA_ARGS__); } while (0)
+static void DYYYSpeedDiagImpl(NSString *msg) {
     @try {
         if (!DYYYGetBool(@"DYYYDiagLog")) {
             return;
@@ -566,10 +590,7 @@ static void DYYYSpeedDiag(NSString *msg) {
         });
         dispatch_async(dyyyDiagWriteQueue, ^{
             @try {
-                NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DYYY"];
-                NSFileManager *fm = [NSFileManager defaultManager];
-                [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-                NSString *path = [dir stringByAppendingPathComponent:@"speed_diag.log"];
+                NSString *path = [DYYYSpeedDiagDirectory() stringByAppendingPathComponent:@"speed_diag.log"];
                 NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
                 if (fh) {
                     [fh seekToEndOfFile];
@@ -600,6 +621,12 @@ static void DYYYApplyPreparedPlaybackSpeedToPlayer(id playerViewController);
 static __weak UIViewController *dyyyCurrentPlayerVC = nil;
 
 static void DYYYRememberCurrentPlayerVC(id vc) {
+    // 【优化】__weak 赋值 = objc_storeWeak = 全局弱引用表加锁 + 哈希查找，而本函数挂在
+    // 抖音起播流上、被高频调用。绝大多数情况"当前 VC"并没有变 ⇒ 先读比较（同对象直接返回），
+    // 省掉这次数以万计的原子写。注意比较的读也要走弱表，但读远轻于写。
+    if (dyyyCurrentPlayerVC == vc) {
+        return;
+    }
     if ([vc isKindOfClass:[UIViewController class]]) {
         dyyyCurrentPlayerVC = (UIViewController *)vc;
     }
@@ -927,9 +954,10 @@ static void DYYYApplyPreparedPlaybackSpeedToPlayer(id playerViewController) {
     // 本函数被抖音起播流（setIsAutoPlay: / prepareForDisplay）频繁调到，缓存在这里永远新鲜。
     DYYYRememberCurrentPlayerVC(playerViewController);
 
-    static BOOL dyyySpeedDiagOnce = NO;
-    if (!dyyySpeedDiagOnce) {
-        dyyySpeedDiagOnce = YES;
+    // 【优化】原先用 `static BOOL + if` 做一次性：非线程安全，两个线程同时首入会把
+    // DYYYProbeEngineSpeedEntry 跑两遍（重复 MSHookFunction 会叠加 trampoline）。改 dispatch_once。
+    static dispatch_once_t dyyySpeedDiagOnceToken;
+    dispatch_once(&dyyySpeedDiagOnceToken, ^{
         DYYYSpeedDiag([NSString stringWithFormat:@"[diag] nativeSpeedClass=%d merge=%d avplayer=%d target=%.3f",
             NSClassFromString(@"AWEDPlayerSpeedController") != nil,
             NSClassFromString(@"AWEDPlayerViewController_Merge") != nil,
@@ -952,7 +980,7 @@ static void DYYYApplyPreparedPlaybackSpeedToPlayer(id playerViewController) {
             }];
             DYYYSpeedDiag(@"[speed-guard] 前后台复核观察者已装（DidBecomeActive）");
         }
-    }
+    });
 
     double speed = DYYYPreparedPlaybackSpeedForPlayer(playerViewController);
     DYYYSpeedDiag([NSString stringWithFormat:@"[speed-apply] %@ speed=%.3f lp=%d lock=%d", NSStringFromClass([playerViewController class]), speed, dyyyLongPressFastSpeedActive, dyyyLongPressLockedSpeedActive]);
@@ -1407,7 +1435,15 @@ static NSInteger DYYYCurrentNowPlayingInfoCount(void) {
 // 用运行时取值（NSClassFromString + objc_msgSend），避免 [UIApplication sharedApplication]
 // 静态发消息带来的 _OBJC_CLASS_$_UIApplication 链接依赖（本工程未链接 MediaPlayer 的教训）。
 static NSInteger DYYYAppStateRaw(void) {
-    Class cls = NSClassFromString(@"UIApplication");
+    // 【优化】NSClassFromString 每次都要走"字符串→类"的带锁查找，而本函数是高频调用点
+    //（setPlayingPlayer:/setNowPlayingInfo: hook 每次调 1~2 次、Boost 每次调）。
+    // UIApplication 在进程生命周期内绝不会卸载，dispatch_once 缓存后后续调用零查找开销。
+    static Class dyyyUIApplicationClass = nil;
+    static dispatch_once_t dyyyUIAppOnce;
+    dispatch_once(&dyyyUIAppOnce, ^{
+        dyyyUIApplicationClass = NSClassFromString(@"UIApplication");
+    });
+    Class cls = dyyyUIApplicationClass;
     if (!cls) {
         return 0;
     }
