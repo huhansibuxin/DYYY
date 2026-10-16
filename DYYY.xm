@@ -760,15 +760,20 @@ static void DYYYProbeEngineSpeedEntry(void) {
             @"TTVideoEngineOwnPlayer",
             @"AWEDPlayerViewController_Merge"
         ];
+        // 【v57 加固①】沿 superclass 链逐层扫。
+        // class_copyMethodList() 只列【本类自己】定义的方法 —— 若速率 setter 定义在父类上，
+        // 原实现永远扫不到 → 该 setter 漏钩 → 它设的 1.0 会真的生效（1.5 掉一帧）。
+        // 去重按 Method 指针：子类未 override 时 class_getInstanceMethod 返回的就是父类 Method，
+        // 同一个 Method 二次 MSHookFunction 会把 orig 串成嵌套 trampoline，必须去重。
+        NSMutableSet<NSValue *> *dyyyHookedMethods = [NSMutableSet set];
         for (NSString *clsName in classNames) {
             Class cls = NSClassFromString(clsName);
             if (!cls) {
                 continue;
             }
+            for (Class dyyyCls = cls; dyyyCls && dyyyCls != [NSObject class]; dyyyCls = class_getSuperclass(dyyyCls)) {
             unsigned int count = 0;
-            Method *methods = class_copyMethodList(cls, &count);
-            //（方法清单 dump 探针已删：诊断使命完成——结论已固化在下方白名单注释里，
-            //  每次启动扫 5 个类 2300+ 方法拼日志纯属浪费）
+            Method *methods = class_copyMethodList(dyyyCls, &count);
             if (!methods) {
                 continue;
             }
@@ -778,6 +783,7 @@ static void DYYYProbeEngineSpeedEntry(void) {
                 NSString *name = NSStringFromSelector(s);
                 NSString *lower = name.lowercaseString;
                 unsigned int nargs = method_getNumberOfArguments(m);
+                NSValue *dyyyMethodKey = [NSValue valueWithPointer:m];
 
                 // ① 速率 setter 白名单：只钳这三个真实速率入口（探针实证），
                 //    严禁用 containsString("speed") 泛匹配——setSpeedModeStartNewTimestamp:
@@ -787,6 +793,9 @@ static void DYYYProbeEngineSpeedEntry(void) {
                     ([lower isEqualToString:@"setplaybackspeed:"] ||
                      [lower isEqualToString:@"setplayerplaybackspeed:"] ||
                      [lower isEqualToString:@"setplaybackrate:"])) {
+                    if ([dyyyHookedMethods containsObject:dyyyMethodKey]) {
+                        continue;
+                    }
                     char *argType = method_copyArgumentType(m, 2);
                     char arg0 = argType ? argType[0] : 0;
                     if (argType) {
@@ -795,18 +804,22 @@ static void DYYYProbeEngineSpeedEntry(void) {
                     if (arg0 != 'f' && arg0 != 'd') {
                         continue; // 参数非浮点（BOOL/int/对象）一律不碰
                     }
+                    [dyyyHookedMethods addObject:dyyyMethodKey];
                     BOOL isFloat = arg0 == 'f';
                     DYYYEngineSpeedHookEntry entry = {s, NULL, NULL};
                     if (isFloat) {
-                        MSHookMessageEx(cls, s, (IMP)dyyyEngineSetSpeedThunkF, &entry.origF);
+                        MSHookMessageEx(dyyyCls, s, (IMP)dyyyEngineSetSpeedThunkF, &entry.origF);
                     } else {
-                        MSHookMessageEx(cls, s, (IMP)dyyyEngineSetSpeedThunkD, &entry.origD);
+                        MSHookMessageEx(dyyyCls, s, (IMP)dyyyEngineSetSpeedThunkD, &entry.origD);
                     }
                     dyyyEngineSpeedSetHooks[dyyyEngineSpeedSetHookCount++] = entry;
-                    DYYYSpeedDiag([NSString stringWithFormat:@"[probe] 钳 %@ %@ (%s)", clsName, name, isFloat ? "float" : "double"]);
+                    DYYYSpeedDiag([NSString stringWithFormat:@"[probe] 钳 %@ %@ (%s)", NSStringFromClass(dyyyCls), name, isFloat ? "float" : "double"]);
                 }
                 // ② 速率变化回调：事件驱动兜底（参数含 f/d 才钩）
                 else if ([lower containsString:@"didchangeplaybackrate"] && nargs == 4 && dyyyEngineRateChangedHookCount < 4) {
+                    if ([dyyyHookedMethods containsObject:dyyyMethodKey]) {
+                        continue;
+                    }
                     char *argType = method_copyArgumentType(m, 3); // 0=self 1=_cmd 2=player 3=rate
                     BOOL isFloat = argType && argType[0] == 'f';
                     BOOL isDouble = argType && argType[0] == 'd';
@@ -816,19 +829,23 @@ static void DYYYProbeEngineSpeedEntry(void) {
                     if (!isFloat && !isDouble) {
                         continue;
                     }
+                    [dyyyHookedMethods addObject:dyyyMethodKey];
                     DYYYEngineSpeedHookEntry entry = {s, NULL, NULL};
                     if (isFloat) {
-                        MSHookMessageEx(cls, s, (IMP)dyyyEngineRateChangedThunkF, &entry.origF);
+                        MSHookMessageEx(dyyyCls, s, (IMP)dyyyEngineRateChangedThunkF, &entry.origF);
                     } else {
-                        MSHookMessageEx(cls, s, (IMP)dyyyEngineRateChangedThunkD, &entry.origD);
+                        MSHookMessageEx(dyyyCls, s, (IMP)dyyyEngineRateChangedThunkD, &entry.origD);
                     }
                     dyyyEngineRateChangedHooks[dyyyEngineRateChangedHookCount++] = entry;
-                    DYYYSpeedDiag([NSString stringWithFormat:@"[probe] 监变化 %@ %@", clsName, name]);
+                    DYYYSpeedDiag([NSString stringWithFormat:@"[probe] 监变化 %@ %@", NSStringFromClass(dyyyCls), name]);
                 }
                 // ③ 速率 getter 白名单：只看真实播放速率，避免网络速率等统计量刷屏
                 else if (nargs == 2 && dyyyEngineSpeedGetHookCount < 8 &&
                          ([lower isEqualToString:@"playbackspeed"] || [lower isEqualToString:@"getplayspeed"] ||
                           [lower isEqualToString:@"currentrate"] || [lower isEqualToString:@"playbackrate"])) {
+                    if ([dyyyHookedMethods containsObject:dyyyMethodKey]) {
+                        continue;
+                    }
                     char *retType = method_copyReturnType(m);
                     char ret0 = retType ? retType[0] : 0;
                     if (retType) {
@@ -837,85 +854,26 @@ static void DYYYProbeEngineSpeedEntry(void) {
                     if (ret0 != 'f' && ret0 != 'd') {
                         continue;
                     }
+                    [dyyyHookedMethods addObject:dyyyMethodKey];
                     DYYYEngineSpeedHookEntry entry = {s, NULL, NULL};
                     if (ret0 == 'f') {
-                        MSHookMessageEx(cls, s, (IMP)dyyyEngineGetSpeedThunkF, &entry.origF);
+                        MSHookMessageEx(dyyyCls, s, (IMP)dyyyEngineGetSpeedThunkF, &entry.origF);
                     } else {
-                        MSHookMessageEx(cls, s, (IMP)dyyyEngineGetSpeedThunkD, &entry.origD);
+                        MSHookMessageEx(dyyyCls, s, (IMP)dyyyEngineGetSpeedThunkD, &entry.origD);
                     }
                     dyyyEngineSpeedGetHooks[dyyyEngineSpeedGetHookCount++] = entry;
-                    DYYYSpeedDiag([NSString stringWithFormat:@"[probe] 监 %@ %@ (%s)", clsName, name, ret0 == 'f' ? "float" : "double"]);
+                    DYYYSpeedDiag([NSString stringWithFormat:@"[probe] 监 %@ %@ (%s)", NSStringFromClass(dyyyCls), name, ret0 == 'f' ? "float" : "double"]);
                 }
             }
             free(methods);
+            }
         }
     } @catch (__unused NSException *e) {
         DYYYSpeedDiag(@"[probe] exception");
     }
 }
 
-// 收集「所有窗口」（全部 scene + shareApplication.windows，指针去重）。
-// 为什么不能只用 [DYYYUtils getActiveWindow]：横屏全屏页有自己的一层 window 层级
-// （AWEMaskWindow / 独立 scene window），只取"活动窗口"时横屏那棵树根本不在遍历范围里。
-static NSArray<UIWindow *> *DYYYSpeedAllWindows(void) {
-    NSMutableArray<UIWindow *> *wins = [NSMutableArray array];
-    NSMutableSet *seen = [NSMutableSet set];
-    void (^add)(UIWindow *) = ^(UIWindow *w) {
-        if (!w || [seen containsObject:w]) {
-            return;
-        }
-        [seen addObject:w];
-        [wins addObject:w];
-    };
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if ([scene isKindOfClass:[UIWindowScene class]]) {
-            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-                add(w);
-            }
-        }
-    }
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        add(w);
-    }
-    return wins;
-}
-
-// 收集所有窗口下的全部 VC：childViewControllers **和** presentedViewController 双向都走（指针去重防环）。
-// ⚠️ 旧路径只从「活动窗口 root」沿 presented 上溯到最上层，再用 findViewControllersInHierarchy
-//    只往下走 childViewControllers —— 结果是「presented 链的下半层」（竖屏 feed 的播放器）永远遍历不到，
-//    而横屏页正是 present 在最上层的那一层，两层都覆盖不全。
-static NSArray<UIViewController *> *DYYYSpeedAllViewControllers(void) {
-    NSMutableArray<UIViewController *> *out = [NSMutableArray array];
-    NSMutableSet *visited = [NSMutableSet set];
-    __block void (^walk)(UIViewController *) = nil;
-    walk = ^(UIViewController *vc) {
-        if (!vc || [visited containsObject:vc]) {
-            return;
-        }
-        [visited addObject:vc];
-        [out addObject:vc];
-        for (UIViewController *child in vc.childViewControllers) {
-            walk(child);
-        }
-        walk(vc.presentedViewController);
-    };
-    for (UIWindow *w in DYYYSpeedAllWindows()) {
-        walk(w.rootViewController);
-    }
-    return out;
-}
-
-// 进全屏/横屏时，把目标倍速重新焊到【所有能找到的播放器 VC】上（幂等）。
-//
-// 修复记录（2026-10-16：横屏入口恒为 `players=()` handle=0）——两个原因叠加：
-//   ① 窗口/遍历范围不足：只取 activeWindow，且只沿 presented 上溯、只往下走 childViewControllers；
-//   ② 候选硬编码 3 个类名（AWEAwemePlayVideoViewController / AWEDPlayerFeedPlayerViewController /
-//      AWEDPlayerViewController_Merge），而横屏那一族是 AWELandscape*，名字对不上 → 必然 0 条。
-// 现改为：
-//   · 全窗口全树遍历（DYYYSpeedAllWindows / DYYYSpeedAllViewControllers）；
-//   · 候选 = 白名单 3 类 ∪「任何响应 setVideoControllerPlaybackRate: 的 VC」——
-//     后者是抖音自己用来判定"我是播放器"的方法，**不依赖类名**，横竖屏、跨版本通吃；
-//   · 命中的按可见性排序取前 4 个全部施速（幂等），来源与命中方式写进日志便于核验。
+// 进全屏/横屏时，按已知三个播放器类在视图层级里找当前播放器并把默认倍速重新焊上（幂等）
 static void DYYYReapplySpeedToCurrentPlayer(NSString *context) {
     if (!DYYYShouldHandleSpeedFeatures()) {
         return;
@@ -926,46 +884,21 @@ static void DYYYReapplySpeedToCurrentPlayer(NSString *context) {
         return;
     }
     dyyyReapplyingSpeed = YES;
-
-    NSArray<UIWindow *> *wins = DYYYSpeedAllWindows();
-    NSArray<UIViewController *> *allVCs = DYYYSpeedAllViewControllers();
-    Class cPlayVideo = NSClassFromString(@"AWEAwemePlayVideoViewController");
-    Class cFeedPlayer = NSClassFromString(@"AWEDPlayerFeedPlayerViewController");
-    Class cMerge = NSClassFromString(@"AWEDPlayerViewController_Merge");
-
-    NSMutableArray<NSArray *> *cands = [NSMutableArray array];   // @[可见性分, VC, 标签]
-    for (UIViewController *vc in allVCs) {
-        BOOL listed = (cPlayVideo && [vc isKindOfClass:cPlayVideo]) ||
-                      (cFeedPlayer && [vc isKindOfClass:cFeedPlayer]) ||
-                      (cMerge && [vc isKindOfClass:cMerge]);
-        BOOL canSetRate = [vc respondsToSelector:@selector(setVideoControllerPlaybackRate:)];
-        if (!listed && !canSetRate) {
-            continue;
-        }
-        CGFloat vis = DYYYViewControllerVisibilityScore(vc);
-        NSString *label = [NSString stringWithFormat:@"%@(%@ vis=%.0f)", NSStringFromClass([vc class]),
-                           listed ? (canSetRate ? @"白名单+可设速率" : @"白名单") : @"可设速率", vis];
-        [cands addObject:@[@(vis), vc, label]];
+    UIWindow *win = [DYYYUtils getActiveWindow];
+    UIViewController *root = win.rootViewController;
+    while (root && root.presentedViewController) {
+        root = root.presentedViewController;
     }
-    [cands sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
-        return [(NSNumber *)b[0] compare:(NSNumber *)a[0]];   // 可见性降序
-    }];
-
-    NSUInteger applied = 0;
-    NSMutableArray<NSString *> *labels = [NSMutableArray array];
-    for (NSArray *item in cands) {
-        [labels addObject:(NSString *)item[2]];
-        if (applied >= 4) {   // 上限 4：正常场景只有 1~3 个，防止极端情况下刷屏
-            continue;
+    NSMutableArray *found = [NSMutableArray array];
+    for (UIViewController *vc in (root ? findViewControllersInHierarchy(root) : @[])) {
+        if ([vc isKindOfClass:NSClassFromString(@"AWEAwemePlayVideoViewController")] ||
+            [vc isKindOfClass:NSClassFromString(@"AWEDPlayerFeedPlayerViewController")] ||
+            [vc isKindOfClass:NSClassFromString(@"AWEDPlayerViewController_Merge")]) {
+            [found addObject:NSStringFromClass([vc class])];
+            DYYYApplyPreparedPlaybackSpeedToPlayer(vc);
         }
-        DYYYApplyPreparedPlaybackSpeedToPlayer(item[1]);
-        applied++;
     }
-    DYYYSpeedDiag([NSString stringWithFormat:@"[reapply:%@] wins=%lu vcs=%lu 候选=%lu %@ 施速=%lu",
-                   context, (unsigned long)wins.count, (unsigned long)allVCs.count,
-                   (unsigned long)cands.count,
-                   labels.count ? [labels componentsJoinedByString:@", "] : @"（无）",
-                   (unsigned long)applied]);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[reapply:%@] players=%@ handle=%d", context, found, (int)found.count]);
     dyyyReapplyingSpeed = NO;
 }
 
@@ -984,6 +917,21 @@ static void DYYYApplyPreparedPlaybackSpeedToPlayer(id playerViewController) {
             DYYYConfiguredPlaybackSpeed()]);
         // 引擎层探针：dump 速率相关方法 + 安装 TTVideoEngine.setPlaybackSpeed: 钳制（仅一次）
         DYYYProbeEngineSpeedEntry();
+
+        // 【v57 加固③】前后台复核（仅装一次，事件驱动、零轮询）：
+        // 切出去再回来时，抖音可能按"重新起播"把速率重置回 1.0；激活通知本身不保证落在主线程，
+        // 所以 queue 指定主队列。reapply 是幂等的，重复施速无害。
+        static id dyyySpeedBecomeActiveToken = nil;
+        if (!dyyySpeedBecomeActiveToken) {
+            dyyySpeedBecomeActiveToken = [[NSNotificationCenter defaultCenter]
+                addObserverForName:UIApplicationDidBecomeActiveNotification
+                            object:nil
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(__unused NSNotification *note) {
+                DYYYReapplySpeedToCurrentPlayer(@"foreground");
+            }];
+            DYYYSpeedDiag(@"[speed-guard] 前后台复核观察者已装（DidBecomeActive）");
+        }
     }
 
     double speed = DYYYPreparedPlaybackSpeedForPlayer(playerViewController);
@@ -1847,6 +1795,19 @@ static void DYYYDeclarePlaybackState(NSInteger state) {
             dyyyLastSetPlayerLog = now;
             DYYYSpeedDiag([NSString stringWithFormat:@"[npv] setPlayingPlayer=非nil(%@) st=%ld",
                            NSStringFromClass([player class]), (long)DYYYAppStateRaw()]);
+        }
+        // 【v57 加固②】新播放器此刻"上岗" = 「每个视频都 1.5」最精准的时机：
+        //   比 viewDidAppear 早，比 didChangePlaybackRate 更贴近起播，而且【完全不依赖 VC 树】
+        //   ——实测证明横屏里根本找不到独立播放器 VC（候选恒 vis=-1），VC 树这条路是空集。
+        // DYYYApplySpeedToObject 内部按 respondsToSelector 依次试
+        //   setPlayerPlaybackSpeed: > setPlaybackSpeed: > setPlaybackRate:，
+        //   并自动适配 float/double 编码；三条都不响应时直接 return，绝不误伤。
+        // 0.3s 限流：setPlayingPlayer: 在交接链里可能连着来好几次，幂等但也别刷日志。
+        static NSTimeInterval dyyyLastSetPlayerSpeed = 0;
+        if (now - dyyyLastSetPlayerSpeed > 0.3 &&
+            DYYYShouldHandleSpeedFeatures() && !dyyyLongPressFastSpeedActive && !dyyyLongPressLockedSpeedActive) {
+            dyyyLastSetPlayerSpeed = now;
+            DYYYApplySpeedToObject(player, DYYYConfiguredPlaybackSpeed());
         }
     }
     %orig;
@@ -4046,13 +4007,10 @@ static BOOL dyyyTagVolumeFromDYYYGesture = NO;
 
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
+    // v57：删掉 v56 的 0.35s 延迟重扫 —— 实测证明横屏里根本找不到独立播放器 VC
+    //（候选恒为 vis=-1 的白名单类），延迟重扫只是白跑一轮遍历；横屏的 1.5 由
+    // 引擎层 setter 钳制 + 起播时刻复核保证，与此处无关。
     DYYYReapplySpeedToCurrentPlayer(@"landscape");
-    // 补一次延迟重扫：viewDidAppear 时刻横屏的播放器 VC 可能还没挂进层级，
-    // 重扫用同一份"全窗口全树 + 可设速率"判据，幂等（重复施速无害）。
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        DYYYReapplySpeedToCurrentPlayer(@"landscape+0.35s");
-    });
 }
 %end
 
