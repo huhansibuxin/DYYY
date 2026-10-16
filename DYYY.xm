@@ -589,6 +589,23 @@ static void DYYYSpeedDiag(NSString *msg) {
 // 前向声明（定义在下方）：避免全屏/横屏重焊函数反向引用未声明
 static void DYYYApplyPreparedPlaybackSpeedToPlayer(id playerViewController);
 
+// 【v58】"当前播放器 VC"精确引用（weak，防悬挂）。
+// 为什么需要它：reapply 过去靠"遍历窗口找白名单类"，实测横屏/前台场景常得
+//   `[reapply:xxx] players=() handle=0` —— 纯粹空转（这条兜底一次都没焊上过东西）。
+// 而抖音每次起播 / 恢复播放都会自己走到
+//   AWEAwemePlayVideoViewController / AWEDPlayerFeedPlayerViewController /
+//   AWEDPlayerViewController_Merge 的 setIsAutoPlay: / prepareForDisplay，
+// 我们也在同一处施速 ⇒ 那一刻的 self 就是"真正在播的那个"。
+// 把它记下来，reapply 就能一次到位；__weak 让 VC 释放后自动置 nil，绝不会拿到野指针。
+static __weak UIViewController *dyyyCurrentPlayerVC = nil;
+
+static void DYYYRememberCurrentPlayerVC(id vc) {
+    if ([vc isKindOfClass:[UIViewController class]]) {
+        dyyyCurrentPlayerVC = (UIViewController *)vc;
+    }
+}
+
+
 // ===== 37.5 倍速引擎层探针 + 钳制 =====
 // 实证链：AVPlayer.setRate: 0 次调用、原生 setPlaybackRate: 无重置、setVideoControllerPlaybackRate:
 // 是空操作；af034f3 已证实 TTVideoEngine.setPlaybackSpeed: 是真实入口之一（req=1.000 重置
@@ -884,21 +901,20 @@ static void DYYYReapplySpeedToCurrentPlayer(NSString *context) {
         return;
     }
     dyyyReapplyingSpeed = YES;
-    UIWindow *win = [DYYYUtils getActiveWindow];
-    UIViewController *root = win.rootViewController;
-    while (root && root.presentedViewController) {
-        root = root.presentedViewController;
+
+    // 【v58】精确命中，不再盲遍历。
+    // v56 曾是"全窗口全树遍历 + 能力探针"，v57 回退成"活动窗口 presented 上溯"，
+    // 两者实测都常得 `players=() handle=0`（空转，一次也没焊上东西）——遍历这条路是空集。
+    // 现在直接用 dyyyCurrentPlayerVC：它由 setIsAutoPlay: / prepareForDisplay 里
+    // 抖音自己的起播流程（我们已挂在那里施速）实时写入，拿到的就是"真正在播的那个 VC"。
+    UIViewController *hot = dyyyCurrentPlayerVC;
+    if (hot && hot.isViewLoaded) {
+        DYYYApplyPreparedPlaybackSpeedToPlayer(hot);
+        DYYYSpeedDiag([NSString stringWithFormat:@"[reapply:%@] 精确命中 %@（缓存）", context, NSStringFromClass([hot class])]);
+    } else {
+        // 缓存失效（VC 尚未起播过 / 已被释放）——明确记一笔，不再假遍历冒充实命中。
+        DYYYSpeedDiag([NSString stringWithFormat:@"[reapply:%@] 无缓存目标（尚未捕获到播放器 VC）", context]);
     }
-    NSMutableArray *found = [NSMutableArray array];
-    for (UIViewController *vc in (root ? findViewControllersInHierarchy(root) : @[])) {
-        if ([vc isKindOfClass:NSClassFromString(@"AWEAwemePlayVideoViewController")] ||
-            [vc isKindOfClass:NSClassFromString(@"AWEDPlayerFeedPlayerViewController")] ||
-            [vc isKindOfClass:NSClassFromString(@"AWEDPlayerViewController_Merge")]) {
-            [found addObject:NSStringFromClass([vc class])];
-            DYYYApplyPreparedPlaybackSpeedToPlayer(vc);
-        }
-    }
-    DYYYSpeedDiag([NSString stringWithFormat:@"[reapply:%@] players=%@ handle=%d", context, found, (int)found.count]);
     dyyyReapplyingSpeed = NO;
 }
 
@@ -906,6 +922,10 @@ static void DYYYApplyPreparedPlaybackSpeedToPlayer(id playerViewController) {
     if (!DYYYShouldHandleSpeedFeatures() || !playerViewController || dyyyLongPressFastSpeedActive || dyyyLongPressLockedSpeedActive) {
         return;
     }
+
+    // 【v58】记下"真正在播的那个 VC"，供 reapply 精确命中（见 dyyyCurrentPlayerVC 的注释）。
+    // 本函数被抖音起播流（setIsAutoPlay: / prepareForDisplay）频繁调到，缓存在这里永远新鲜。
+    DYYYRememberCurrentPlayerVC(playerViewController);
 
     static BOOL dyyySpeedDiagOnce = NO;
     if (!dyyySpeedDiagOnce) {
@@ -1475,6 +1495,26 @@ static void DYYYBoostNowPlayingAfterPause(void) {
         return;
     }
     lastBoost = now;
+
+    // ===== 【v58 根治】前台一律不 Boost（老板 2026-10-16 拍板）=====
+    // 缺陷根因（实机日志 + 代码对锁，2026-10-16 16:28/16:34 两轮）：
+    //   切视频瞬间抖音的状态机会短暂进入【交接态】—— 旧播放器已下岗、新的还没起 ——
+    //   此时 backgroundIsPlaying=NO + canPlayForRemoteControl=YES
+    //   ⇒ DYYYReadDouyinPlayState() 算出 score<=-2 ⇒ 返回 2（"暂停"）。
+    //   同一瞬间 store 也被清空（`模块 store 为空(cnt=0)`）⇒ 观察窗的 sawNonEmpty 也是 0。
+    //   于是 v16 的两道门控【一个都不满足】：`sawNonEmpty || vote == 1` 双双为假
+    //   ⇒ 这个"切视频交接态"被当成"真暂停" ⇒ 我们主动往抖音模块灌 appWillResignActiveNotification。
+    //   而抖音收到 resignActive 会走【重新激活】路径 ⇒ 实机表现正是老板描述的
+    //   「不自动切下一条，而是【当前视频从头重播】」。
+    // 为什么不能用"双窗口确认"救：前台真暂停与切条交接在信号层【完全同形】（vote 都是 2、
+    //   store 都被清空），任何基于单点/短窗的判据都是在赌，赌输就是重播本条。
+    // 决策：前台根本不介入 —— 后台才是本功能的主战场（后台暂停/锁屏时接管卡片）。
+    //   代价：前台点暂停后卡片不再立即挂到控制中心（拉一下控制中心即可，抖音自己的链会跑）。
+    if (DYYYAppStateRaw() == 0) {
+        DYYYSpeedDiag(@"[npv] Boost 跳过（前台：严防把「切视频交接态」误判为暂停后重播本条）");
+        return;
+    }
+
     dyyyNpPublishedSinceBoost = NO;
     dyyyNpSawNonEmptySinceEmpty = NO;   // 【v16】开观察窗：0.25s 内若抖音填回非空信息 = 切视频
     DYYYSpeedDiag(@"[npv] Boost 触发(暂停检测)");
