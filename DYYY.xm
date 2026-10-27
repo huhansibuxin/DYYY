@@ -1054,6 +1054,10 @@ static void DYYYEndLockedLongPressSpeedAndRestoreIfNeeded(void) {
     DYYYScheduleConfiguredPlaybackSpeedRestore();
 }
 
+// 前置声明：这两个的真身定义在文件后段（[eov]/AutoPlay 区块），这里先用
+static UIInterfaceOrientation DYYYDiagInterfaceOrientation(void);
+extern BOOL gDYYYFSReverseActive;
+
 static void DYYYHandleCurrentSpeedAwemeChanged(id aweme) {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -1066,6 +1070,26 @@ static void DYYYHandleCurrentSpeedAwemeChanged(id aweme) {
     if (awemeClass && [aweme isKindOfClass:awemeClass]) {
         dyyyCurrentSpeedAweme = (AWEAwemeModel *)aweme;
     }
+
+    // ===== 【v68】重播探针 =====
+    // 老板实机：竖屏自动下一条【一直正常】，只有【反向横屏】偶尔会反复播同一条。
+    // 所以判据不能看"起播次数有没有涨"（重播也会涨），只能看【视频 ID 变没变】。
+    // 这条日志就是"重播"这件事的直接证据：同一 ID 连续两次起播 = 重播本条。
+    {
+        static NSString *sLastPlayedIdentifier = nil;
+        NSString *nowIdentifier = DYYYSpeedAwemeIdentifier(dyyyCurrentSpeedAweme);
+        if (nowIdentifier.length > 0) {
+            BOOL replay = (sLastPlayedIdentifier != nil &&
+                           [nowIdentifier isEqualToString:sLastPlayedIdentifier]);
+            DYYYSpeedDiag([NSString stringWithFormat:@"[ap] 起播 id=%@ %@ cur=%ld rev=%d",
+                           nowIdentifier,
+                           (replay ? @"★同一视频再次起播（重播本条）" : @"（新视频）"),
+                           (long)DYYYDiagInterfaceOrientation(),
+                           (int)gDYYYFSReverseActive]);
+            sLastPlayedIdentifier = nowIdentifier;
+        }
+    }
+
     if (!DYYYShouldHandleSpeedFeatures()) {
         return;
     }
@@ -4204,15 +4228,36 @@ static BOOL dyyyAPShouldNextThunk(id self, SEL _cmd) {
     return ret;
 }
 
+// v68：本 thunk 现在【真的会被装上去】（v67 只读扫描确认了它的真实归属类 + 签名 B/3）。
+// 归属类（v67 实机日志）：
+//   AFDPureModePagePlaybackController                 -> B/3   ✓ ObjC，真实实现
+//   AWEFeedPlayControlImpl.PureModePageCellViewController -> B/3   ✓ Swift，真实实现
+//   另一个 AWEBasicModePlayInteractionViewController 上是 @/2，是 block 属性 getter，不是业务方法，不钩。
+// ⚠️ 线程安全：本方法可能在播放引擎线程被调用。非主线程时【绝不读 UIKit】
+//   （DYYYAPIsReverseLandscape 会走 getActiveWindow），只原样转发 + 记一条日志。
 static BOOL dyyyAPCanNextThunk(id self, SEL _cmd, id aweme) {
-    BOOL ret = NO;
     IMP orig = DYYYAPOrigFor(self, 1);
-    if (orig) {
-        ret = ((DYYYAPBool1IMP)orig)(self, _cmd, aweme);
+    BOOL ret = orig ? ((DYYYAPBool1IMP)orig)(self, _cmd, aweme) : NO;
+
+    BOOL main = [NSThread isMainThread];
+    if (!main) {
+        // 子线程：只留痕，不干预（参数里 aweme 也只打印指针，避免在子线程读模型属性）
+        if (DYYYAPThrottle(8, 1.0)) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[ap] canAutoPlayNextAweme:=%d 子线程(不干预) cls=%@",
+                           (int)ret, NSStringFromClass([self class])]);
+        }
+        return ret;
     }
-    if (DYYYAPThrottle(1, 1.0)) {
+
+    BOOL revLand = DYYYAPIsReverseLandscape();
+    if (DYYYAPThrottle(1, 0.5)) {
         DYYYSpeedDiag([NSString stringWithFormat:@"[ap] canAutoPlayNextAweme:=%d revLand=%d cls=%@",
-                       (int)ret, (int)DYYYAPIsReverseLandscape(), NSStringFromClass([self class])]);
+                       (int)ret, (int)revLand, NSStringFromClass([self class])]);
+    }
+    if (!ret && revLand) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[ap] ★canAutoPlayNextAweme 原=NO → 强制 YES（反向横屏）cls=%@",
+                       NSStringFromClass([self class])]);
+        return YES;
     }
     return ret;
 }
@@ -4273,6 +4318,119 @@ static void dyyyAPPlayerFinishThunk(id self, SEL _cmd, id player, id err) {
     IMP orig = DYYYAPOrigFor(self, 6);
     if (orig) {
         ((DYYYAPVoid2IMP)orig)(self, _cmd, player, err);
+    }
+}
+
+// ===== 【v68】在 v67 只读扫描拿到的真实归属类上做精准 hook =====
+// v67 实机日志（speed_diag.v67.run1.log，全类 182912 / 候选 6282 / 后台 479~1049ms）：
+//   canAutoPlayNextAweme: -> AFDPureModePagePlaybackController[B/3]
+//                            AWEFeedPlayControlImpl.PureModePageCellViewController[B/3]
+//                            AWEBasicModePlayInteractionViewController[@/2]   ← block 属性 getter，不是业务方法
+//   shouldAutoPlayNext / autoPlayNext / startAutoPlay / didFinishPlaying
+//       全部只命中 AWEBasicModePlayInteractionViewController[@/2] ——
+//       返回对象、参数只有 self/_cmd，说明这些名字在抖音里是【block 属性/getter】，
+//       不是真实业务方法，钩它们毫无意义（v66 那轮白烧的根源也在这）。
+// 所以本版只钩 canAutoPlayNextAweme:，且只钩这两个签名确认为 B/3 的真实实现类。
+#define DYYY_AP_CANNEXT_SEL "canAutoPlayNextAweme:"
+
+static void DYYYAPDumpMethodsForClass(Class cls) {
+    if (!cls) {
+        return;
+    }
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    if (!methods) {
+        return;
+    }
+    static const char *keys[] = {"next", "Next", "auto", "Auto", "finish", "Finish",
+                                 "play", "Play", "scroll", "Scroll", "advance", "Advance",
+                                 "end", "End"};
+    NSMutableArray<NSString *> *keep = [NSMutableArray array];
+    for (unsigned int i = 0; i < count && keep.count < 40; i++) {
+        const char *n = sel_getName(method_getName(methods[i]));
+        if (!n) {
+            continue;
+        }
+        for (int k = 0; k < (int)(sizeof(keys) / sizeof(keys[0])); k++) {
+            if (strstr(n, keys[k])) {
+                [keep addObject:[NSString stringWithUTF8String:n]];
+                break;
+            }
+        }
+    }
+    unsigned int total = count;
+    free(methods);
+
+    // 一行别太长（日志是整行写盘的），每 12 个一条
+    for (NSUInteger start = 0; start < keep.count || start == 0; start += 12) {
+        NSUInteger len = MIN((NSUInteger)12, keep.count - start);
+        NSString *chunk = len ? [[keep subarrayWithRange:NSMakeRange(start, len)]
+                                    componentsJoinedByString:@" | "] : @"（无匹配）";
+        DYYYSpeedDiag([NSString stringWithFormat:@"[ap] dump %s 自身方法=%u 关键%d/%lu：%@",
+                       class_getName(cls), total, (int)start, (unsigned long)keep.count, chunk]);
+        if (keep.count == 0) {
+            break;
+        }
+    }
+}
+
+static void DYYYAPInstallCanNextHook(void) {
+    static BOOL sInstalled = NO;
+    if (sInstalled) {
+        return;
+    }
+
+    // 只这两个：v67 日志实测签名 B/3 的真实实现类。
+    // AWEBasicModePlayInteractionViewController 故意不在列表里 —— 它是 @/2 的 block getter。
+    const char *classNames[] = {
+        "AFDPureModePagePlaybackController",
+        "AWEFeedPlayControlImpl.PureModePageCellViewController"
+    };
+    SEL sel = sel_registerName(DYYY_AP_CANNEXT_SEL);
+    int handled = 0;
+
+    for (int i = 0; i < (int)(sizeof(classNames) / sizeof(classNames[0])); i++) {
+        Class cls = objc_getClass(classNames[i]);
+        if (!cls) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[ap] 钩安装：类未找到 %s", classNames[i]]);
+            continue;
+        }
+        handled++;
+        DYYYAPDumpMethodsForClass(cls);
+
+        Method m = class_getInstanceMethod(cls, sel);
+        if (!m) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[ap] 钩安装：%s 无 %s", classNames[i], DYYY_AP_CANNEXT_SEL]);
+            continue;
+        }
+        char retType[8] = {0};
+        method_getReturnType(m, retType, sizeof(retType));
+        unsigned int argc = method_getNumberOfArguments(m);
+        if (!(retType[0] == 'B' || retType[0] == 'c') || argc != 3) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[ap] 钩安装：%s 签名不符 ret=%s argc=%u，跳过",
+                           classNames[i], retType, argc]);
+            continue;
+        }
+
+        IMP oldImp = NULL;
+        MSHookMessageEx(cls, sel, (IMP)dyyyAPCanNextThunk, &oldImp);
+        if (!oldImp) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[ap] 钩安装：%s MSHookMessageEx 未返回原实现", classNames[i]]);
+            continue;
+        }
+        int slot = dyyyAPHookedCount[1];
+        if (slot < DYYY_AP_MAX_PER_SEL) {
+            dyyyAPHookedClasses[1][slot] = cls;
+            dyyyAPOrigIMPs[1][slot] = oldImp;
+            dyyyAPHookedCount[1] = slot + 1;
+        }
+        DYYYSpeedDiag([NSString stringWithFormat:@"[ap] ★已钩 canAutoPlayNextAweme: @ %s（B/3 校验通过）",
+                       classNames[i]]);
+    }
+
+    // 只有真的看到类才锁定；否则下次扫描还能再试（类可能懒加载）
+    if (handled > 0) {
+        sInstalled = YES;
     }
 }
 
@@ -4390,6 +4548,10 @@ static void DYYYAPScanAndHook(int attempt) {
             DYYYAPScanAndHook(attempt + 1);
         });
     }
+
+    // 【v68】类归属已确认，装精准 hook（只钩 canAutoPlayNextAweme: 的两个真实实现类）。
+    // 放最后：即使前面扫得慢，也不影响 App 启动；后台线程装 hook 不阻塞 UI。
+    DYYYAPInstallCanNextHook();
 }
 
 static void DYYYInstallAutoPlayProbe(void) {
