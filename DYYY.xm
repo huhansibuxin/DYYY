@@ -10772,7 +10772,7 @@ static NSHashTable *processedParentViews = nil;
 // 需求：关注的人发的「限时日常」刷到后不会自动下一条（story 播放器自己 loop 重播本轮），
 //   一直放一直放，内容也不好看 ⇒ 和「过滤图文 / 过滤直播」完全一样，在模型解析阶段直接过滤掉。
 //
-// 【规则写法和原生几条完全同构：开关 && 模型字段】
+// 【规则写法和 DYYY 现有的「过滤直播 / 过滤图文 / 过滤音乐卡」一模一样：开关 && 模型字段】
 //   shouldFilterAllLive = skipAllLive && [self.videoFeedTag isEqualToString:@"直播中"];
 //   shouldskipPhoto     = skipPhoto     && (self.awemeType == 68) && isRecommendFeed;
 //   shouldskipPhotoText = skipPhotoText && self.isNewTextMode     && isRecommendFeed;
