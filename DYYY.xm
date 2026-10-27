@@ -4342,9 +4342,12 @@ static void DYYYAPDumpMethodsForClass(Class cls) {
     if (!methods) {
         return;
     }
+    // 【v69】补 index/page/switch/seek/progress：横屏 feed 的"翻页/切条"方法
+    // 大概率叫 scrollToIndex:/switchToIndex:/page 之类，旧关键字会漏掉。
     static const char *keys[] = {"next", "Next", "auto", "Auto", "finish", "Finish",
                                  "play", "Play", "scroll", "Scroll", "advance", "Advance",
-                                 "end", "End"};
+                                 "end", "End", "index", "Index", "page", "Page",
+                                 "switch", "Switch", "seek", "Seek", "progress", "Progress"};
     NSMutableArray<NSString *> *keep = [NSMutableArray array];
     for (unsigned int i = 0; i < count && keep.count < 40; i++) {
         const char *n = sel_getName(method_getName(methods[i]));
@@ -4432,6 +4435,263 @@ static void DYYYAPInstallCanNextHook(void) {
     if (handled > 0) {
         sInstalled = YES;
     }
+}
+
+// ===== 【v69】播完信号 / 切条 API 取证 =====
+// 先认清一件事（老板 2026-10-27 实测，v68 日志铁证）：
+//   v68 把 canAutoPlayNextAweme: 钩在两个类上，钩子确实装上了（日志有「★已钩」），
+//   但一份完整使用日志（含反向横屏连切 5~6 条）里 **该 SEL 一次都没被调用**。
+//   而 v68 的 dump 显示 AFDPureModePagePlaybackController 的方法全是
+//   playForRemoteControl / playPrevForRemoteControl / nowPlayingInfo /
+//   shouldShowPlayNextRemoteControl / backgroundPlay* ——
+//   这个类其实是【控制中心远程控制 + 后台播放】的控制器，
+//   canAutoPlayNextAweme: 决定的是「控制中心里"下一条"按钮能不能点」，
+//   跟 feed 播完自动切条没有任何关系。
+//   ⇒ 结论：「让抖音自己把 NO 改成 YES」这条路实测走不通，不再往上堆代码。
+//
+// 要做到「必然切下一条」，只剩一条正路：自己判「该切了」，然后自己推一页。
+// 需要两把钥匙：
+//   ① 播完信号 —— 引擎/player/controller 的 finish 回调（判"该切了"）
+//   ② 切条执行 —— scrollToIndex: / NextAweme: 之类（推一页）
+// 本段做两件事（都只在后台跑，不改任何行为）：
+//   A. 扫出这些 SEL 的【归属类 + 完整签名（含每个参数类型）】写进日志；
+//   B. 签名安全的播完回调（返回 v、参数全是对象）顺手钩上，只打日志不动作 ——
+//      用来验证「这个 SEL 到底会不会被调用」。
+//      这一步是必须的：v68 已经证明「名字对 ≠ 会被调用」，不验证就写动作等于瞎改。
+// 为什么不直接写动作：参数类型写错就是读错寄存器，随机崩（v66 吃过一次）。
+//   所以全部先按 Method 的真实签名校验，不匹配一律不钩。
+typedef struct {
+    const char *sel;
+    const char *note;
+} DYYYSigProbeItem;
+
+static const DYYYSigProbeItem kDYYYSigProbes[] = {
+    {"videoEngineDidFinish:error:",                  "引擎播完+err"},
+    {"videoEngineDidFinish:videoStatusException:",   "引擎播完+异常码"},
+    {"videoEngine:didFinishedWithEvent:",            "引擎播完+事件"},
+    {"playerControllerPlayFinished:",                "控制器播完"},
+    {"player:updatePlayTime:canPlayTime:totalTime:", "★播放进度"},
+    {"scrollToIndex:",                               "切条:index"},
+    {"scrollToIndex:animated:",                      "切条:index+anim"},
+    {"NextAweme:",                                   "切下一条:aweme"},
+    {"NextItem:currentAwemeModel:targetIndex:",      "切下一条:item"},
+};
+#define DYYY_SIG_PROBE_COUNT ((int)(sizeof(kDYYYSigProbes) / sizeof(kDYYYSigProbes[0])))
+
+// 把 Method 的返回类型 + 每个参数类型拼成一行（跳过 self/_cmd）
+static NSString *DYYYMethodSignatureText(Method m) {
+    if (!m) {
+        return @"?";
+    }
+    char retType[16] = {0};
+    method_getReturnType(m, retType, sizeof(retType));
+    unsigned int argc = method_getNumberOfArguments(m);
+    NSMutableString *args = [NSMutableString string];
+    for (unsigned int i = 2; i < argc && i < 10; i++) {
+        char *t = method_copyArgumentType(m, i);
+        if (!t) {
+            continue;
+        }
+        if (args.length > 0) {
+            [args appendString:@" "];
+        }
+        [args appendFormat:@"%s", t];
+        free(t);
+    }
+    return [NSString stringWithFormat:@"ret=%s argc=%u args=[%@]", retType, argc, args];
+}
+
+// ---- 播完回调：按类落表的原实现（同一 SEL 可能被多个类各自实现）----
+typedef void (*DYYYSigVoid0)(id, SEL);
+typedef void (*DYYYSigVoid1)(id, SEL, id);
+typedef void (*DYYYSigVoid2)(id, SEL, id, id);
+
+typedef struct {
+    Class cls;
+    SEL sel;
+    IMP orig;
+} DYYYSigHookEntry;
+#define DYYY_SIG_HOOK_MAX 12
+static DYYYSigHookEntry dyyySigHooks[DYYY_SIG_HOOK_MAX];
+static int dyyySigHookCount = 0;
+
+static IMP DYYYSigOrigFor(id self, SEL _cmd) {
+    for (Class c = object_getClass(self); c; c = class_getSuperclass(c)) {
+        for (int i = 0; i < dyyySigHookCount; i++) {
+            if (dyyySigHooks[i].sel == _cmd && dyyySigHooks[i].cls == c) {
+                return dyyySigHooks[i].orig;
+            }
+        }
+    }
+    return NULL;
+}
+
+// 播完回调里【绝不读 UIKit】——可能不在主线程。
+// 只打：类名 / SEL / 是否主线程。方向信息留给主线程后续判断。
+static void DYYYSigLogFinish(id self, SEL _cmd) {
+    static NSTimeInterval sLast = 0;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - sLast < 0.5) {
+        return;
+    }
+    sLast = now;
+    DYYYSpeedDiag([NSString stringWithFormat:@"[nxt] 播完回调 %@ cls=%@ main=%d",
+                   NSStringFromSelector(_cmd), NSStringFromClass([self class]),
+                   (int)[NSThread isMainThread]]);
+}
+
+static void dyyySigFinishThunk0(id self, SEL _cmd) {
+    DYYYSigLogFinish(self, _cmd);
+    IMP o = DYYYSigOrigFor(self, _cmd);
+    if (o) {
+        ((DYYYSigVoid0)o)(self, _cmd);
+    }
+}
+
+static void dyyySigFinishThunk1(id self, SEL _cmd, id a1) {
+    DYYYSigLogFinish(self, _cmd);
+    IMP o = DYYYSigOrigFor(self, _cmd);
+    if (o) {
+        ((DYYYSigVoid1)o)(self, _cmd, a1);
+    }
+}
+
+static void dyyySigFinishThunk2(id self, SEL _cmd, id a1, id a2) {
+    DYYYSigLogFinish(self, _cmd);
+    IMP o = DYYYSigOrigFor(self, _cmd);
+    if (o) {
+        ((DYYYSigVoid2)o)(self, _cmd, a1, a2);
+    }
+}
+
+static BOOL DYYYSigIsFinishSel(const char *selName) {
+    // 只把「播完」类放进自动 hook 名单。
+    // 切条类（scrollToIndex:/NextAweme:）参数语义不明，先只取证，不钩。
+    return strstr(selName, "Finish") != NULL || strstr(selName, "finish") != NULL;
+}
+
+static void DYYYSigTryAutoHook(Class cls, SEL sel, Method m, NSString *sigText) {
+    if (!DYYYSigIsFinishSel(sel_getName(sel))) {
+        return;
+    }
+    if (dyyySigHookCount >= DYYY_SIG_HOOK_MAX) {
+        return;
+    }
+    char retType[16] = {0};
+    method_getReturnType(m, retType, sizeof(retType));
+    if (retType[0] != 'v') {
+        return;
+    }
+    unsigned int argc = method_getNumberOfArguments(m);
+    if (argc < 2 || argc > 4) {
+        return;
+    }
+    for (unsigned int i = 2; i < argc; i++) {
+        char *t = method_copyArgumentType(m, i);
+        char c = t ? t[0] : 0;
+        if (t) {
+            free(t);
+        }
+        if (c != '@') {
+            return; // 有非对象参数 ⇒ 不做变参转发，宁可不钩
+        }
+    }
+    // 同一个 Method 已经被钩过就不再钩（防止 orig 串成嵌套 trampoline）
+    if (method_getImplementation(m) == (IMP)dyyySigFinishThunk0 ||
+        method_getImplementation(m) == (IMP)dyyySigFinishThunk1 ||
+        method_getImplementation(m) == (IMP)dyyySigFinishThunk2) {
+        return;
+    }
+    IMP thunk = (argc == 2 ? (IMP)dyyySigFinishThunk0
+                : argc == 3 ? (IMP)dyyySigFinishThunk1
+                            : (IMP)dyyySigFinishThunk2);
+    IMP oldImp = NULL;
+    MSHookMessageEx(cls, sel, thunk, &oldImp);
+    if (!oldImp) {
+        return;
+    }
+    dyyySigHooks[dyyySigHookCount].cls = cls;
+    dyyySigHooks[dyyySigHookCount].sel = sel;
+    dyyySigHooks[dyyySigHookCount].orig = oldImp;
+    dyyySigHookCount++;
+    DYYYSpeedDiag([NSString stringWithFormat:@"[nxt] ★已钩播完回调 %s @ %s（%@）",
+                   sel_getName(sel), class_getName(cls), sigText]);
+}
+
+static void DYYYAPScanPlaybackSignals(void) {
+    static BOOL sDone = NO;
+    if (sDone) {
+        return;
+    }
+    sDone = YES;
+
+    double t0 = [NSDate timeIntervalSinceReferenceDate];
+
+    int numClasses = objc_getClassList(NULL, 0);
+    if (numClasses <= 0) {
+        return;
+    }
+    Class *classes = (Class *)malloc(sizeof(Class) * (size_t)numClasses);
+    if (!classes) {
+        return;
+    }
+    numClasses = objc_getClassList(classes, numClasses);
+
+    SEL sels[DYYY_SIG_PROBE_COUNT];
+    for (int k = 0; k < DYYY_SIG_PROBE_COUNT; k++) {
+        sels[k] = sel_registerName(kDYYYSigProbes[k].sel);
+    }
+
+    NSMutableArray<NSString *> *hits[DYYY_SIG_PROBE_COUNT];
+    for (int k = 0; k < DYYY_SIG_PROBE_COUNT; k++) {
+        hits[k] = [NSMutableArray array];
+    }
+
+    // 不做类名预筛：播完 delegate 的类名未必含 "Play"（可能是 xxxDelegate / xxxMonitor），
+    // 预筛会把它筛掉，等于白扫。全类只读扫一遍，后台线程，慢一点无所谓。
+    BOOL allFull = NO;
+    for (int i = 0; i < numClasses && !allFull; i++) {
+        Class cls = classes[i];
+        if (!cls) {
+            continue;
+        }
+        for (int k = 0; k < DYYY_SIG_PROBE_COUNT; k++) {
+            if (hits[k].count >= 6) {
+                continue;
+            }
+            Method m = class_getInstanceMethod(cls, sels[k]);
+            if (!m) {
+                continue;
+            }
+            NSString *sigText = DYYYMethodSignatureText(m);
+            NSString *entry = [NSString stringWithFormat:@"%s{%@}", class_getName(cls), sigText];
+            if ([hits[k] containsObject:entry]) {
+                continue;
+            }
+            [hits[k] addObject:entry];
+            DYYYSigTryAutoHook(cls, sels[k], m, sigText);
+        }
+        allFull = YES;
+        for (int k = 0; k < DYYY_SIG_PROBE_COUNT; k++) {
+            if (hits[k].count < 6) {
+                allFull = NO;
+                break;
+            }
+        }
+    }
+    free(classes);
+
+    double ms = ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0;
+    DYYYSpeedDiag([NSString stringWithFormat:@"[sig] 播完/切条信号扫描 全类=%d 耗时=%.1fms 已钩播完回调=%d",
+                   numClasses, ms, dyyySigHookCount]);
+    for (int k = 0; k < DYYY_SIG_PROBE_COUNT; k++) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[sig] %s (%s) -> %@",
+                       kDYYYSigProbes[k].sel, kDYYYSigProbes[k].note,
+                       hits[k].count ? [hits[k] componentsJoinedByString:@" , "] : @"未找到"]);
+    }
+
+    // 横屏 feed 播放器容器：dump 它自己的方法名，找"翻页/切条"的真 API
+    DYYYAPDumpMethodsForClass(objc_getClass("AWEDPlayerFeedPlayerViewController"));
 }
 
 // 静态拿不到类归属，只能在运行时全量扫一遍类列表。
@@ -4552,6 +4812,11 @@ static void DYYYAPScanAndHook(int attempt) {
     // 【v68】类归属已确认，装精准 hook（只钩 canAutoPlayNextAweme: 的两个真实实现类）。
     // 放最后：即使前面扫得慢，也不影响 App 启动；后台线程装 hook 不阻塞 UI。
     DYYYAPInstallCanNextHook();
+
+    // 【v69】播完信号 / 切条 API 取证（仍在后台线程，仍是只读 + 安全签名校验后的 hook）
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        DYYYAPScanPlaybackSignals();
+    });
 }
 
 static void DYYYInstallAutoPlayProbe(void) {
@@ -4878,6 +5143,43 @@ static NSHashTable *DYYYLandscapeVolContainers(void) {
     return table;
 }
 
+// 【v69】横屏滚动容器快照 —— 下一版「播完没切就自己推一页」要用它定位真正的容器。
+// 只认 UICollectionView/UITableView/UIScrollView 三类，打印类名 + 尺寸 + contentSize + offset，
+// 一眼就能看出"横屏 feed 到底是哪个 scrollView 在管翻页、翻一页要加多少 offset"。
+// 限流 30s，只在横屏竖滑放行时打，不刷屏。
+static void DYYYDiagDumpLandscapeScrollViews(void) {
+    static NSTimeInterval sLast = 0;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - sLast < 30.0) {
+        return;
+    }
+    sLast = now;
+
+    UIWindow *win = [DYYYUtils getActiveWindow];
+    if (!win) {
+        return;
+    }
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:win];
+    NSMutableArray<NSString *> *found = [NSMutableArray array];
+    int guard = 0;
+    while (stack.count > 0 && guard++ < 6000) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        if ([v isKindOfClass:[UIScrollView class]]) {
+            UIScrollView *sv = (UIScrollView *)v;
+            [found addObject:[NSString stringWithFormat:@"%@ %.0fx%.0f cs=%.0fx%.0f y=%.0f",
+                              NSStringFromClass([v class]),
+                              sv.bounds.size.width, sv.bounds.size.height,
+                              sv.contentSize.width, sv.contentSize.height,
+                              sv.contentOffset.y]];
+        }
+        [stack addObjectsFromArray:v.subviews];
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[scroll] 横屏滚动容器 %lu 个：%@",
+                   (unsigned long)found.count,
+                   found.count ? [found componentsJoinedByString:@" | "] : @"（无）"]);
+}
+
 // 手势起点是否落在亮度/音量按钮区域内（容错外扩 30pt）
 static BOOL DYYYLandscapePanHitsVolumeRegion(UIGestureRecognizer *gesture, UIView *host) {
     if (!gesture || !host) {
@@ -4930,6 +5232,10 @@ static BOOL DYYYLandscapePanHitsVolumeRegion(UIGestureRecognizer *gesture, UIVie
                     (int)inVolumeRegion,
                     (unsigned long)[DYYYLandscapeVolContainers() allObjects].count,
                     (long)DYYYDiagInterfaceOrientation()]);
+            }
+            // 【v69】放行时顺手拍一次横屏滚动容器快照（内部 30s 限流）
+            if (!inVolumeRegion) {
+                DYYYDiagDumpLandscapeScrollViews();
             }
             if (inVolumeRegion) {
                 return NO;
