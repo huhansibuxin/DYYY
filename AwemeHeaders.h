@@ -186,6 +186,14 @@ typedef NS_ENUM(NSUInteger, DYEdgeMode) {
 @property(nonatomic, strong) AWEPropGuideV2Model *propGuideV2;
 @property(nonatomic, strong) AWEECommerceLabel *ecommerceBelowLabel;
 @property(nonatomic, strong) AWEMusicCardModel *musicCard;
+// 【v79】日常（抖音内部叫 Story）字段 —— 名字来自实机 dump 的 AWEAwemeModel 属性表（1316 个里确认存在）。
+// 和 isLive / isNewTextMode / musicCard 一样，都是模型上的真实属性，所以规则可以直接读属性，不用运行时查。
+@property(nonatomic, assign) BOOL isStory;        // 通用 story 标记
+@property(nonatomic, assign) BOOL is24Story;      // 24 小时限时日常
+@property(nonatomic, assign) BOOL is25Story;      // 日常 2.5 版条目
+@property(nonatomic, strong) id storyGroup;       // 所属日常分组（非 nil 即属于日常）
+@property(nonatomic, strong) id story25Group;     // 2.5 版日常分组
+@property(nonatomic, strong) id storyCreationID;  // 创建日常时带的 id（非 nil）
 @property(nonatomic, assign) BOOL isShowLandscapeEntryView;
 - (BOOL)isLive;
 - (BOOL)contentFilter;
