@@ -10823,6 +10823,73 @@ static id DYYYStoryCallObjectGetter(id obj, NSString *selName) {
     return fn ? fn(obj, sel) : nil;
 }
 
+// 【v78】通用「真值」取值：属性返回类型不确定（BOOL / NSNumber* / NSString* / 模型对象）也能安全判。
+// 依据 v77 实机 dump 的 AWEAwemeModel 1316 个真实属性：
+//   [440-479]  isStory, storyGroup, story25Group, storyCreationID, storyEnterFrom, innerStoryIndex, disableStoryGroup
+//   [1080-1119] is24Story, is24StoryFriendPanel, is25Story
+// 其中 is24Story / is25Story 就是「日常」的两个版本标记（24h 限时日常 / 日常 2.5），
+// is24StoryFriendPanel 是「好友面板」交互状态，与内容无关，故不纳入判定。
+static BOOL DYYYStoryCallTruthy(id obj, NSString *selName) {
+    SEL sel = NSSelectorFromString(selName);
+    if (!sel || ![obj respondsToSelector:sel]) {
+        return NO;
+    }
+    NSMethodSignature *sig = [obj methodSignatureForSelector:sel];
+    const char *ret = sig ? sig.methodReturnType : NULL;
+    if (!ret || !ret[0]) {
+        return NO;
+    }
+    switch (ret[0]) {
+        case 'B':
+        case 'c': {
+            BOOL (*fn)(id, SEL) = (BOOL (*)(id, SEL))[obj methodForSelector:sel];
+            return fn ? fn(obj, sel) : NO;
+        }
+        case '@':
+        case '#': {
+            id (*fn)(id, SEL) = (id (*)(id, SEL))[obj methodForSelector:sel];
+            return fn ? (fn(obj, sel) != nil) : NO;
+        }
+        case 'q': case 'Q': case 'i': case 'I':
+        case 'l': case 'L': case 's': case 'S': {
+            long long (*fn)(id, SEL) = (long long (*)(id, SEL))[obj methodForSelector:sel];
+            return fn ? (fn(obj, sel) != 0) : NO;
+        }
+        default:
+            return NO;
+    }
+}
+
+// 一次性把所有日常字段的当前值拼成一个字符串（只给诊断日志用）
+static NSString *DYYYStoryFieldSnapshot(id model) {
+    static NSArray<NSString *> *fields = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        fields = @[ @"is24Story", @"is25Story", @"isStory",
+                    @"storyGroup", @"story25Group", @"storyCreationID",
+                    @"storyEnterFrom", @"innerStoryIndex" ];
+    });
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    for (NSString *name in fields) {
+        SEL sel = NSSelectorFromString(name);
+        if (!sel || ![model respondsToSelector:sel]) {
+            continue;
+        }
+        NSMethodSignature *sig = [model methodSignatureForSelector:sel];
+        const char *ret = sig ? sig.methodReturnType : NULL;
+        if (!ret || !ret[0]) {
+            continue;
+        }
+        if (ret[0] == '@' || ret[0] == '#') {
+            id v = DYYYStoryCallObjectGetter(model, name);
+            [parts addObject:[NSString stringWithFormat:@"%@=%@", name, v ?: @"nil"]];
+        } else {
+            [parts addObject:[NSString stringWithFormat:@"%@=%d", name, (int)DYYYStoryCallTruthy(model, name)]];
+        }
+    }
+    return [parts componentsJoinedByString:@" "];
+}
+
 // 判定一条 aweme 是不是日常。开关打开时每条 aweme 调一次。
 // 只收「二进制里确实存在」且语义无歧义的字段（isStory / hasStory / isMoment），
 // 不像 v76 那样罗列一堆根本不存在的选择器（那些 respondsToSelector 恒为 NO，纯浪费）。
@@ -10831,13 +10898,22 @@ static NSString *DYYYStoryHitOnAweme(id model) {
     if (!model) {
         return nil;
     }
-    static NSArray<NSString *> *boolSelectors = nil;
+    // 【v78 正式判定 —— 字段全部来自 v77 实机 dump 的 AWEAwemeModel 真实属性表】
+    // 顺序按「语义强度」排，命中即返回该字段名（既做判定也做日志证据）：
+    //   is24Story      24 小时限时日常（就是老板遇到的那种"播完一直循环"的）
+    //   is25Story      日常 2.5 版的条目
+    //   isStory        通用 story 标记
+    //   storyGroup / story25Group   属于某个日常分组（对象非 nil）
+    //   storyCreationID             创建日常时带的 id（非空）
+    // 不收 is24StoryFriendPanel（那是"好友面板"交互状态，任何视频都可能置位）。
+    static NSArray<NSString *> *fields = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        boolSelectors = @[ @"isStory", @"hasStory", @"isMoment" ];
+        fields = @[ @"is24Story", @"is25Story", @"isStory",
+                    @"storyGroup", @"story25Group", @"storyCreationID" ];
     });
-    for (NSString *selName in boolSelectors) {
-        if (DYYYStoryCallBoolGetter(model, selName)) {
+    for (NSString *selName in fields) {
+        if (DYYYStoryCallTruthy(model, selName)) {
             return selName;
         }
     }
@@ -10988,14 +11064,30 @@ static void DYYYNoteAwemeTypeOnce(NSInteger awemeType, NSString *referString) {
     DYYYSpeedDiag([NSString stringWithFormat:@"[od] 首见 type=%ld ref=%@", (long)awemeType,
                    referString ? referString : @"-"]);
 }
-// 【v76 取证】抖音的「日常」页：AWEOneDayFeedViewController（二进制里 AWEOneDay* 一整套类）。
-// 只打一行日志，不做任何拦截 —— 先确认限时日常到底是不是独立页面，再决定屏蔽手段。
+// 【v78 第二道兜底】抖音的「日常」独立页：AWEOneDayFeedViewController。
+// 内容级过滤（AWEAwemeModel.contentFilter → 返回 nil）能挡掉流内的日常条目；
+// 但如果某种形态根本不经 AWEAwemeModel（独立页面/独立数据源），就靠这里兜底：
+// 开关打开时把页面直接弹走，绝不会停在那儿「一直放一直放」。
 %hook AWEOneDayFeedViewController
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     if (DYYYDiagOn()) {
         DYYYSpeedDiag(@"[od] OneDayFeedViewController 出现（限时日常独立页面）");
     }
+    if (!DYYYGetBool(@"DYYYSkipStory")) {
+        return;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (DYYYDiagOn()) {
+            DYYYSpeedDiag(@"[od] 兜底：日常独立页面已自动关闭");
+        }
+        UINavigationController *nav = self.navigationController;
+        if (nav && nav.viewControllers.count > 1) {
+            [nav popViewControllerAnimated:NO];
+        } else if (self.presentingViewController) {
+            [self dismissViewControllerAnimated:NO completion:nil];
+        }
+    });
 }
 %end
 
@@ -11161,10 +11253,13 @@ static void DYYYNoteAwemeTypeOnce(NSInteger awemeType, NSString *referString) {
         storyHitSelector = DYYYStoryHitOnAweme(self);
         shouldFilterStory = (storyHitSelector != nil);
         if (shouldFilterStory && DYYYDiagOn()) {
-            DYYYSpeedDiag([NSString stringWithFormat:@"[od] 拦截日常 命中=%@ type=%ld aid=%@",
+            // 打出「命中的是哪个字段 + 该条的全部日常字段值」，万一误杀立刻能看出来
+            DYYYSpeedDiag([NSString stringWithFormat:@"[od] 拦截日常 命中=%@ type=%ld ref=%@ aid=%@ | %@",
                            storyHitSelector,
                            (long)self.awemeType,
-                           DYYYStoryCallObjectGetter(self, @"awemeID") ?: @"-"]);
+                           self.referString ?: @"-",
+                           DYYYStoryCallObjectGetter(self, @"awemeID") ?: @"-",
+                           DYYYStoryFieldSnapshot(self)]);
         }
     }
     BOOL shouldFilterHDR = NO;
