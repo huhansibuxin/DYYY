@@ -552,6 +552,9 @@ static double DYYYPreparedPlaybackSpeedForPlayer(id playerViewController) {
 // 门控：设置页"诊断日志"开关（DYYYDiagLog，默认开）——关掉后 DYYY 全部日志零输出：
 //   ① 本函数（speed_diag.log 文件行）；② 姊妹函数 DYYYFSDiag（DYYYLongPressPanel.xm，同一文件）；
 //   ③ 系统日志 NSLog —— 全部统一走 AwemeHeaders.h 的 DYYYLog 宏，同一开关。
+//   ④ 【v62】两级门控：宏在【调用点】判一次（关闭时连拼接都不求值），
+//      写盘 block 在【落盘前】再判一次（兜住"关开关时队列里还压着几行"的异步窗口）。
+//      ⇒ 开关一关，后续一行都不会再落盘。全工程无裸 NSLog / 无旁路写文件（已 grep 核验）。
 //   开关判断放在【宏】最前面 → 关闭时连调用点的 [NSString stringWithFormat:] 都不求值，
 //   零拼接、零文件 IO、零开销。
 // 【优化】v55~v58 里本接口是"函数"，而 41 处调用写在【调用方主线程】先
@@ -578,9 +581,8 @@ static NSString *DYYYSpeedDiagDirectory(void) {
 static void DYYYSpeedDiagImpl(NSString *msg);
 #define DYYYSpeedDiag(...) do { if (DYYYGetBool(@"DYYYDiagLog")) DYYYSpeedDiagImpl(__VA_ARGS__); } while (0)
 static void DYYYSpeedDiagImpl(NSString *msg) {
-    // 开关判断已由上面的 DYYYSpeedDiag 宏完成（且本函数是唯一经宏进入的出口），
-    // 这里【不再重复读 NSUserDefaults】——否则开关打开时每条日志都会多一次 defaults 读
-    //（宏一次 + 这里一次 = 双读），把一个"降开销"改动变成微回归。
+    // 开关判断已由上面的 DYYYSpeedDiag 宏完成（调用点连同参数拼接一起被短路，
+    // 关闭时零字符串拼接、零队列投递）。所以进到这里的调用，必然是"发起那一刻开关是开的"。
     @try {
         NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
         static dispatch_queue_t dyyyDiagWriteQueue;
@@ -589,6 +591,16 @@ static void DYYYSpeedDiagImpl(NSString *msg) {
             dyyyDiagWriteQueue = dispatch_queue_create("com.dyyy.speeddiag", DISPATCH_QUEUE_SERIAL);
         });
         dispatch_async(dyyyDiagWriteQueue, ^{
+            // 【v62 门控加固】落盘前复检一次开关。
+            // 必须复检的原因：写盘是异步的，从"投递"到"真正写"之间有一个队列窗口；
+            // 老板关掉日志开关的那一刻，此前已投递但还没写的行仍会写进去 ⇒
+            // 表现为"开关关了日志还在长"，违背「关闭后所有日志都不写」。
+            // 成本：只有开关【开着】时才会走到这里、每行多一次 defaults 读
+            // （boolForKey 是进程内字典查找，相比本行本来就有的 open/seek/write/close 可忽略）；
+            // 开关关闭时宏已经短路，根本不会进本函数，因此不存在"关闭态双读"的回归。
+            if (!DYYYGetBool(@"DYYYDiagLog")) {
+                return;
+            }
             @try {
                 NSString *path = [DYYYSpeedDiagDirectory() stringByAppendingPathComponent:@"speed_diag.log"];
                 NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
@@ -4254,8 +4266,23 @@ static BOOL DYYYLandscapePanHitsVolumeRegion(UIGestureRecognizer *gesture, UIVie
         if (![container isKindOfClass:[UIView class]] || !container.superview) {
             continue;
         }
+        // 【v62 加固①】只认「还挂在某个窗口上」的容器。
+        // 背景：这些容器只登记不清理（hidden 但不 remove、被 VC 持有 ⇒ 弱表不释放），
+        //   v61 实测「容器数」随刷视频 / 进出横屏单调爬升 2→4→6→8→10→12。
+        // 离屏容器 window 为 nil，superview 却可能仍非 nil；对它做 convertRect 属于跨视图树换算，
+        // 结果可以落在屏幕任意位置 ⇒ 某天突然判成「音量区=1」把切条拦死，
+        // 正是老板担心的「今天能滑、过几天又划不动」。剥掉它们即可根治。
+        if (!container.window) {
+            continue;
+        }
         CGRect rect = [container.superview convertRect:container.frame toView:host];
         if (rect.size.width < 1.0 || rect.size.height < 1.0) {
+            continue;
+        }
+        // 【v62 加固②】换算结果必须落在手势宿主可视范围内才参与判定。
+        // 历史容器若已被挪到屏幕外（或换算异常跑到远处），一律不算——
+        // 音量/亮度按钮本体永远在屏内，这条对真容器零影响，对残留容器是死门。
+        if (!CGRectIntersectsRect(host.bounds, rect)) {
             continue;
         }
         if (CGRectContainsPoint(CGRectInset(rect, -30.0, -30.0), loc)) {
@@ -4309,7 +4336,22 @@ static BOOL DYYYLandscapePanHitsVolumeRegion(UIGestureRecognizer *gesture, UIVie
     %orig;
     ((UIView *)self).hidden = YES;
     // v61：登记给竖滑手势判据用（弱表，容器释放自动出表）
-    [DYYYLandscapeVolContainers() addObject:(UIView *)self];
+    NSHashTable *dyyyVolTable = DYYYLandscapeVolContainers();
+    [dyyyVolTable addObject:(UIView *)self];
+    // 【v62 加固③】顺手裁掉已脱离窗口的历史容器。
+    // 弱表只在对象【释放】时自动出表，而这些容器被播放页 VC 攥着、只是 hidden 不 remove，
+    // 实测随刷视频/进出横屏单调爬升（2→12），永远不会自己掉。
+    // 不清的话，手势开始时要在主线程对越来越多个离屏视图做 convertRect（判定层已忽略它们，
+    // 但换算开销照付），刷久了就是"手势起手那一瞬发肉"。
+    // 这里在主线程、低频（容器真正移到窗口时）执行，超过 8 个才扫一次，代价可忽略。
+    // 注意 allObjects 返回的是数组副本，遍历中 removeObject 安全。
+    if (dyyyVolTable.count > 8) {
+        for (UIView *dyyyStale in [dyyyVolTable allObjects]) {
+            if (dyyyStale != (UIView *)self && !dyyyStale.window) {
+                [dyyyVolTable removeObject:dyyyStale];
+            }
+        }
+    }
 }
 %end
 

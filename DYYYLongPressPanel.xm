@@ -86,13 +86,18 @@ static NSString *DYYYFSDiagDirectory(void) {
 static void DYYYFSDiagImpl(NSString *msg);
 #define DYYYFSDiag(...) do { if (DYYYGetBool(@"DYYYDiagLog")) DYYYFSDiagImpl(__VA_ARGS__); } while (0)
 static void DYYYFSDiagImpl(NSString *msg) {
-    // 开关判断已由上面 DYYYFSDiag 宏完成，此处不重复读 NSUserDefaults（避免开关打开时双读）。
+    // 开关判断已由上面 DYYYFSDiag 宏完成（关闭时连参数拼接都不求值）。
     @try {
         NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
         static dispatch_queue_t q;
         static dispatch_once_t once;
         dispatch_once(&once, ^{ q = dispatch_queue_create("com.dyyy.fsdiag", DISPATCH_QUEUE_SERIAL); });
         dispatch_async(q, ^{
+            // 【v62 门控加固】落盘前复检开关，堵住"关开关瞬间队列里已投递的行"这个异步窗口。
+            // 关闭态下宏已短路、进不到本函数，所以这里不会引入"关闭态双读"的回归。
+            if (!DYYYGetBool(@"DYYYDiagLog")) {
+                return;
+            }
             @try {
                 NSString *path = [DYYYFSDiagDirectory() stringByAppendingPathComponent:@"speed_diag.log"];
                 NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
