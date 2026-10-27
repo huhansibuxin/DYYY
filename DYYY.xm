@@ -4077,6 +4077,370 @@ static BOOL DYYYIsLandscapeFullscreenNow(void) {
 //   导致反向全屏翻面被系统拒掉、直接退回竖屏。已全部撤回，详见 DYYYLongPressPanel.xm。
 extern BOOL gDYYYFSReverseActive;   // 定义在 DYYYLongPressPanel.xm：本次是否从「反向全屏」入口进的横屏
 
+// ============ 【v66】反向全屏「播完自动下一条」：抖音 AutoPlay 决策链探针 ============
+// 背景（老板 2026-10-27）：v65 已把翻面修好（cur=3 → 4 ✓稳定），但"播完会不会自动切"仍不可控 ——
+//   反向全屏偶尔会【反复重播同一条】。
+//
+// ⚠️ 先钉死一个更根本的坑：v63/v64 用的 AVPlayerItemDidPlayToEndTimeNotification 在这里
+//   【从来没触发过】—— v64 装了 7 次观察者、v65 装了 11 次，"本条播完"命中 0。
+//   抖音用的是自研 TTVideoEngine，不走 AVPlayer 那条通知，所以 [eov] 之前一条数据都没有，
+//   之前关于"重播 vs 停住"的判断全部没有实测支撑。这个坑必须换信号源才能补上。
+//
+// 静态取证（设备上对 AwemeCore.framework/AwemeCore 667MB 二进制做 SEL 字符串扫描）拿到这些：
+//   shouldAutoPlayNext            是否该自动播下一条（无参，should 前缀 ⇒ BOOL）
+//   canAutoPlayNextAweme:         某条 aweme 能不能自动播（带参）
+//   autoPlayNext / startAutoPlay  真正执行
+//   didFinishPlaying / didFinishPlayingWithError: / playerDidFinish:error:   引擎侧播完回调
+// 另有成体系的 AutoPlayManager / AutoPlayController / AutoPlayHandler / AutoPlayService /
+//   AutoPlayPlugin / AutoPlayDataSource 等类族 —— 说明"播放完自动下一条"是独立子系统，不是 feed 内联逻辑。
+//
+// 本版做两件事（都不改动抖音既有成功路径）：
+//   ① 运行时全量扫类列表定位这些 SEL 的【定义类】（静态拿不到类归属），全部记录调用与返回值
+//      —— 拿到"反向横屏 vs 正向横屏"在 AutoPlay 决策链上的真实差异；
+//   ② 反向横屏下 shouldAutoPlayNext 若返回 NO，强制返回 YES（只改这一个点，最小干预）。
+//      竖屏 / 正向横屏原样透传，一个字节都不改。
+
+typedef BOOL (*DYYYAPBoolIMP)(id, SEL);
+typedef BOOL (*DYYYAPBool1IMP)(id, SEL, id);
+typedef void (*DYYYAPVoidIMP)(id, SEL);
+typedef void (*DYYYAPVoid1IMP)(id, SEL, id);
+typedef void (*DYYYAPVoid2IMP)(id, SEL, id, id);
+
+// 这两个定义在本区块之后（[eov] 判据区），先声明后使用
+static void DYYYCheckAdvancedAfterEnd(NSString *baseIdentifier, NSUInteger baseCount, double checkAt, BOOL isFinal);
+static UIInterfaceOrientation DYYYDiagInterfaceOrientation(void);
+
+// 0=shouldAutoPlayNext 1=canAutoPlayNextAweme: 2=autoPlayNext 3=startAutoPlay
+// 4=didFinishPlaying 5=didFinishPlayingWithError: 6=playerDidFinish:error:
+#define DYYY_AP_SEL_COUNT 7
+#define DYYY_AP_MAX_PER_SEL 8
+
+// ⚠️ 原实现必须【按类】保存，不能按 SEL 存一个。
+//   MSHookMessageEx 是给每个类各自替换 IMP、各自回填 orig 的：
+//   若同一个 SEL 在 A、B 两个类上都有实现，共用一个 slot 时后钩的会覆盖前一个，
+//   A 的调用就会转发到 B 的原实现 —— 参数布局/语义一错就是随机崩溃，极难查。
+// 查找策略：从 self 的实际类沿 superclass 链往上找第一个已登记（我们钩过的）类。
+static Class dyyyAPHookedClasses[DYYY_AP_SEL_COUNT][DYYY_AP_MAX_PER_SEL];
+static IMP dyyyAPOrigIMPs[DYYY_AP_SEL_COUNT][DYYY_AP_MAX_PER_SEL];
+static int dyyyAPHookedCount[DYYY_AP_SEL_COUNT] = {0, 0, 0, 0, 0, 0, 0};
+static double dyyyAPLastLogTime[DYYY_AP_SEL_COUNT + 2] = {0};
+
+static IMP DYYYAPOrigFor(id self, int k) {
+    Class cls = object_getClass(self);
+    for (Class c = cls; c != Nil; c = class_getSuperclass(c)) {
+        for (int i = 0; i < dyyyAPHookedCount[k]; i++) {
+            if (dyyyAPHookedClasses[k][i] == c) {
+                return dyyyAPOrigIMPs[k][i];
+            }
+        }
+    }
+    return NULL;
+}
+
+// 每个 SEL 的日志限流：同一个通道在 interval 秒内只打一条，避免高频 SEL 把日志刷爆。
+//（反向横屏下的"强制 YES"事件单独走 7 号通道，限流更松，因为它才是关键证据。）
+static BOOL DYYYAPThrottle(int ch, double interval) {
+    double now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - dyyyAPLastLogTime[ch] < interval) {
+        return NO;
+    }
+    dyyyAPLastLogTime[ch] = now;
+    return YES;
+}
+
+// 「本次是否反向横屏」的唯一判据。
+// ⚠️ 顺手做状态清理：一旦不在横屏就把 gDYYYFSReverseActive 归零。
+//   否则「反向横屏 → 退出 → 用户自己转进正向横屏」这条路上，标记会残留成 YES，
+//   强制逻辑就会错误地作用到正向横屏（虽然只在原值为 NO 时才改，仍不该冒险）。
+static BOOL DYYYAPIsReverseLandscape(void) {
+    if (!DYYYIsLandscapeFullscreenNow()) {
+        gDYYYFSReverseActive = NO;
+        return NO;
+    }
+    return gDYYYFSReverseActive;
+}
+
+// 引擎播完 → 跑一次 [eov] 判据（比视频 ID，区分「切了新条」还是「重播本条」）。
+// 2 秒内只触发一次：didFinishPlaying 可能被多个类各调一遍（引擎 / ownPlayer / VC），
+// 重复触发会把 0.8s / 1.8s 检查点排成一堆，日志互相打架。
+static double dyyyAPLastEovTrigger = 0;
+static void DYYYAPTriggerEovIfNeeded(void) {
+    double now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - dyyyAPLastEovTrigger < 2.0) {
+        return;
+    }
+    dyyyAPLastEovTrigger = now;
+
+    NSString *baseIdentifier = DYYYSpeedAwemeIdentifier(dyyyCurrentSpeedAweme);
+    NSUInteger baseCount = gDYYYApplySpeedCount;
+    DYYYSpeedDiag([NSString stringWithFormat:@"[eov] 引擎播完 cur=%ld rev=%d landscape=%d id=%@ 起播=%lu",
+                   (long)DYYYDiagInterfaceOrientation(),
+                   (int)gDYYYFSReverseActive,
+                   (int)DYYYIsLandscapeFullscreenNow(),
+                   baseIdentifier ?: @"-",
+                   (unsigned long)baseCount]);
+    DYYYCheckAdvancedAfterEnd(baseIdentifier, baseCount, 0.8, NO);
+    DYYYCheckAdvancedAfterEnd(baseIdentifier, baseCount, 1.8, YES);
+}
+
+static BOOL dyyyAPShouldNextThunk(id self, SEL _cmd) {
+    BOOL ret = NO;
+    IMP orig = DYYYAPOrigFor(self, 0);
+    if (orig) {
+        ret = ((DYYYAPBoolIMP)orig)(self, _cmd);
+    }
+    BOOL revLand = DYYYAPIsReverseLandscape();
+    if (!ret && revLand) {
+        if (DYYYAPThrottle(7, 0.35)) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[ap] shouldAutoPlayNext 原=NO → 强制 YES（反向横屏）cls=%@",
+                           NSStringFromClass([self class])]);
+        }
+        return YES;
+    }
+    if (DYYYAPThrottle(0, 1.0)) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[ap] shouldAutoPlayNext=%d revLand=%d cls=%@",
+                       (int)ret, (int)revLand, NSStringFromClass([self class])]);
+    }
+    return ret;
+}
+
+static BOOL dyyyAPCanNextThunk(id self, SEL _cmd, id aweme) {
+    BOOL ret = NO;
+    IMP orig = DYYYAPOrigFor(self, 1);
+    if (orig) {
+        ret = ((DYYYAPBool1IMP)orig)(self, _cmd, aweme);
+    }
+    if (DYYYAPThrottle(1, 1.0)) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[ap] canAutoPlayNextAweme:=%d revLand=%d cls=%@",
+                       (int)ret, (int)DYYYAPIsReverseLandscape(), NSStringFromClass([self class])]);
+    }
+    return ret;
+}
+
+static void dyyyAPAutoNextThunk(id self, SEL _cmd) {
+    if (dyyyAPThrottle(2, 0.5)) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[ap] autoPlayNext 被调用 revLand=%d cls=%@",
+                       (int)DYYYAPIsReverseLandscape(), NSStringFromClass([self class])]);
+    }
+    IMP orig = DYYYAPOrigFor(self, 2);
+    if (orig) {
+        ((DYYYAPVoidIMP)orig)(self, _cmd);
+    }
+}
+
+static void dyyyAPStartThunk(id self, SEL _cmd) {
+    if (DYYYAPThrottle(3, 1.0)) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[ap] startAutoPlay 被调用 revLand=%d cls=%@",
+                       (int)DYYYAPIsReverseLandscape(), NSStringFromClass([self class])]);
+    }
+    IMP orig = DYYYAPOrigFor(self, 3);
+    if (orig) {
+        ((DYYYAPVoidIMP)orig)(self, _cmd);
+    }
+}
+
+static void dyyyAPFinishThunk(id self, SEL _cmd) {
+    if (DYYYAPThrottle(4, 0.3)) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[ap] didFinishPlaying 播完 revLand=%d cls=%@",
+                       (int)DYYYAPIsReverseLandscape(), NSStringFromClass([self class])]);
+    }
+    // 【v66 关键】把真正的"播完"事件接到 [eov] 判据上。
+    // 以前 [eov] 挂在 AVPlayerItemDidPlayToEndTimeNotification 上，抖音根本不发，
+    // 所以 v64/v65 一条数据都没有。这里是引擎自己的播完回调，才是可靠信号。
+    DYYYAPTriggerEovIfNeeded();
+    IMP orig = DYYYAPOrigFor(self, 4);
+    if (orig) {
+        ((DYYYAPVoidIMP)orig)(self, _cmd);
+    }
+}
+
+static void dyyyAPFinishErrThunk(id self, SEL _cmd, id err) {
+    if (DYYYAPThrottle(5, 0.3)) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[ap] didFinishPlayingWithError: revLand=%d err=%@ cls=%@",
+                       (int)DYYYAPIsReverseLandscape(), err ?: @"-", NSStringFromClass([self class])]);
+    }
+    IMP orig = DYYYAPOrigFor(self, 5);
+    if (orig) {
+        ((DYYYAPVoid1IMP)orig)(self, _cmd, err);
+    }
+}
+
+static void dyyyAPPlayerFinishThunk(id self, SEL _cmd, id player, id err) {
+    if (DYYYAPThrottle(6, 0.3)) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[ap] playerDidFinish:error: revLand=%d err=%@ cls=%@",
+                       (int)DYYYAPIsReverseLandscape(), err ?: @"-", NSStringFromClass([self class])]);
+    }
+    IMP orig = DYYYAPOrigFor(self, 6);
+    if (orig) {
+        ((DYYYAPVoid2IMP)orig)(self, _cmd, player, err);
+    }
+}
+
+// 静态拿不到类归属，只能在运行时全量扫一遍类列表。
+// 3 万+ 类 × 7 个 SEL，几十毫秒量级，只做一次（启动后延迟执行，不占首帧）。
+static void DYYYAPScanAndHook(int attempt) {
+    static BOOL sScanDone = NO;
+    if (sScanDone) {
+        return;
+    }
+    const char *selNames[DYYY_AP_SEL_COUNT] = {
+        "shouldAutoPlayNext",
+        "canAutoPlayNextAweme:",
+        "autoPlayNext",
+        "startAutoPlay",
+        "didFinishPlaying",
+        "didFinishPlayingWithError:",
+        "playerDidFinish:error:"
+    };
+    IMP thunks[DYYY_AP_SEL_COUNT] = {
+        (IMP)dyyyAPShouldNextThunk,
+        (IMP)dyyyAPCanNextThunk,
+        (IMP)dyyyAPAutoNextThunk,
+        (IMP)dyyyAPStartThunk,
+        (IMP)dyyyAPFinishThunk,
+        (IMP)dyyyAPFinishErrThunk,
+        (IMP)dyyyAPPlayerFinishThunk
+    };
+    // 期望的返回类型首字母：should/can 是 BOOL('c'/'B')，其余应是 void('v')。
+    // 不符就跳过并记账 —— 宁可漏钩，也不要用错的函数签名去踩内存。
+    const char *expectRet[DYYY_AP_SEL_COUNT] = {"c", "c", "v", "v", "v", "v", "v"};
+    // 期望的总参数个数（含 self/_cmd）：多一个少一个都不能钩 —— thunk 是按这个布局转发的，
+    // 签名不对会直接丢参数或读错寄存器，表现为随机崩溃（这类尾随参数崩溃极难查）。
+    const int expectArgc[DYYY_AP_SEL_COUNT] = {2, 3, 2, 2, 2, 3, 4};
+
+    int numClasses = objc_getClassList(NULL, 0);
+    if (numClasses <= 0) {
+        sScanDone = YES;
+        return;
+    }
+    Class *classes = (Class *)malloc(sizeof(Class) * (size_t)numClasses);
+    if (!classes) {
+        sScanDone = YES;
+        return;
+    }
+    numClasses = objc_getClassList(classes, numClasses);
+
+    NSMutableSet<NSString *> *hitInfo = [NSMutableSet set];
+    // 同一个 Method 只能钩一次：子类未 override 时 class_getInstanceMethod 返回的是父类 Method，
+    // 二次 MSHookMessageEx 会把 orig 串成嵌套 trampoline（速率探针那边踩过这个坑）。
+    NSMutableSet<NSValue *> *hookedMethods = [NSMutableSet set];
+    // 每个 SEL 最多钩 8 个实现：同一个 SEL 可能在多个类上各自实现（引擎 / ownPlayer / VC / 插件），
+    // 全部钩住意义不大，反而放大日志量与出错面。
+    int perSelHooked[DYYY_AP_SEL_COUNT] = {0, 0, 0, 0, 0, 0, 0};
+
+    // 预先把 SEL 注册出来：内层循环要跑 (类数 × 7) 次，别每次都 sel_registerName
+    SEL sels[DYYY_AP_SEL_COUNT];
+    for (int k = 0; k < DYYY_AP_SEL_COUNT; k++) {
+        sels[k] = sel_registerName(selNames[k]);
+    }
+
+    for (int i = 0; i < numClasses; i++) {
+        Class cls = classes[i];
+        if (!cls) {
+            continue;
+        }
+        for (int k = 0; k < DYYY_AP_SEL_COUNT; k++) {
+            SEL sel = sels[k];
+            if (perSelHooked[k] >= 8) {
+                continue;
+            }
+            Method m = class_getInstanceMethod(cls, sel);
+            if (!m) {
+                continue;
+            }
+            NSValue *key = [NSValue valueWithPointer:m];
+            if ([hookedMethods containsObject:key]) {
+                continue;
+            }
+            // ⚠️ 重试路径上会重复扫到同一个 Method：此时它的 IMP 已经是我们自己的 thunk，
+            //   再 MSHookMessageEx 一次就会把 orig 指回 thunk ⇒ 无限递归爆栈。
+            //   用 IMP 比对挡掉（这是重试机制唯一的安全阀，别删）。
+            if (method_getImplementation(m) == thunks[k]) {
+                continue;
+            }
+            char retType[8] = {0};
+            method_getReturnType(m, retType, sizeof(retType));
+            char want = expectRet[k][0];
+            BOOL ok = (retType[0] == want) ||
+                      (want == 'c' && (retType[0] == 'B' || retType[0] == 'c'));
+            if (!ok) {
+                [hitInfo addObject:[NSString stringWithFormat:@"%s@%s 返回'%s'跳过",
+                                    selNames[k], class_getName(cls), retType]];
+                continue;
+            }
+            // 参数个数 + 参数类型校验（thunk 只认对象参数）
+            unsigned int argc = method_getNumberOfArguments(m);
+            if ((int)argc != expectArgc[k]) {
+                [hitInfo addObject:[NSString stringWithFormat:@"%s@%s argc=%u跳过",
+                                    selNames[k], class_getName(cls), argc]];
+                continue;
+            }
+            BOOL argsOk = YES;
+            for (unsigned int a = 2; a < argc; a++) {
+                char *at = method_copyArgumentType(m, a);
+                BOOL isObj = (at && at[0] == '@');
+                if (at) {
+                    free(at);
+                }
+                if (!isObj) {
+                    argsOk = NO;
+                    break;
+                }
+            }
+            if (!argsOk) {
+                [hitInfo addObject:[NSString stringWithFormat:@"%s@%s 参数非对象跳过",
+                                    selNames[k], class_getName(cls)]];
+                continue;
+            }
+            [hookedMethods addObject:key];
+
+            IMP oldImp = NULL;
+            MSHookMessageEx(cls, sel, thunks[k], &oldImp);
+
+            // 按类落表（不要按 SEL 存单个 slot，理由见 dyyyAPHookedClasses 的注释）
+            int slot = dyyyAPHookedCount[k];
+            if (oldImp && slot < DYYY_AP_MAX_PER_SEL) {
+                dyyyAPHookedClasses[k][slot] = cls;
+                dyyyAPOrigIMPs[k][slot] = oldImp;
+                dyyyAPHookedCount[k] = slot + 1;
+                perSelHooked[k]++;
+            }
+
+            [hitInfo addObject:[NSString stringWithFormat:@"%s@%s", selNames[k], class_getName(cls)]];
+        }
+    }
+    free(classes);
+    sScanDone = YES;
+
+    // 关键 SEL（shouldAutoPlayNext）没扫到 ⇒ 类还没加载，退避重试。
+    // 抖音是巨型 App，AutoPlay 子系统可能是懒加载的，一次扫不到很正常。
+    if (dyyyAPHookedCount[0] == 0 && attempt < 6) {
+        sScanDone = NO;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            DYYYAPScanAndHook(attempt + 1);
+        });
+        DYYYSpeedDiag([NSString stringWithFormat:@"[ap] 第%d次扫描未命中 shouldAutoPlayNext，2s 后重试", attempt]);
+        return;
+    }
+
+    DYYYSpeedDiag([NSString stringWithFormat:@"[ap] 探针装载完成（第%d次，扫 %d 类）：%@",
+                   attempt, numClasses,
+                   [[[hitInfo allObjects] subarrayWithRange:NSMakeRange(0, MIN((NSUInteger)40, [hitInfo count]))]
+                       componentsJoinedByString:@" | "]]);
+}
+
+static void DYYYInstallAutoPlayProbe(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // 3s：等 AutoPlay 子系统实例化出来（%ctor 时机太早，那时类可能还没加载）
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            DYYYAPScanAndHook(1);
+        });
+    });
+}
+
 static UIInterfaceOrientation DYYYDiagInterfaceOrientation(void) {
     if (@available(iOS 13.0, *)) {
         for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
@@ -15333,7 +15697,13 @@ static void findTargetViewInView(UIView *view) {
     DYYYMigrateCombinedHDRModeIfNeeded();
 
     // 【v63】播完/切条诊断（观察者只装一次，只在视频播完时打两条日志）
+    // ⚠️ v66 实测：抖音用自研 TTVideoEngine，AVPlayerItemDidPlayToEndTimeNotification 从不触发
+    //   （v64 装 7 次 / v65 装 11 次，命中 0）。这里保留观察者但不再指望它，
+    //   真正的播完信号改由 DYYYInstallAutoPlayProbe 的 didFinishPlaying 系列提供。
     DYYYInstallEndOfVideoDiag();
+
+    // 【v66】反向全屏「播完自动下一条」：定位抖音 AutoPlay 决策链（shouldAutoPlayNext 等）
+    DYYYInstallAutoPlayProbe();
 
     Class interactionBaseLabelClass = objc_getClass("AWECommentSwiftBizUI.CommentInteractionBaseLabel");
     if (interactionBaseLabelClass) {
