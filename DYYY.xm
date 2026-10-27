@@ -4127,8 +4127,8 @@ extern BOOL gDYYYFSReverseActive;   // 定义在 DYYYLongPressPanel.xm：本次�
 //    把 VC 的支持方向收窄成 portrait，反向全屏翻面当场被系统拨回竖屏（v65 已撤回）。
 //
 // ⇒ 唯一还站得住的信号：player:updatePlayTime:canPlayTime:totalTime:
-//   实现在 AWEDPlayerVideoController_Merge，签名 v/6 [@ d d d]，实机确认在跑。
-//   播完只能自己按进度算，见下方【v70】。
+//   v69 全类扫描证明它有 6 个实现者；v70 只钩了 Merge ⇒ 实机 0 调用（横屏根本不是它在跑）。
+//   v71 改为「全类扫描、所有实现者全部钩上」，播完自己按进度算，见下方【v71】。
 
 // 定义在本区块之后（v70 的 [prog] 日志要用，先声明）
 static UIInterfaceOrientation DYYYDiagInterfaceOrientation(void);
@@ -4180,41 +4180,65 @@ static void DYYYAPDumpMethodsForClass(Class cls) {
 
 
 // ============================================================================
-// ==== 【v70】播完检测：抖音没有「播完回调」，只有「播放进度」
+// ==== 【v71】播完检测 v2：钩「所有实现者」+ 判完抢在抖音 loop 重播前自己推一页
 // ============================================================================
-// v69 实机铁证（speed_diag.v69.run1.log，604 行，含横屏连切多条）：
-//   ① 9 个猜测的「播完/切条」SEL 里 8 个命中的全是无关类 ——
-//        LynxVideoPlayableDefault / BDXAudioPlayer / BDXAudioModelPlayer（小程序播放器）、
-//        HMDPlaceHolder / UIKeyboardCandidateViewStyle（键盘）、
-//        AWELiveVideoPreviewStreamPlayerWrapper（直播预览）。
-//      只有 player:updatePlayTime:canPlayTime:totalTime: 命中了真正的播放控制器
-//        AWEDPlayerVideoController_Merge {ret=v argc=6 args=[@ d d d]}。
-//   ② 钩上的 12 个「播完回调」（videoEngineDidFinish:error: 等）实机一次都没被调用。
-//   ③ [scroll] 0 次、[nxt] 实际调用 0 次。
-// ⇒ 结论：抖音横屏 feed 不派发任何「播完」回调，继续 grep 方法名只是浪费轮次。
-//   唯一可靠的办法 = 拿进度自己算播完：total>0 且 cur 距末尾 ≤0.35s。
-//   这条回调同时给出**条目指纹**（引擎指针 + 总时长），能区分三种结局：
-//     引擎换 / 总时长变            → 已切新条 ✓
-//     两者都没变 + cur 从 0 重来    → 重播本条 ✗
-//     两者都没变 + cur 停在末尾     → 停住未动 ✗
-//   这正是我们一直缺的那份实测数据，本版必有（进度回调确定在跑）。
-#define DYYY_PROG_CLASS_NAME "AWEDPlayerVideoController_Merge"
+// 【v70 铁证·为什么必须换】speed_diag.v70.run1.log（689 行）：
+//   [prog] ★已钩 … Merge 于 09:50:51 装上（签名 v/6 [@ d d d] 校验通过），
+//   随后 09:51:04 进反向全屏 → 10:00:25 手动竖滑，整整 9 分钟里
+//   [prog] 判播完 = 0 条、连一条采样都没有。
+//   ⇒ AWEDPlayerVideoController_Merge 在横屏 feed 里根本不跑（它是纯模式 PureMode 的控制器）。
+//     v70 的错不在签名、不在钩法，而在「只钩一个类」—— 钩了个永不发生的调用方。
+// 【v69 早给了答案】[sig] 全类扫描列出这 SEL 的全部实现者：
+//   AWEDPlayerVideoController_Merge / HunterVideoIESVideoPlayerDelegate /
+//   AWEListenFeedPlayerElement / AWERVPaymentViewController /
+//   AWERVPaymentTryWatchController / AWELongVideoDetailIAACountDownController
+//   横屏 feed 走的多半是 HunterVideoIESVideoPlayerDelegate（通用视频 delegate）。
+// ⇒ v71 不再猜类名：运行时全类扫描，凡「自己 method list 里就有这个 SEL」的类全部钩上。
+//   ⚠️ 另一个 v70 隐藏 bug：判完逻辑写在 DYYYDiagLog 门控之内 ⇒ 关掉日志功能就没了。
+//      v71 功能与日志彻底分离：判完 → 推页 永远生效，日志才受开关控制。
+// 【核心策略】抖音横屏是「播完 → loop 重播本条」而不是「停下来」。所以不能等 1.5s 再看结局，
+//   那 1.5s 里它已经从头播了。正确做法：判到末段（total-cur ≤ 0.35s）后只等 0.35s，
+//   这 0.35s 只用来让抖音「有机会自己切」；它没切（引擎/总时长都没变）⇒ 我们自己推一页。
+// ============================================================================
 #define DYYY_PROG_SEL_NAME "player:updatePlayTime:canPlayTime:totalTime:"
 
 typedef void (*DYYYProgIMP)(id, SEL, id, double, double, double);
-static IMP dyyyProgOrig = NULL;
-static BOOL dyyyProgHooked = NO;
 
-// 播完那一刻的快照 —— 只观察【这一个引擎指针】之后的进度。
-// ⚠️ 为什么要按指针锁死：抖音同时存在预加载引擎和临时播放器，
-//   若用"全局最新进度"当指纹，别的引擎随便回一次进度就会把结局判歪。
-static uintptr_t dyyyProgEndEnginePtr = 0;   // 播完的那台引擎（0 = 没有在观察）
-static double dyyyProgEndBaseTotal = 0;      // 播完时的总时长（判"换条"的基准）
-static double dyyyProgEndCur = 0;            // 该引擎最近一次进度
-static double dyyyProgEndTotal = 0;          // 该引擎最近一次总时长
-static NSTimeInterval dyyyProgEndLastSeen = 0; // 该引擎最近一次有进度的时间
+// 按类落表（v66 教训：单槽 orig 会被后钩的类覆盖）。
+// 用定长 C 数组 + 线性扫描：进度回调每秒多次，加锁/查字典都嫌重，扫 ≤32 个指针几乎免费。
+#define DYYY_PROG_MAX_HOOKED 32
+static Class dyyyProgClasses[DYYY_PROG_MAX_HOOKED];
+static IMP dyyyProgIMPs[DYYY_PROG_MAX_HOOKED];
+static volatile int dyyyProgHookedCount = 0;
 
-// 横屏下所有滚动容器快照（找「翻一页」的把手；只在未切时打，不常驻）
+static IMP DYYYProgOrigFor(Class cls) {
+    int n = dyyyProgHookedCount;
+    for (Class c = cls; c; c = class_getSuperclass(c)) {
+        for (int i = 0; i < n; i++) {
+            if (dyyyProgClasses[i] == c) {
+                return dyyyProgIMPs[i];
+            }
+        }
+    }
+    return NULL;
+}
+
+// —— 观察状态 ——
+// dyyyProgWatched* ：播完那一刻锁定的「那一台引擎」，用于 0.35s 后判有没有自己切
+static uintptr_t dyyyProgWatchedPtr = 0;
+static double dyyyProgWatchedBaseTotal = 0;
+static double dyyyProgWatchedCur = 0;
+static double dyyyProgWatchedTotal = 0;
+static NSTimeInterval dyyyProgWatchedLastSeen = 0;
+// dyyyProgGlobal* ：最近一次有进度的引擎（任何引擎），用来判「抖音是不是换引擎播新条了」
+static uintptr_t dyyyProgGlobalPtr = 0;
+static NSTimeInterval dyyyProgGlobalAt = 0;
+// 节流
+static NSTimeInterval dyyyProgLastSampleAt = 0;
+static NSTimeInterval dyyyProgLastVerdictAt = 0;
+static NSTimeInterval dyyyProgLastAdvanceAt = 0;
+
+// 横屏下所有滚动容器快照（诊断用，只在门控内打）
 static void DYYYProgDumpScrollViews(void) {
     UIWindow *win = [DYYYUtils getActiveWindow];
     if (!win) {
@@ -4240,7 +4264,6 @@ static void DYYYProgDumpScrollViews(void) {
         }
         [stack addObjectsFromArray:v.subviews];
     }
-    // 每行最多 4 个，避免单行过长（日志是整行写盘的）
     for (NSUInteger s = 0; s < found.count || s == 0; s += 4) {
         NSUInteger len = MIN((NSUInteger)4, found.count - s);
         NSString *chunk = len ? [[found subarrayWithRange:NSMakeRange(s, len)]
@@ -4253,130 +4276,328 @@ static void DYYYProgDumpScrollViews(void) {
     }
 }
 
-// 播完判定：末段进度处触发一次，1.5s 后看这台引擎的结局
-static void DYYYProgHandleEndOfItem(id player, double cur, double total) {
-    static NSTimeInterval sLastEnd = 0;
-    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (now - sLastEnd < 1.0) {
+// 找横屏 feed 的「翻页容器」。
+// v70 实测现场：UICollectionView 932x430 cs=932x5590 y=430 → 纵向分页、一页 430、已在第 1 页。
+// 判据：视口够大、内容至少能翻一页、主方向与视口同轴（横屏也照样兼容横向分页）。
+static UIScrollView *DYYYProgFindPager(CGFloat *stepOut) {
+    UIWindow *win = [DYYYUtils getActiveWindow];
+    if (!win) {
+        return nil;
+    }
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:win];
+    UIScrollView *best = nil;
+    CGFloat bestArea = 0;
+    CGFloat bestStep = 0;
+    int guard = 0;
+    while (stack.count > 0 && guard++ < 8000) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        if ([v isKindOfClass:[UIScrollView class]]) {
+            UIScrollView *sv = (UIScrollView *)v;
+            CGSize b = sv.bounds.size;
+            CGSize cs = sv.contentSize;
+            if (b.width > 120.0 && b.height > 120.0) {
+                // 纵向分页（横屏 feed 就是这种）/ 横向分页
+                BOOL vScroll = (cs.height > b.height * 1.5 && cs.width <= b.width * 1.3);
+                BOOL hScroll = (cs.width > b.width * 1.5 && cs.height <= b.height * 1.3);
+                if (vScroll || hScroll) {
+                    CGFloat area = b.width * b.height;
+                    if (area > bestArea) {
+                        bestArea = area;
+                        best = sv;
+                        bestStep = vScroll ? b.height : b.width;
+                    }
+                }
+            }
+        }
+        [stack addObjectsFromArray:v.subviews];
+    }
+    if (stepOut) {
+        *stepOut = bestStep;
+    }
+    return best;
+}
+
+// 自己推一页（主线程）。返回 YES=已发出滚动指令。
+static BOOL DYYYProgAdvancePage(NSString **detailOut) {
+    if (![NSThread isMainThread]) {
+        if (detailOut) {
+            *detailOut = @"非主线程，拒绝推页";
+        }
+        return NO;
+    }
+    CGFloat step = 0;
+    UIScrollView *sv = DYYYProgFindPager(&step);
+    if (!sv || step < 50.0) {
+        if (detailOut) {
+            *detailOut = @"未找到翻页容器";
+        }
+        return NO;
+    }
+    CGSize b = sv.bounds.size;
+    CGSize cs = sv.contentSize;
+    CGPoint off = sv.contentOffset;
+    BOOL vertical = (cs.height > b.height * 1.5);
+    CGFloat maxOffset = vertical ? (cs.height - b.height) : (cs.width - b.width);
+    CGFloat cur = vertical ? off.y : off.x;
+    CGFloat curPage = round(cur / step);
+    CGFloat target = (curPage + 1) * step;
+    if (target > maxOffset + 1.0) {
+        if (detailOut) {
+            *detailOut = [NSString stringWithFormat:@"已是末页 cur=%.0f max=%.0f step=%.0f",
+                          cur, maxOffset, step];
+        }
+        return NO;
+    }
+    if (vertical) {
+        [sv setContentOffset:CGPointMake(off.x, target) animated:YES];
+    } else {
+        [sv setContentOffset:CGPointMake(target, off.y) animated:YES];
+    }
+    if (detailOut) {
+        *detailOut = [NSString stringWithFormat:@"%@ %.0fx%.0f %@ cur=%.0f→%.0f step=%.0f max=%.0f",
+                      NSStringFromClass([sv class]), b.width, b.height,
+                      vertical ? @"纵向" : @"横向", cur, target, step, maxOffset];
+    }
+    return YES;
+}
+
+// 末段命中：拍快照 → 0.35s 后判抖音自己切没切 → 没切就自己推一页
+static void DYYYProgOnItemEnd(id host, id player, double cur, double total, NSTimeInterval now) {
+    uintptr_t ptr = (uintptr_t)player;
+    dyyyProgWatchedPtr = ptr;
+    dyyyProgWatchedBaseTotal = total;
+    dyyyProgWatchedCur = cur;
+    dyyyProgWatchedTotal = total;
+    dyyyProgWatchedLastSeen = now;
+
+    NSString *hostName = NSStringFromClass(object_getClass(host));
+    BOOL landscape = DYYYIsLandscapeFullscreenNow();
+    BOOL reverse = gDYYYFSReverseActive;
+
+    if (DYYYGetBool(@"DYYYDiagLog")) {
+        DYYYSpeedDiag([NSString stringWithFormat:
+            @"[prog] 判播完 %@ 引擎=0x%lx cur=%.2f/%.2f 横屏=%d 反向=%d main=%d",
+            hostName, (unsigned long)ptr, cur, total, (int)landscape, (int)reverse,
+            (int)[NSThread isMainThread]]);
+    }
+
+    // 只服务「反向全屏」：正向横屏与竖屏抖音自己能切，插手只会多跳一条（老板实测竖屏正常）
+    if (!(landscape && reverse)) {
         return;
     }
-    sLastEnd = now;
 
-    // 拍快照：只认这台引擎
-    dyyyProgEndEnginePtr = (uintptr_t)player;
-    dyyyProgEndBaseTotal = total;
-    dyyyProgEndCur = cur;
-    dyyyProgEndTotal = total;
-    dyyyProgEndLastSeen = now;
     NSTimeInterval endAt = now;
-
-    DYYYSpeedDiag([NSString stringWithFormat:@"[prog] 判播完 cur=%.2f/%.2f 引擎=0x%lx main=%d",
-                   cur, total, (unsigned long)dyyyProgEndEnginePtr,
-                   (int)[NSThread isMainThread]]);
-
-    // 1.5s 后回主线程看结局（要读 UIKit 打容器快照，必须主线程）
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        if (!DYYYGetBool(@"DYYYDiagLog")) {
+        // 抖音自己切了吗？三重判据（任一成立就算切了，绝不能推，否则一次跳两条）
+        BOOL oldStillAdvancing = (dyyyProgWatchedLastSeen > endAt + 0.01);
+        BOOL totalChanged = oldStillAdvancing &&
+                            (fabs(dyyyProgWatchedTotal - dyyyProgWatchedBaseTotal) > 0.6);
+        BOOL otherEngine = (dyyyProgGlobalPtr != 0 && dyyyProgGlobalPtr != ptr &&
+                            dyyyProgGlobalAt > endAt + 0.01);
+        BOOL switched = totalChanged || (!oldStillAdvancing && otherEngine);
+
+        if (switched) {
+            if (DYYYGetBool(@"DYYYDiagLog")) {
+                DYYYSpeedDiag([NSString stringWithFormat:
+                    @"[prog] 0.35s 后抖音自己切了（总时长变=%d 换引擎=%d）→ 不插手",
+                    (int)totalChanged, (int)otherEngine]);
+            }
+            dyyyProgWatchedPtr = 0;
             return;
         }
-        NSString *engine = [NSString stringWithFormat:@"0x%lx", (unsigned long)dyyyProgEndEnginePtr];
-        BOOL seen = (dyyyProgEndLastSeen > endAt + 0.01);   // 播完后这台引擎还回过进度吗
-        double nowCur = dyyyProgEndCur;
-        double nowTotal = dyyyProgEndTotal;
-        BOOL totalChanged = seen && (fabs(nowTotal - dyyyProgEndBaseTotal) > 0.6);
 
-        NSString *verdict = nil;
-        if (totalChanged) {
-            verdict = @"已切新条 ✓（同引擎、总时长变了）";
-        } else if (seen && nowCur < dyyyProgEndBaseTotal * 0.8) {
-            verdict = @"重播本条 ✗（同引擎、总时长没变、cur 从 0 重来）";
-        } else if (seen) {
-            verdict = @"停住未动 ✗（同引擎、cur 仍停在末尾）";
-        } else {
-            verdict = @"该引擎不再回进度（已换引擎/已释放）";
+        NSTimeInterval now2 = [NSDate timeIntervalSinceReferenceDate];
+        if (now2 - dyyyProgLastAdvanceAt < 2.0) {
+            dyyyProgWatchedPtr = 0;
+            return;
         }
-        DYYYSpeedDiag([NSString stringWithFormat:
-            @"[prog] 1.5s 后 %@ cur=%.2f total=%.2f(base=%.2f) 引擎=%@ 方向=%ld 反向=%d 横屏=%d",
-            verdict, nowCur, nowTotal, dyyyProgEndBaseTotal, engine,
-            (long)DYYYDiagInterfaceOrientation(), (int)gDYYYFSReverseActive,
-            (int)DYYYIsLandscapeFullscreenNow()]);
+        dyyyProgLastAdvanceAt = now2;
 
-        // 判定为「没切」⇒ 把「翻页把手」的现场打出来（滚动容器 + 播放控制器自身方法）
-        if (!totalChanged && seen && nowCur >= dyyyProgEndBaseTotal * 0.8) {
-            DYYYProgDumpScrollViews();
-            DYYYAPDumpMethodsForClass(objc_getClass(DYYY_PROG_CLASS_NAME));
+        NSString *detail = nil;
+        BOOL ok = DYYYProgAdvancePage(&detail);
+
+        if (DYYYGetBool(@"DYYYDiagLog")) {
+            DYYYSpeedDiag([NSString stringWithFormat:
+                @"[prog] 0.35s 后未切（旧引擎还在=%d 新引擎=%d cur=%.2f/%.2f）→ %@：%@",
+                (int)oldStillAdvancing, (int)otherEngine,
+                dyyyProgWatchedCur, dyyyProgWatchedBaseTotal,
+                ok ? @"自己推一页" : @"推页失败", detail ? detail : @"?"]);
+            if (!ok) {
+                DYYYProgDumpScrollViews();
+            }
         }
-        dyyyProgEndEnginePtr = 0;   // 观察结束，下次播完重新拍快照
+
+        // 再等 1.2s 复核：推了到底有没有翻过去（没翻 ⇒ 下一版换手段：直接打抖音的翻页方法）
+        if (ok) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (!DYYYGetBool(@"DYYYDiagLog")) {
+                    return;
+                }
+                CGFloat step = 0;
+                UIScrollView *sv = DYYYProgFindPager(&step);
+                NSString *afterTxt = sv ? [NSString stringWithFormat:@"容器=%@ y=%.0f",
+                                       NSStringFromClass([sv class]), sv.contentOffset.y]
+                                    : @"容器已消失";
+                DYYYSpeedDiag([NSString stringWithFormat:@"[prog] 推页 1.2s 后复核：%@", afterTxt]);
+            });
+        }
+        dyyyProgWatchedPtr = 0;
     });
 }
 
-static void dyyyProgThunk(id self, SEL _cmd, id player, double cur, double canPlay, double total) {
-    IMP orig = dyyyProgOrig;
-    if (orig) {
-        ((DYYYProgIMP)orig)(self, _cmd, player, cur, canPlay, total);
-    }
-    if (total <= 1.0 || cur < 0.0) {
+// 进度观察：更新指纹 + 采样日志 + 末段判播完
+static void DYYYProgObserve(id host, id player, double cur, double total) {
+    if (total <= 1.0 || cur < 0.0 || cur > total + 5.0) {
         return;
     }
     uintptr_t ptr = (uintptr_t)player;
-    // 只更新「正在观察的那台引擎」的结局变量，别的引擎（预加载/临时播放器）一概不理
-    if (dyyyProgEndEnginePtr != 0 && ptr == dyyyProgEndEnginePtr) {
-        dyyyProgEndCur = cur;
-        dyyyProgEndTotal = total;
-        dyyyProgEndLastSeen = [NSDate timeIntervalSinceReferenceDate];
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+
+    dyyyProgGlobalPtr = ptr;
+    dyyyProgGlobalAt = now;
+
+    if (dyyyProgWatchedPtr != 0 && ptr == dyyyProgWatchedPtr) {
+        dyyyProgWatchedCur = cur;
+        dyyyProgWatchedTotal = total;
+        dyyyProgWatchedLastSeen = now;
     }
-    if (!DYYYGetBool(@"DYYYDiagLog")) {
-        return;
+
+    // 采样：每 3s 一条，确认「到底是谁在回调、进度到底在不在动」（受日志门控）
+    if (DYYYGetBool(@"DYYYDiagLog") && now - dyyyProgLastSampleAt > 3.0) {
+        dyyyProgLastSampleAt = now;
+        DYYYSpeedDiag([NSString stringWithFormat:
+            @"[prog] 采样 %@ 引擎=0x%lx cur=%.2f/%.2f 横屏=%d 反向=%d",
+            NSStringFromClass(object_getClass(host)), (unsigned long)ptr, cur, total,
+            (int)DYYYIsLandscapeFullscreenNow(), (int)gDYYYFSReverseActive]);
     }
+
+    // 末段（≤0.35s）才判播完；2.5s 去抖防重播期间反复触发
     if (total - cur > 0.35) {
         return;
     }
-    DYYYProgHandleEndOfItem(player, cur, total);
+    if (now - dyyyProgLastVerdictAt < 2.5) {
+        return;
+    }
+    dyyyProgLastVerdictAt = now;
+    DYYYProgOnItemEnd(host, player, cur, total, now);
 }
 
-// 装进度回调。签名必须校验：参数类型写错就是读错寄存器、随机崩（v66 吃过一次）。
-// 期望：ret='v'、argc=6（self/_cmd + 4 参）、第 3/4/5 个参数全为 'd'。
+static void dyyyProgThunk(id self, SEL _cmd, id player, double cur, double canPlay, double total) {
+    IMP orig = DYYYProgOrigFor(object_getClass(self));
+    if (orig) {
+        ((DYYYProgIMP)orig)(self, _cmd, player, cur, canPlay, total);
+    }
+    DYYYProgObserve(self, player, cur, total);
+}
+
+// 安装：全类扫描「自己 method list 里就有这个 SEL」的类，逐个签名校验后钩上。
+// 只钩自身实现、不钩继承（否则同一个 IMP 被钩多次）。
 static void DYYYAPInstallProgressHook(void) {
-    if (dyyyProgHooked) {
+    static BOOL sStarted = NO;
+    if (sStarted) {
         return;
     }
-    Class cls = objc_getClass(DYYY_PROG_CLASS_NAME);
-    if (!cls) {
-        DYYYSpeedDiag(@"[prog] 类未找到 AWEDPlayerVideoController_Merge，进度钩未装");
-        return;
-    }
+    sStarted = YES;
+
     SEL sel = sel_registerName(DYYY_PROG_SEL_NAME);
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) {
-        DYYYSpeedDiag(@"[prog] 方法未找到 player:updatePlayTime:canPlayTime:totalTime:，进度钩未装");
+    int clsCount = objc_getClassList(NULL, 0);
+    if (clsCount <= 0) {
+        DYYYSpeedDiag(@"[prog] objc_getClassList 失败，进度钩未装");
         return;
     }
-    char retType[8] = {0};
-    method_getReturnType(m, retType, sizeof(retType));
-    unsigned int argc = method_getNumberOfArguments(m);
-    BOOL sigOK = (retType[0] == 'v') && (argc == 6);
-    if (sigOK) {
-        for (unsigned int i = 3; i <= 5; i++) {
-            char *t = method_copyArgumentType(m, i);
-            if (!t || t[0] != 'd') {
-                sigOK = NO;
+    Class *all = (Class *)malloc(sizeof(Class) * (size_t)clsCount);
+    if (!all) {
+        return;
+    }
+    clsCount = objc_getClassList(all, clsCount);
+    NSTimeInterval t0 = [NSDate timeIntervalSinceReferenceDate];
+
+    NSMutableArray<NSValue *> *targets = [NSMutableArray array];
+    NSMutableArray<NSString *> *badSig = [NSMutableArray array];
+    for (int i = 0; i < clsCount; i++) {
+        Class cls = all[i];
+        const char *nm = class_getName(cls);
+        if (!nm) {
+            continue;
+        }
+        // 跳过 Swift 命名类（带 "."）、_TtC mangled、以及 CoreFoundation 私有类：
+        // 这些走 Swift vtable / 非 ObjC 派发，MSHookMessageEx 钩不到还可能崩。
+        if (nm[0] == '_' || strchr(nm, '.')) {
+            continue;
+        }
+        unsigned int mcount = 0;
+        Method *ms = class_copyMethodList(cls, &mcount);
+        if (!ms) {
+            continue;
+        }
+        for (unsigned int j = 0; j < mcount; j++) {
+            if (method_getName(ms[j]) != sel) {
+                continue;
             }
-            if (t) {
-                free(t);
+            char rt[8] = {0};
+            method_getReturnType(ms[j], rt, sizeof(rt));
+            BOOL ok = (rt[0] == 'v') && (method_getNumberOfArguments(ms[j]) == 6);
+            if (ok) {
+                for (unsigned int a = 3; a <= 5; a++) {
+                    char *t = method_copyArgumentType(ms[j], a);
+                    if (!t || t[0] != 'd') {
+                        ok = NO;
+                    }
+                    if (t) {
+                        free(t);
+                    }
+                }
+            }
+            if (ok) {
+                [targets addObject:[NSValue valueWithPointer:(__bridge void *)cls]];
+            } else {
+                [badSig addObject:[NSString stringWithFormat:@"%s(%c/%u)", nm,
+                                   rt[0] ? rt[0] : '?', method_getNumberOfArguments(ms[j])]];
+            }
+            break;
+        }
+        free(ms);
+    }
+    free(all);
+
+    NSTimeInterval cost = ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0;
+
+    void (^install)(void) = ^{
+        int hooked = 0;
+        for (NSValue *v in targets) {
+            if (hooked >= DYYY_PROG_MAX_HOOKED) {
+                break;
+            }
+            Class cls = (Class)[v pointerValue];
+            IMP oldImp = NULL;
+            MSHookMessageEx(cls, sel, (IMP)dyyyProgThunk, &oldImp);
+            if (oldImp) {
+                dyyyProgClasses[hooked] = cls;
+                dyyyProgIMPs[hooked] = oldImp;
+                hooked++;
+                DYYYSpeedDiag([NSString stringWithFormat:
+                    @"[prog] ★已钩 %s（v/6 [@ d d d] 校验通过）", class_getName(cls)]);
             }
         }
-    }
-    if (!sigOK) {
+        __atomic_store_n(&dyyyProgHookedCount, hooked, __ATOMIC_RELEASE);
         DYYYSpeedDiag([NSString stringWithFormat:
-            @"[prog] 签名不符（ret=%s argc=%u），拒绝挂钩", retType, argc]);
-        return;
+            @"[prog] 进度钩安装完成 共 %d 个类（扫描耗时 %.0fms，全类=%d，候选=%lu，签名不符=%lu）",
+            hooked, cost, clsCount, (unsigned long)targets.count,
+            (unsigned long)badSig.count]);
+        if (badSig.count > 0) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[prog] 签名不符已跳过：%@",
+                           [badSig componentsJoinedByString:@" | "]]);
+        }
+    };
+
+    if ([NSThread isMainThread]) {
+        install();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), install);
     }
-    IMP oldImp = NULL;
-    MSHookMessageEx(cls, sel, (IMP)dyyyProgThunk, &oldImp);
-    dyyyProgOrig = oldImp;
-    dyyyProgHooked = YES;
-    DYYYSpeedDiag(@"[prog] ★已钩播放进度 AWEDPlayerVideoController_Merge（v/6 [@ d d d] 校验通过）");
 }
 
 
@@ -15582,10 +15803,9 @@ static void findTargetViewInView(UIView *view) {
 
     DYYYMigrateCombinedHDRModeIfNeeded();
 
-    // 【v63】播完/切条诊断（观察者只装一次，只在视频播完时打两条日志）
-    // ⚠️ v66 实测：抖音用自研 TTVideoEngine，AVPlayerItemDidPlayToEndTimeNotification 从不触发
-    // 【v70】播完检测：抖音不发任何播完回调，改用「播放进度」自己算
-    //   （player:updatePlayTime:canPlayTime:totalTime: @ AWEDPlayerVideoController_Merge）。
+    // 【v71】播完检测：抖音不发任何播完回调，改用「播放进度」自己算。
+    //   player:updatePlayTime:canPlayTime:totalTime: 全类扫描所有实现者全钩（v70 只钩 Merge ⇒ 0 调用）
+    //   → 末段（≤0.35s）判播完 → 反向横屏时抖音没自己切就自己推一页。
     // 历史失败方案见上方【历史】注释块，勿再重写。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
