@@ -28,6 +28,10 @@ static void DYYYFSClearOrientationBias(void);   // 定义见下方 DYYYFS 区
 // 由 DYYYFSEnterReverse 置 YES，复位执行后自清。
 static BOOL gDYYYFSNeedReset = NO;
 
+// 【v63】本次横屏是不是从「反向全屏」入口进来的（供 DYYY.xm 的 [eov] 播完诊断对照用）。
+// 进入反向全屏置 YES；下一次从任意入口重新进屏时置 NO（普通「全屏观看」走的是原生方向）。
+BOOL gDYYYFSReverseActive = NO;
+
 static void simulateTapOnEntryView(UIView *entryView) {
     if (!entryView) return;
     // 只有上一次反向全屏可能留下残留时才复位（否则「全屏观看」也会被带偏，详见 DYYYFSClearOrientationBias）
@@ -173,6 +177,45 @@ static void DYYYFSApplyOrientation(UIInterfaceOrientation target) {
     }
     [[UIDevice currentDevice] setValue:@(target) forKey:@"orientation"];
     [UIViewController attemptRotationToDeviceOrientation];
+
+    // ===== 【v63 核心修复】把"设备方向变了"这件事广播出去 =====
+    // 现象（老板 2026-10-27 实机）：反向全屏进去后，视频播完【不自动切下一条】；
+    //   但【手动划几条之后又恢复正常】。正向横屏（原生旋转）一切正常。
+    // 根因推论：抖音（和绝大多数播放器一样）是靠
+    //   UIDeviceOrientationDidChangeNotification 来维护自己那份「当前横屏方向 / 是否横屏」状态缓存的。
+    //   正向横屏时是系统自己转、系统自己发这条通知 → 抖音状态正确 → 播完照常切条。
+    //   反向全屏是我们在它背后硬转：geometry 请求 + KVC 改 UIDevice.orientation + attemptRotation，
+    //   UIKit 自己转过去了（界面确实翻了），但【这条通知一次都没发过】⇒
+    //   抖音的方向缓存还停在原来的方向，全屏容器按旧方向算，播完时"下一条"的判定落空 → 不动。
+    //   手动滑动之所以能治好：滚动/布局把它的容器状态重新算了一遍（自愈路径），所以"滑几个就正常了"。
+    // 修法：转完之后补发这条通知（抖音自己会读 device.orientation，我们已经写成 target），
+    //   让它走它本来就该走的响应逻辑。发两次（0ms + 0.12s）兜住它可能的重入/去抖。
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:@"UIDeviceOrientationDidChangeNotification"
+                          object:[UIDevice currentDevice]];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:@"UIDeviceOrientationDidChangeNotification"
+                          object:[UIDevice currentDevice]];
+    });
+}
+
+// 【v63 补强】翻面稳定后让 root 重新布局一次。
+// post 通知是让抖音"知道方向变了"，这一步是顺手把当前 window 的布局脏标记打上，
+// 让横屏容器在下一 runloop 按新方向的尺寸重算一遍（不改任何状态，纯 UIKit 常规调用）。
+static void DYYYFSRequestRelayoutAfterFlip(void) {
+    UIWindow *win = [UIApplication sharedApplication].keyWindow;
+    if (!win) return;
+    UIViewController *root = win.rootViewController;
+    if (@available(iOS 16.0, *)) {
+        [root setNeedsUpdateOfSupportedInterfaceOrientations];
+    }
+    [win setNeedsLayout];
+    [root.view setNeedsLayout];
+    DYYYFSDiag(@"[fs-rev] 翻面稳定 → 已请求 root 重新布局");
 }
 
 // 反向全屏：点抖音原生入口 → 进横屏 → 翻到【另一侧】（0.5s / 1.2s 各补确认一次）。
@@ -180,6 +223,7 @@ static void DYYYFSApplyOrientation(UIInterfaceOrientation target) {
 static void DYYYFSEnterReverse(UIView *entryView) {
     if (!entryView) return;
     DYYYFSDiag(@"[fs-rev] 反向全屏：进横屏后翻到另一侧");
+    gDYYYFSReverseActive = YES;   // v63：标记本次横屏来自反向入口，供 DYYY.xm 的 [eov] 诊断对照
     simulateTapOnEntryView(entryView);
 
     __block void (^poll)(NSInteger);
@@ -202,7 +246,12 @@ static void DYYYFSEnterReverse(UIView *entryView) {
                 DYYYFSDiag([NSString stringWithFormat:@"[fs-rev] 1.2s cur=%ld (目标%ld) %@",
                             (long)b, (long)target,
                             (b == target ? @"✓稳定" : @"✗被拨回")]);
-                if (b != target) DYYYFSApplyOrientation(target);
+                if (b != target) {
+                    DYYYFSApplyOrientation(target);
+                } else {
+                    // v63：方向已稳定 ⇒ 主动让抖音按新方向重算布局（补强，关键修复在 ApplyOrientation 的通知）
+                    DYYYFSRequestRelayoutAfterFlip();
+                }
             });
             return;
         }
@@ -670,6 +719,7 @@ static void DYYYStartTimerCloseCheck(void) {
           [panelManager dismissWithAnimation:YES completion:^{
             UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
             UIView *entryView = findLandscapeEntryViewInView(keyWindow);
+            gDYYYFSReverseActive = NO;   // v63：普通「全屏观看」= 抖音原生方向，供 [eov] 诊断对照
             simulateTapOnEntryView(entryView);
           }];
         };
@@ -1494,6 +1544,7 @@ static void DYYYStartTimerCloseCheck(void) {
           [panelManager dismissWithAnimation:YES completion:^{
             UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
             UIView *entryView = findLandscapeEntryViewInView(keyWindow);
+            gDYYYFSReverseActive = NO;   // v63：普通「全屏观看」= 抖音原生方向，供 [eov] 诊断对照
             simulateTapOnEntryView(entryView);
           }];
         };

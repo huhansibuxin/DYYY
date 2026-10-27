@@ -957,10 +957,18 @@ static void DYYYReapplySpeedToCurrentPlayer(NSString *context) {
     dyyyReapplyingSpeed = NO;
 }
 
+// 【v63 诊断】起播施速次数。
+// 每一次「新视频上岗」都会经过 DYYYApplyPreparedPlaybackSpeedToPlayer（抖音 setIsAutoPlay: /
+// prepareForDisplay 起播流必到），所以这个计数就是"已经换过多少条"的可靠代理指标。
+// 用途：end-of-video 时记一次值，2.5s 后再看有没有涨 —— 没涨 = 没自动切（老板报的反向全屏问题）。
+// 只在开着 1.5 倍速时有效（那正是老板的常开配置），诊断记录里会带 rev/cur 一起看。
+static NSUInteger gDYYYApplySpeedCount = 0;
+
 static void DYYYApplyPreparedPlaybackSpeedToPlayer(id playerViewController) {
     if (!DYYYShouldHandleSpeedFeatures() || !playerViewController || dyyyLongPressFastSpeedActive || dyyyLongPressLockedSpeedActive) {
         return;
     }
+    gDYYYApplySpeedCount++;
 
     // 【v58】记下"真正在播的那个 VC"，供 reapply 精确命中（见 dyyyCurrentPlayerVC 的注释）。
     // 本函数被抖音起播流（setIsAutoPlay: / prepareForDisplay）频繁调到，缓存在这里永远新鲜。
@@ -4053,6 +4061,81 @@ static BOOL DYYYIsLandscapeFullscreenNow(void) {
     return win != nil && win.bounds.size.width > win.bounds.size.height;
 }
 
+// === 【v63 诊断】本条播完 → 到底有没有接上下一条 ===
+// 背景（老板 2026-10-27 实机反馈）：正向横屏正常自动下一条；反向全屏进去后"播完不滑"，
+//   但【手动划几条之后就恢复正常】，说明是"初始方向状态不一致、被用户交互顺带修好了"。
+// 这条日志用来把这件事钉死：
+//   [eov] 本条播完 ...        ← 视频真播完了（AVPlayerItemDidPlayToEndTimeNotification 到了）
+//   [eov] 2.0s 后已接上新一条 / 无新视频上岗 ← 切条成功与否
+// 有了 正向 vs 反向、rev=0 vs rev=1 的对照，就能证明"不切"发生在哪一侧。
+extern BOOL gDYYYFSReverseActive;   // 定义在 DYYYLongPressPanel.xm：本次是否从「反向全屏」入口进的横屏
+
+static UIInterfaceOrientation DYYYDiagInterfaceOrientation(void) {
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]] &&
+                scene.activationState == UISceneActivationStateForegroundActive) {
+                return ((UIWindowScene *)scene).interfaceOrientation;
+            }
+        }
+    }
+    return (UIInterfaceOrientation)[UIApplication sharedApplication].statusBarOrientation;
+}
+
+static void DYYYInstallEndOfVideoDiag(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // ⚠️ 通知名用字面量而不是 AVPlayerItemDidPlayToEndTimeNotification 常量：
+        //   本工程 Makefile 没链 AVFoundation（同 [npv] 区对 MediaPlayer 的处理），
+        //   静态引用外部常量会产生未定义符号导致链接失败。
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:@"AVPlayerItemDidPlayToEndTimeNotification"
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(__unused NSNotification *note) {
+            if (!DYYYGetBool(@"DYYYDiagLog")) {
+                return;
+            }
+            NSUInteger baseCount = gDYYYApplySpeedCount;
+            DYYYSpeedDiag([NSString stringWithFormat:@"[eov] 本条播完 cur=%ld rev=%d landscape=%d 已切=%lu",
+                           (long)DYYYDiagInterfaceOrientation(),
+                           (int)gDYYYFSReverseActive,
+                           (int)DYYYIsLandscapeFullscreenNow(),
+                           (unsigned long)baseCount]);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (!DYYYGetBool(@"DYYYDiagLog")) {
+                    return;
+                }
+                NSUInteger nowCount = gDYYYApplySpeedCount;
+                BOOL advanced = (nowCount > baseCount);
+                DYYYSpeedDiag([NSString stringWithFormat:@"[eov] 2.0s 后 %@ cur=%ld rev=%d 已切=%lu(+%lu)",
+                               (advanced ? @"已接上新一条 ✓" : @"无新视频上岗 ✗（没自动切）"),
+                               (long)DYYYDiagInterfaceOrientation(),
+                               (int)gDYYYFSReverseActive,
+                               (unsigned long)nowCount,
+                               (unsigned long)(nowCount - baseCount)]);
+                // 【v63 兜底】横屏里播完没接上，且本次是反向全屏进来的 ⇒ 再敲一次方向广播 + 重布局。
+                // 不发号施令、不改方向、不模拟手势，只做「让抖音重新算一遍」，失败了也无副作用。
+                // 这一手是给主修复（DYYYFSApplyOrientation 里补发通知）兜底的第二道保险。
+                if (!advanced && gDYYYFSReverseActive && DYYYIsLandscapeFullscreenNow()) {
+                    DYYYSpeedDiag(@"[eov] 兜底：补发一次方向广播 + 请求 root 重布局");
+                    [[NSNotificationCenter defaultCenter]
+                        postNotificationName:@"UIDeviceOrientationDidChangeNotification"
+                                      object:[UIDevice currentDevice]];
+                    UIWindow *dyyyWin = [DYYYUtils getActiveWindow];
+                    if (@available(iOS 16.0, *)) {
+                        [dyyyWin.rootViewController setNeedsUpdateOfSupportedInterfaceOrientations];
+                    }
+                    [dyyyWin setNeedsLayout];
+                    [dyyyWin.rootViewController.view setNeedsLayout];
+                }
+            });
+        }];
+        DYYYSpeedDiag(@"[eov] 播完/切条诊断观察者已装");
+    });
+}
+
 // DYYY 自己边缘手势（DYYYVideoGesture）打标：置 YES 表示本次亮度/音量设置来自
 // DYYY 边缘手势，效果层拦截 hook 要放行（横屏下边缘手势已禁用，此打标为竖屏路径保留）
 static BOOL dyyyTagBrightFromDYYYGesture = NO;
@@ -4303,10 +4386,11 @@ static BOOL DYYYLandscapePanHitsVolumeRegion(UIGestureRecognizer *gesture, UIVie
             if (now - dyyyLastPanLog > 0.5) {
                 dyyyLastPanLog = now;
                 CGPoint loc = [gestureRecognizer locationInView:(UIView *)self];
-                DYYYSpeedDiag([NSString stringWithFormat:@"[pan-%s] 竖滑 loc=(%.0f,%.0f) vel=(%.0f,%.0f) 音量区=%d 容器数=%lu",
+                DYYYSpeedDiag([NSString stringWithFormat:@"[pan-%s] 竖滑 loc=(%.0f,%.0f) vel=(%.0f,%.0f) 音量区=%d 容器数=%lu 方向=%ld",
                     inVolumeRegion ? "block" : "pass", loc.x, loc.y, vel.x, vel.y,
                     (int)inVolumeRegion,
-                    (unsigned long)[DYYYLandscapeVolContainers() allObjects].count]);
+                    (unsigned long)[DYYYLandscapeVolContainers() allObjects].count,
+                    (long)DYYYDiagInterfaceOrientation()]);
             }
             if (inVolumeRegion) {
                 return NO;
@@ -15197,6 +15281,9 @@ static void findTargetViewInView(UIView *view) {
     }
 
     DYYYMigrateCombinedHDRModeIfNeeded();
+
+    // 【v63】播完/切条诊断（观察者只装一次，只在视频播完时打两条日志）
+    DYYYInstallEndOfVideoDiag();
 
     Class interactionBaseLabelClass = objc_getClass("AWECommentSwiftBizUI.CommentInteractionBaseLabel");
     if (interactionBaseLabelClass) {
