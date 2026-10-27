@@ -10894,6 +10894,13 @@ static NSString *DYYYStoryFieldSnapshot(id model) {
 // 只收「二进制里确实存在」且语义无歧义的字段（isStory / hasStory / isMoment），
 // 不像 v76 那样罗列一堆根本不存在的选择器（那些 respondsToSelector 恒为 NO，纯浪费）。
 // v77 的结构 dump 出来后，这里按真实字段名收敛。
+// 【v79 自检】把「过滤到底有没有在跑、日常字段正常值长什么样」变成可判断的证据。
+// 老板实测 v78 刷了 8 分钟：开关 DYYYSkipStory=True、日志里 [od] 全是 dump、拦截日常=0
+// ⇒ 完全无法区分「没刷到日常」和「字段不对/根本没走到这里」。
+// 现在每次 contentFilter 都计数，并每 20 条打一条完整字段快照作为「正常视频基线」。
+static volatile int64_t dyyyStoryCheckCount = 0;   // contentFilter 被调用次数
+static volatile int64_t dyyyStoryHitCount = 0;     // 命中日常并被过滤的条数
+
 static NSString *DYYYStoryHitOnAweme(id model) {
     if (!model) {
         return nil;
@@ -11054,7 +11061,10 @@ static void DYYYNoteAwemeTypeOnce(NSInteger awemeType, NSString *referString) {
     dispatch_once(&onceToken, ^{
         seen = [NSMutableSet set];
     });
-    NSString *key = [NSString stringWithFormat:@"%ld|%@", (long)awemeType, referString ? referString : @"-"];
+    // 【v79】改成只按 awemeType 去重（原来是 type|ref 组合）。
+    // 原因：日常如果和普通视频同 type、只是 ref 不同，组合去重会互相顶掉；
+    // 而「type 数值」本身才是内容类型的判据，新 type 出现必须冒头。
+    NSString *key = [NSString stringWithFormat:@"%ld", (long)awemeType];
     @synchronized (seen) {
         if ([seen containsObject:key] || seen.count >= 60) {
             return;
@@ -11254,6 +11264,29 @@ static void DYYYNoteAwemeTypeOnce(NSInteger awemeType, NSString *referString) {
     if (skipStory) {
         storyHitSelector = DYYYStoryHitOnAweme(self);
         shouldFilterStory = (storyHitSelector != nil);
+
+        // 【v79 自检】① 累计计数 ② 每 20 条打一条完整快照（正常视频基线）
+        int64_t checkNo = ++dyyyStoryCheckCount;
+        if (shouldFilterStory) {
+            dyyyStoryHitCount++;
+        }
+        if (DYYYDiagOn()) {
+            static dispatch_once_t dyyyStoryOnce;
+            dispatch_once(&dyyyStoryOnce, ^{
+                DYYYSpeedDiag(@"[od] ★日常过滤已启用 开关=ON 判定字段=is24Story/is25Story/isStory/storyGroup/story25Group/storyCreationID");
+            });
+            // 命中必打；未命中时每 20 条采样一条，用来确认「普通视频这些字段确实全 0」
+            if (shouldFilterStory || (checkNo % 20) == 0) {
+                DYYYSpeedDiag([NSString stringWithFormat:
+                    @"[od] 自检 #%lld 命中=%lld type=%ld ref=%@ aid=%@ | %@",
+                    (long long)checkNo,
+                    (long long)dyyyStoryHitCount,
+                    (long)self.awemeType,
+                    self.referString ?: @"-",
+                    DYYYStoryCallObjectGetter(self, @"awemeID") ?: @"-",
+                    DYYYStoryFieldSnapshot(self)]);
+            }
+        }
         if (shouldFilterStory && DYYYDiagOn()) {
             // 打出「命中的是哪个字段 + 该条的全部日常字段值」，万一误杀立刻能看出来
             DYYYSpeedDiag([NSString stringWithFormat:@"[od] 拦截日常 命中=%@ type=%ld ref=%@ aid=%@ | %@",
