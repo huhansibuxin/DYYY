@@ -11,10 +11,27 @@
 
 // 【统一日志出口】受设置页「诊断日志」总开关（DYYYDiagLog，默认开）控制。
 // 关闭后 DYYY 的日志【零输出】——既包括写入 speed_diag.log 的诊断行
-// （DYYYSpeedDiag / DYYYFSDiag，它们的门控在各自函数开头），也包括这里的 NSLog（系统日志/Console）。
+// （DYYYSpeedDiag / DYYYFSDiag），也包括这里的 NSLog（系统日志/Console）。
 // ⚠️ 约定：本项目新增任何日志，一律走 DYYYLog(...) 或 DYYYSpeedDiag(...)，
 //    不要直接写裸 NSLog —— 否则会绕过总开关（历史上就漏了 36 处）。
-#define DYYYLog(fmt, ...) do { if (DYYYGetBool(@"DYYYDiagLog")) NSLog(fmt, ##__VA_ARGS__); } while (0)
+//
+// 【v75·日志必须受控】v74 实测：18:47 关掉开关后仍继续写盘到 18:48:40（170 行），
+//   说明"只读 defaults"这一层门控不够铁。现在门控收敛成唯一入口 DYYYDiagOn()，三层：
+//     ① 进程内 volatile 硬开关：设置页切换那一刻立刻置位，零 I/O、零缓存、零延迟；
+//     ② defaults（DYYYDiagLog）：保留，外部改库/跨版本也认；
+//     ③ 跨进程标记文件 tmp/DYYY/diag.state：别的进程/子进程也能立刻看到（0.3s 缓存）。
+//   三者任一为"关"即不写。定义在 DYYY.xm（Logos 编成 .mm，故必须 extern "C"）。
+#ifdef __cplusplus
+extern "C" {
+#endif
+BOOL DYYYDiagOn(void);                     // 当前是否允许写日志（唯一真相）
+void DYYYDiagSetEnabled(BOOL on);          // 设置页切换开关时调用：立即生效 + 落跨进程标记
+void DYYYDiagMarkSwitchChange(BOOL on);    // 切换前落一条取证行（能精确标记"关"的时刻）
+#ifdef __cplusplus
+}
+#endif
+
+#define DYYYLog(fmt, ...) do { if (DYYYDiagOn()) NSLog(fmt, ##__VA_ARGS__); } while (0)
 #define DYYY_IGNORE_GLOBAL_ALPHA_TAG 114514
 
 // 弹幕穿透开关缓存失效入口（定义在 DYYY.xm，设置页开关变更时由 DYYYSettingsHelper 调用）

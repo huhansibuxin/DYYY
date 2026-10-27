@@ -9,6 +9,12 @@
 
 #import "DYYYToast.h"
 #import "DYYYUtils.h"
+// 【v75】日志受控：本文件所有 NSLog 统一走 DYYYDiagOn()（定义在 DYYY.xm），
+// 设置页关掉「诊断日志」后连系统日志也零输出（此前这里的 NSLog 是绕过总开关的裸调用）。
+extern BOOL DYYYDiagOn(void);
+#ifndef DYYYLog
+#define DYYYLog(fmt, ...) do { if (DYYYDiagOn()) NSLog(fmt, ##__VA_ARGS__); } while (0)
+#endif
 
 
 @interface DYYYManager () {
@@ -612,7 +618,7 @@
         NSError *error = nil;
         [fileManager removeItemAtPath:livePhotoPath error:&error];
         if (error) {
-            NSLog(@"清理实况照片临时目录失败: %@", error.localizedDescription);
+            DYYYLog(@"清理实况照片临时目录失败: %@", error.localizedDescription);
         }
     }
 
@@ -621,7 +627,7 @@
         NSError *error = nil;
         [fileManager removeItemAtPath:generalLivePhotoPath error:&error];
         if (error) {
-            NSLog(@"清理LivePhoto临时目录失败: %@", error.localizedDescription);
+            DYYYLog(@"清理LivePhoto临时目录失败: %@", error.localizedDescription);
         }
     }
 
@@ -1334,10 +1340,10 @@
                 }
             }
             
-            NSLog(@"[DYYY] 评论图片URL: %@", imageUrlStr);
+            DYYYLog(@"[DYYY] 评论图片URL: %@", imageUrlStr);
             
             if (!imageUrlStr || imageUrlStr.length == 0) {
-                NSLog(@"[DYYY] 无法获取图片URL，imageModel: %@", imageModel);
+                DYYYLog(@"[DYYY] 无法获取图片URL，imageModel: %@", imageModel);
                 continue;
             }
             
@@ -1361,11 +1367,11 @@
             // 普通图片 - 存储字符串而不是 NSURL
             [normalImages addObject:imageUrlStr];
         } @catch (NSException *e) {
-            NSLog(@"[DYYY] 解析评论图片失败: %@", e);
+            DYYYLog(@"[DYYY] 解析评论图片失败: %@", e);
         }
     }
     
-    NSLog(@"[DYYY] 解析完成: 普通图片=%lu, 实况照片=%lu", (unsigned long)normalImages.count, (unsigned long)livePhotos.count);
+    DYYYLog(@"[DYYY] 解析完成: 普通图片=%lu, 实况照片=%lu", (unsigned long)normalImages.count, (unsigned long)livePhotos.count);
     
     // 如果都没有解析到有效URL，直接返回失败
     if (normalImages.count == 0 && livePhotos.count == 0) {
@@ -2813,7 +2819,7 @@
     // 设置视频写入器
     AVAssetWriter *videoWriter = [[AVAssetWriter alloc] initWithURL:[NSURL fileURLWithPath:outputPath] fileType:AVFileTypeMPEG4 error:&error];
     if (error) {
-        NSLog(@"创建视频写入器失败: %@", error);
+        DYYYLog(@"创建视频写入器失败: %@", error);
         if (completion)
             completion(NO);
         return;
@@ -2892,7 +2898,7 @@
               CMTime frameTime = CMTimeMake(i, frameRate);
               success = [adaptor appendPixelBuffer:pixelBuffer withPresentationTime:frameTime];
               if (!success) {
-                  NSLog(@"无法写入像素缓冲区");
+                  DYYYLog(@"无法写入像素缓冲区");
                   break;
               }
           } else {
@@ -2913,7 +2919,7 @@
             if (completion)
                 completion(YES);
         } else {
-            NSLog(@"写入视频失败: %@", videoWriter.error);
+            DYYYLog(@"写入视频失败: %@", videoWriter.error);
             if (completion)
                 completion(NO);
         }
@@ -2999,7 +3005,7 @@
                                  NSError *removeError = nil;
                                  [[NSFileManager defaultManager] removeItemAtURL:gifURL error:&removeError];
                                  if (removeError) {
-                                     NSLog(@"删除临时转换文件失败: %@", removeError);
+                                     DYYYLog(@"删除临时转换文件失败: %@", removeError);
                                  }
                                });
                              }];
@@ -3023,7 +3029,7 @@
         dispatch_async(dispatch_get_main_queue(), ^{
             [DYYYUtils showToast:@"语音数据解析失败"];
         });
-        NSLog(@"[DYYY] 解析语音 JSON 失败: %@", error);
+        DYYYLog(@"[DYYY] 解析语音 JSON 失败: %@", error);
         return;
     }
     
@@ -3068,7 +3074,7 @@
             dispatch_async(dispatch_get_main_queue(), ^{
                 [DYYYUtils showToast:[NSString stringWithFormat:@"下载失败: %@", error.localizedDescription]];
             });
-            NSLog(@"[DYYY] 下载语音失败: %@", error);
+            DYYYLog(@"[DYYY] 下载语音失败: %@", error);
             return;
         }
         
@@ -3103,7 +3109,7 @@
             dispatch_async(dispatch_get_main_queue(), ^{
                 [DYYYUtils showToast:@"文件保存失败"];
             });
-            NSLog(@"[DYYY] 移动文件失败: %@", moveError);
+            DYYYLog(@"[DYYY] 移动文件失败: %@", moveError);
             return;
         }
         

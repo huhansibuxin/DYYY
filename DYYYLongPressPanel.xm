@@ -1,4 +1,5 @@
 #import "AwemeHeaders.h"
+#include <unistd.h>   // getpid()（v75：日志每行带 pid）
 #import <objc/message.h>
 #import "DYYYBottomAlertView.h"
 #import "DYYYConfirmCloseView.h"
@@ -88,18 +89,18 @@ static NSString *DYYYFSDiagDirectory(void) {
 }
 
 static void DYYYFSDiagImpl(NSString *msg);
-#define DYYYFSDiag(...) do { if (DYYYGetBool(@"DYYYDiagLog")) DYYYFSDiagImpl(__VA_ARGS__); } while (0)
+#define DYYYFSDiag(...) do { if (DYYYDiagOn()) DYYYFSDiagImpl(__VA_ARGS__); } while (0)
 static void DYYYFSDiagImpl(NSString *msg) {
     // 开关判断已由上面 DYYYFSDiag 宏完成（关闭时连参数拼接都不求值）。
     @try {
-        NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
+        NSString *line = [NSString stringWithFormat:@"%@ [p%d] %@\n", [NSDate date], (int)getpid(), msg];
         static dispatch_queue_t q;
         static dispatch_once_t once;
         dispatch_once(&once, ^{ q = dispatch_queue_create("com.dyyy.fsdiag", DISPATCH_QUEUE_SERIAL); });
         dispatch_async(q, ^{
-            // 【v62 门控加固】落盘前复检开关，堵住"关开关瞬间队列里已投递的行"这个异步窗口。
+            // 【v62 门控加固 / v75 换用铁门控】落盘前复检开关，堵住"关开关瞬间队列里已投递的行"。
             // 关闭态下宏已短路、进不到本函数，所以这里不会引入"关闭态双读"的回归。
-            if (!DYYYGetBool(@"DYYYDiagLog")) {
+            if (!DYYYDiagOn()) {
                 return;
             }
             @try {

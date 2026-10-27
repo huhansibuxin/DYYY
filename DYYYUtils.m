@@ -612,7 +612,7 @@ static void DYYYApplyDisplayLocationToLabel(UILabel *label, NSString *displayLoc
                                         if ([error.domain isEqualToString:DYYYGeonamesErrorDomain]) {
                                             displayLocation = [DYYYUtils displayLocationForGeoNamesError:error model:model];
                                         } else {
-                                            NSLog(@"[DYYY] GeoNames fetch failed: %@", error.localizedDescription);
+                                            DYYYLog(@"[DYYY] GeoNames fetch failed: %@", error.localizedDescription);
                                             NSString *fallbackLocation = [DYYYUtils fallbackLocationFromIPAttribution:model];
                                             if (fallbackLocation.length > 0) {
                                                 displayLocation = fallbackLocation;
@@ -1052,7 +1052,7 @@ static void DYYYApplyDisplayLocationToLabel(UILabel *label, NSString *displayLoc
                                           includingPropertiesForKeys:keys
                                                              options:NSDirectoryEnumerationSkipsHiddenFiles
                                                         errorHandler:^BOOL(NSURL *url, NSError *error) {
-                                                          NSLog(@"Error enumerating %@: %@", url.path, error);
+                                                          DYYYLog(@"Error enumerating %@: %@", url.path, error);
                                                           return YES;
                                                         }];
 
@@ -1061,7 +1061,7 @@ static void DYYYApplyDisplayLocationToLabel(UILabel *label, NSString *displayLoc
         NSDictionary<NSURLResourceKey, id> *resourceValues = [fileURL resourceValuesForKeys:keys error:&resourceError];
 
         if (resourceError) {
-            NSLog(@"Error getting resource values for %@: %@", fileURL.path, resourceError);
+            DYYYLog(@"Error getting resource values for %@: %@", fileURL.path, resourceError);
             continue;
         }
 
@@ -1075,7 +1075,7 @@ static void DYYYApplyDisplayLocationToLabel(UILabel *label, NSString *displayLoc
         if (fileSize) {
             totalSize += fileSize.unsignedLongLongValue;
         } else {
-            NSLog(@"Missing file size for %@", fileURL.path);
+            DYYYLog(@"Missing file size for %@", fileURL.path);
         }
     }
     return totalSize;
@@ -1086,7 +1086,7 @@ static void DYYYApplyDisplayLocationToLabel(UILabel *label, NSString *displayLoc
     BOOL isDir = NO;
 
     if (![fileManager fileExistsAtPath:directoryPath isDirectory:&isDir] || !isDir) {
-        NSLog(@"[CacheClean] Path is not a directory or does not exist: %@", directoryPath);
+        DYYYLog(@"[CacheClean] Path is not a directory or does not exist: %@", directoryPath);
         return;
     }
 
@@ -1096,7 +1096,7 @@ static void DYYYApplyDisplayLocationToLabel(UILabel *label, NSString *displayLoc
                                           includingPropertiesForKeys:@[ NSURLIsDirectoryKey, NSURLIsSymbolicLinkKey ]
                                                              options:NSDirectoryEnumerationSkipsHiddenFiles
                                                         errorHandler:^BOOL(NSURL *url, NSError *enumError) {
-                                                          NSLog(@"[CacheClean] Error enumerating directory %@: %@", url, enumError);
+                                                          DYYYLog(@"[CacheClean] Error enumerating directory %@: %@", url, enumError);
                                                           return YES;
                                                         }];
 
@@ -1113,9 +1113,9 @@ static void DYYYApplyDisplayLocationToLabel(UILabel *label, NSString *displayLoc
     for (NSURL *itemURL in [itemsToDelete reverseObjectEnumerator]) {
         NSError *removeError = nil;
         if ([fileManager removeItemAtURL:itemURL error:&removeError]) {
-            // NSLog(@"[CacheClean] Successfully removed: %@", itemURL.lastPathComponent);
+            // DYYYLog(@"[CacheClean] Successfully removed: %@", itemURL.lastPathComponent);
         } else {
-            NSLog(@"[CacheClean] Error removing %@: %@", itemURL.path, removeError);
+            DYYYLog(@"[CacheClean] Error removing %@: %@", itemURL.path, removeError);
         }
     }
 }
@@ -1450,7 +1450,7 @@ static void DYYYApplyDisplayLocationToLabel(UILabel *label, NSString *displayLoc
             NSError *removeError = nil;
             [[NSFileManager defaultManager] removeItemAtPath:path error:&removeError];
             if (removeError) {
-                NSLog(@"删除临时GIF文件失败: %@", removeError);
+                DYYYLog(@"删除临时GIF文件失败: %@", removeError);
             }
           });
         }];
@@ -1558,7 +1558,7 @@ static void DYYYApplyDisplayLocationToLabel(UILabel *label, NSString *displayLoc
       [exportSession exportAsynchronouslyWithCompletionHandler:^{
         BOOL success = exportSession.status == AVAssetExportSessionStatusCompleted;
         if (!success) {
-            NSLog(@"Merge export failed: %@", exportSession.error);
+            DYYYLog(@"Merge export failed: %@", exportSession.error);
         } else {
             [[NSFileManager defaultManager] removeItemAtURL:videoURL error:nil];
         }
@@ -1653,7 +1653,7 @@ static void DYYYApplyDisplayLocationToLabel(UILabel *label, NSString *displayLoc
       if (!success) {
           [[NSFileManager defaultManager] removeItemAtURL:gifURL error:nil];
           if (failureReason.length > 0) {
-              NSLog(@"[DYYY] convertHeicToGif失败: %@", failureReason);
+              DYYYLog(@"[DYYY] convertHeicToGif失败: %@", failureReason);
           }
       }
 
@@ -2320,12 +2320,12 @@ static void DYYYAppendViewTree(UIView *view, NSMutableString *buffer, NSUInteger
                                            atomically:YES
                                              encoding:NSUTF8StringEncoding
                                                 error:&fallbackError];
-                NSLog(@"[DYYY] dump view tree fallback to %@ ok=%d err=%@", fallback, fallbackOK, fallbackError);
+                DYYYLog(@"[DYYY] dump view tree fallback to %@ ok=%d err=%@", fallback, fallbackOK, fallbackError);
             } else {
-                NSLog(@"[DYYY] dump view tree failed: %@", writeError);
+                DYYYLog(@"[DYYY] dump view tree failed: %@", writeError);
             }
         } else {
-            NSLog(@"[DYYY] dump view tree to %@ size=%lu", targetPath, (unsigned long)buffer.length);
+            DYYYLog(@"[DYYY] dump view tree to %@ size=%lu", targetPath, (unsigned long)buffer.length);
         }
     });
 }

@@ -5,6 +5,12 @@
 #import "DYYYFloatClearButton.h"
 #import "DYYYFloatSpeedButton.h"
 
+// 【v75】诊断日志总开关的三个入口（实现都在 DYYY.xm，Logos 编成 .mm 但函数是 extern "C" 的 C 符号）。
+// 设置页只认这一套：内存硬开关 + defaults + 跨进程标记文件一起切，关掉立刻生效、一行都不再写。
+extern BOOL DYYYDiagOn(void);
+extern void DYYYDiagSetEnabled(BOOL on);
+extern void DYYYDiagMarkSwitchChange(BOOL on);
+
 typedef NS_ENUM(NSInteger, DYYYSettingItemType) { DYYYSettingItemTypeSwitch, DYYYSettingItemTypeTextField, DYYYSettingItemTypePicker };
 
 @interface DYYYSettingItem : NSObject
@@ -737,7 +743,15 @@ typedef NS_ENUM(NSInteger, DYYYSettingItemType) { DYYYSettingItemTypeSwitch, DYY
     NSIndexPath *indexPath = [NSIndexPath indexPathForRow:sender.tag % 1000 inSection:sender.tag / 1000];
     DYYYSettingItem *item = self.settingSections[indexPath.section][indexPath.row];
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    [defaults setBool:sender.isOn forKey:item.key];
+    // 【v75】诊断日志总开关：走专门入口，三层门控一起切换（内存硬开关 + defaults + 跨进程标记文件）。
+    // 先在"旧状态还没变"时落一条取证行，这样日志里能精确看到"用户是几点几分点的关闭"——
+    // v74 就是因为没有这个锚点，才出现"关了之后还写了 100 秒"却说不清到底几点关的。
+    if ([item.key isEqualToString:@"DYYYDiagLog"]) {
+        DYYYDiagMarkSwitchChange(sender.isOn);
+        DYYYDiagSetEnabled(sender.isOn);
+    } else {
+        [defaults setBool:sender.isOn forKey:item.key];
+    }
     if ([item.key isEqualToString:@"DYYYEnableFloatSpeedButton"] || [item.key isEqualToString:@"DYYYSpeedButtonShowX"]) {
         [FloatingSpeedButton reloadConfiguration];
     }

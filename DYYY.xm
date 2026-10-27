@@ -6,6 +6,7 @@
 //  Created on: 2024/10/04
 //
 #import <QuartzCore/QuartzCore.h>
+#include <unistd.h>   // getpid()（v75：日志每行带 pid）
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
@@ -578,27 +579,103 @@ static NSString *DYYYSpeedDiagDirectory(void) {
     return dir;
 }
 
+// ============================================================================
+// 【v75】日志总开关：唯一真相 DYYYDiagOn()，三层铁门控（详见 AwemeHeaders.h 说明）
+//   ① dyyyDiagHardOff —— 设置页点关闭那一刻立刻置 YES，纯内存、零 I/O、零延迟
+//   ② defaults DYYYDiagLog —— 每次仍读（外部改库 / 旧版本写入也认）
+//   ③ tmp/DYYY/diag.state —— 跨进程标记文件（内容 "1"/"0"），0.3s 缓存
+// 为什么不在"只读 defaults"上再加猜：v74 实测关掉后还写了 100 秒，
+//   而 slow path 只有一个可能——某个写入方读到的不是我们以为的那份值。
+//   所以把状态同时落到"任何进程都能 stat 到"的文件，从根上消除歧义。
+// ⚠️ 硬开关一旦置位，只能由 DYYYDiagSetEnabled(YES) 解除（外部改库后需重启抖音）。
+// ============================================================================
+static volatile BOOL dyyyDiagHardOff = NO;
+
 static void DYYYSpeedDiagImpl(NSString *msg);
-#define DYYYSpeedDiag(...) do { if (DYYYGetBool(@"DYYYDiagLog")) DYYYSpeedDiagImpl(__VA_ARGS__); } while (0)
+
+static NSString *DYYYDiagMarkerPath(void) {
+    return [DYYYSpeedDiagDirectory() stringByAppendingPathComponent:@"diag.state"];
+}
+
+extern "C" BOOL DYYYDiagOn(void) {
+    if (dyyyDiagHardOff) {
+        return NO;
+    }
+    if (![[NSUserDefaults standardUserDefaults] boolForKey:@"DYYYDiagLog"]) {
+        dyyyDiagHardOff = YES;   // defaults 已关 ⇒ 顺手把硬开关也压上，后续零 defaults 读
+        return NO;
+    }
+    // ③ 跨进程标记：0.3s 缓存（乐观并发，读的都是同一个小文件，无需加锁）
+    static NSTimeInterval ckAt = 0;
+    static BOOL ckOff = NO;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - ckAt > 0.3) {
+        ckAt = now;
+        NSString *s = [NSString stringWithContentsOfFile:DYYYDiagMarkerPath()
+                                                encoding:NSUTF8StringEncoding
+                                                   error:nil];
+        ckOff = (s.length > 0 && [s characterAtIndex:0] == '0');
+    }
+    return !ckOff;
+}
+
+extern "C" void DYYYDiagSetEnabled(BOOL on) {
+    // 顺序有讲究：先写标记文件（让别的进程也能立刻看到），再改 defaults，最后动内存开关。
+    [[NSString stringWithFormat:@"%d\n", (int)on] writeToFile:DYYYDiagMarkerPath()
+                                                    atomically:YES
+                                                      encoding:NSUTF8StringEncoding
+                                                         error:nil];
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"DYYYDiagLog"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    dyyyDiagHardOff = !on;
+}
+
+// 切换开关前落一条"取证行"：这是"关闭"这个事件本身的记录（不是功能日志），所以【故意绕过门控】
+// 直接同步写盘 —— 必须绕过的原因：紧接着 DYYYDiagSetEnabled(NO) 会把硬开关压死，
+// 若走队列异步写，block 里的复检会把这一行也丢掉，就永远不知道用户几点关的。
+// 每行带 pid，能一眼看出是哪台进程写的（v74 排查时就卡在这个歧义上）。
+extern "C" void DYYYDiagMarkSwitchChange(BOOL on) {
+    @try {
+        NSString *line = [NSString stringWithFormat:
+            @"%@ [p%d] [diag] 设置页：诊断日志开关 → %@（本行之后不再写盘）\n",
+            [NSDate date], (int)getpid(), on ? @"开启" : @"关闭"];
+        NSString *path = [DYYYSpeedDiagDirectory() stringByAppendingPathComponent:@"speed_diag.log"];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (fh) {
+            [fh seekToEndOfFile];
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        } else {
+            NSString *old = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+            [(old ? [old stringByAppendingString:line] : line) writeToFile:path
+                                                               atomically:YES
+                                                                 encoding:NSUTF8StringEncoding
+                                                                    error:nil];
+        }
+    } @catch (__unused NSException *e) {}
+}
+
+static void DYYYSpeedDiagImpl(NSString *msg);
+#define DYYYSpeedDiag(...) do { if (DYYYDiagOn()) DYYYSpeedDiagImpl(__VA_ARGS__); } while (0)
 static void DYYYSpeedDiagImpl(NSString *msg) {
     // 开关判断已由上面的 DYYYSpeedDiag 宏完成（调用点连同参数拼接一起被短路，
     // 关闭时零字符串拼接、零队列投递）。所以进到这里的调用，必然是"发起那一刻开关是开的"。
     @try {
-        NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
+        // 【v75】每行带 pid：日志若被别的进程/子进程写也能一眼看出来（v74 排查时就卡在这个歧义上）
+        NSString *line = [NSString stringWithFormat:@"%@ [p%d] %@\n", [NSDate date], (int)getpid(), msg];
         static dispatch_queue_t dyyyDiagWriteQueue;
         static dispatch_once_t dyyyDiagOnce;
         dispatch_once(&dyyyDiagOnce, ^{
             dyyyDiagWriteQueue = dispatch_queue_create("com.dyyy.speeddiag", DISPATCH_QUEUE_SERIAL);
         });
         dispatch_async(dyyyDiagWriteQueue, ^{
-            // 【v62 门控加固】落盘前复检一次开关。
+            // 【v62 门控加固 / v75 换用铁门控】落盘前复检。
             // 必须复检的原因：写盘是异步的，从"投递"到"真正写"之间有一个队列窗口；
             // 老板关掉日志开关的那一刻，此前已投递但还没写的行仍会写进去 ⇒
             // 表现为"开关关了日志还在长"，违背「关闭后所有日志都不写」。
-            // 成本：只有开关【开着】时才会走到这里、每行多一次 defaults 读
-            // （boolForKey 是进程内字典查找，相比本行本来就有的 open/seek/write/close 可忽略）；
-            // 开关关闭时宏已经短路，根本不会进本函数，因此不存在"关闭态双读"的回归。
-            if (!DYYYGetBool(@"DYYYDiagLog")) {
+            // v75：复检从"读 defaults"升级为 DYYYDiagOn()（内存硬开关 + defaults + 跨进程标记文件），
+            //   三层任一为关即丢弃 ⇒ 关开关后队列里残留的行也绝不会落盘。
+            if (!DYYYDiagOn()) {
                 return;
             }
             @try {
