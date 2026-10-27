@@ -4218,7 +4218,7 @@ static BOOL dyyyAPCanNextThunk(id self, SEL _cmd, id aweme) {
 }
 
 static void dyyyAPAutoNextThunk(id self, SEL _cmd) {
-    if (dyyyAPThrottle(2, 0.5)) {
+    if (DYYYAPThrottle(2, 0.5)) {
         DYYYSpeedDiag([NSString stringWithFormat:@"[ap] autoPlayNext 被调用 revLand=%d cls=%@",
                        (int)DYYYAPIsReverseLandscape(), NSStringFromClass([self class])]);
     }
