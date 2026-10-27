@@ -11081,11 +11081,13 @@ static void DYYYNoteAwemeTypeOnce(NSInteger awemeType, NSString *referString) {
         if (DYYYDiagOn()) {
             DYYYSpeedDiag(@"[od] 兜底：日常独立页面已自动关闭");
         }
-        UINavigationController *nav = self.navigationController;
+        // 类只有前向声明（拿不到父类属性），强转成 UIViewController 再用标准 API
+        UIViewController *vc = (UIViewController *)self;
+        UINavigationController *nav = vc.navigationController;
         if (nav && nav.viewControllers.count > 1) {
             [nav popViewControllerAnimated:NO];
-        } else if (self.presentingViewController) {
-            [self dismissViewControllerAnimated:NO completion:nil];
+        } else if (vc.presentingViewController) {
+            [vc dismissViewControllerAnimated:NO completion:nil];
         }
     });
 }
