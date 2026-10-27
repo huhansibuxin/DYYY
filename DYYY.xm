@@ -4197,8 +4197,9 @@ static void DYYYAPDumpMethodsForClass(Class cls) {
 //   ⚠️ 另一个 v70 隐藏 bug：判完逻辑写在 DYYYDiagLog 门控之内 ⇒ 关掉日志功能就没了。
 //      v71 功能与日志彻底分离：判完 → 推页 永远生效，日志才受开关控制。
 // 【核心策略】抖音横屏是「播完 → loop 重播本条」而不是「停下来」。所以不能等 1.5s 再看结局，
-//   那 1.5s 里它已经从头播了。正确做法：判到末段（total-cur ≤ 0.35s）后只等 0.35s，
-//   这 0.35s 只用来让抖音「有机会自己切」；它没切（引擎/总时长都没变）⇒ 我们自己推一页。
+//   那 1.5s 里它已经从头播了。正确做法：判到末段（total-cur ≤ 0.35s）后等 1.0s，
+//   这 1.0s 是留给抖音自己切条的时间（它本来就会切，只是有时候不切）；
+//   1.0s 后引擎和总时长都没变 ⇒ 确认它没切 ⇒ 我们兜底推一页。
 // ============================================================================
 #define DYYY_PROG_SEL_NAME "player:updatePlayTime:canPlayTime:totalTime:"
 
@@ -4206,7 +4207,7 @@ typedef void (*DYYYProgIMP)(id, SEL, id, double, double, double);
 
 // 按类落表（v66 教训：单槽 orig 会被后钩的类覆盖）。
 // 用定长 C 数组 + 线性扫描：进度回调每秒多次，加锁/查字典都嫌重，扫 ≤32 个指针几乎免费。
-#define DYYY_PROG_MAX_HOOKED 32
+#define DYYY_PROG_MAX_HOOKED 128
 static Class dyyyProgClasses[DYYY_PROG_MAX_HOOKED];
 static IMP dyyyProgIMPs[DYYY_PROG_MAX_HOOKED];
 static volatile int dyyyProgHookedCount = 0;
@@ -4224,7 +4225,7 @@ static IMP DYYYProgOrigFor(Class cls) {
 }
 
 // —— 观察状态 ——
-// dyyyProgWatched* ：播完那一刻锁定的「那一台引擎」，用于 0.35s 后判有没有自己切
+// dyyyProgWatched* ：播完那一刻锁定的「那一台引擎」，用于 1.0s 后判有没有自己切
 static uintptr_t dyyyProgWatchedPtr = 0;
 static double dyyyProgWatchedBaseTotal = 0;
 static double dyyyProgWatchedCur = 0;
@@ -4237,6 +4238,9 @@ static NSTimeInterval dyyyProgGlobalAt = 0;
 static NSTimeInterval dyyyProgLastSampleAt = 0;
 static NSTimeInterval dyyyProgLastVerdictAt = 0;
 static NSTimeInterval dyyyProgLastAdvanceAt = 0;
+static NSTimeInterval dyyyProgLastDumpAt = 0;
+// 【v72】上一次推页的目标 offset：防「被回弹后按回弹值算成同一页」
+static CGFloat dyyyProgLastTargetOffset = -1;
 
 // 横屏下所有滚动容器快照（诊断用，只在门控内打）
 static void DYYYProgDumpScrollViews(void) {
@@ -4340,15 +4344,39 @@ static BOOL DYYYProgAdvancePage(NSString **detailOut) {
     BOOL vertical = (cs.height > b.height * 1.5);
     CGFloat maxOffset = vertical ? (cs.height - b.height) : (cs.width - b.width);
     CGFloat cur = vertical ? off.y : off.x;
-    CGFloat curPage = round(cur / step);
-    CGFloat target = (curPage + 1) * step;
-    if (target > maxOffset + 1.0) {
+
+    // 【v72】手指正在滑 / 惯性滚动中，绝不插手：
+    // v71 实测 10:13:26 推页后 10:13:28 用户手动竖滑，offset 被回弹 3440→3040，
+    // 下一次判完又按 3040 算出 3440（= 当前页）再推一次 ⇒ 就是那一下「跳两次」。
+    // 手势进行中 setContentOffset 一定会和 UIScrollView 自己的手势状态打架，等它停下再说。
+    if (sv.isTracking || sv.isDragging || sv.isDecelerating) {
         if (detailOut) {
-            *detailOut = [NSString stringWithFormat:@"已是末页 cur=%.0f max=%.0f step=%.0f",
-                          cur, maxOffset, step];
+            *detailOut = [NSString stringWithFormat:
+                @"用户手指滑动中（tracking=%d dragging=%d decel=%d），本次不推",
+                (int)sv.isTracking, (int)sv.isDragging, (int)sv.isDecelerating];
         }
         return NO;
     }
+
+    // 【v72】基准不能被「回弹后的 offset」骗：取 max(当前 offset, 上次推页目标)。
+    // 否则 offset 被回弹到 3040 时会算出 target=3440（还是当前页），推了等于没推。
+    if (dyyyProgLastTargetOffset > cur + step * 3.0) {
+        dyyyProgLastTargetOffset = cur;   // 容器被重置（换播放页等），旧目标作废
+    }
+    CGFloat base = cur;
+    if (dyyyProgLastTargetOffset > base) {
+        base = dyyyProgLastTargetOffset;
+    }
+    CGFloat curPage = round(base / step);
+    CGFloat target = (curPage + 1) * step;
+    if (target > maxOffset + 1.0) {
+        if (detailOut) {
+            *detailOut = [NSString stringWithFormat:@"已是末页 cur=%.0f base=%.0f max=%.0f step=%.0f",
+                          cur, base, maxOffset, step];
+        }
+        return NO;
+    }
+    dyyyProgLastTargetOffset = target;
     if (vertical) {
         [sv setContentOffset:CGPointMake(off.x, target) animated:YES];
     } else {
@@ -4362,7 +4390,7 @@ static BOOL DYYYProgAdvancePage(NSString **detailOut) {
     return YES;
 }
 
-// 末段命中：拍快照 → 0.35s 后判抖音自己切没切 → 没切就自己推一页
+// 末段命中：拍快照 → 1.0s 后判抖音自己切没切 → 没切就自己推一页（兜底）
 static void DYYYProgOnItemEnd(id host, id player, double cur, double total, NSTimeInterval now) {
     uintptr_t ptr = (uintptr_t)player;
     dyyyProgWatchedPtr = ptr;
@@ -4387,8 +4415,13 @@ static void DYYYProgOnItemEnd(id host, id player, double cur, double total, NSTi
         return;
     }
 
+    // 【v72·观察窗口 0.35s → 1.0s】
+    // 老板实机纠正：抖音**自己会切**，只是「有时候不切」（原因未知）。
+    // v71 用 0.35s 太急：抖音从「播完」到「新条回报第一条进度」经常要 0.5~1s，
+    // 我们在它切换过程中就推了 ⇒ 抖音随后也切 ⇒ 一次播完跳两条（这就是老板看到的「跳两次」）。
+    // 现在给足 1.0s：它切了我们就不动，只有它真没切（引擎 + 总时长都没变）才兜底推一页。
     NSTimeInterval endAt = now;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         // 抖音自己切了吗？三重判据（任一成立就算切了，绝不能推，否则一次跳两条）
         BOOL oldStillAdvancing = (dyyyProgWatchedLastSeen > endAt + 0.01);
@@ -4401,7 +4434,7 @@ static void DYYYProgOnItemEnd(id host, id player, double cur, double total, NSTi
         if (switched) {
             if (DYYYGetBool(@"DYYYDiagLog")) {
                 DYYYSpeedDiag([NSString stringWithFormat:
-                    @"[prog] 0.35s 后抖音自己切了（总时长变=%d 换引擎=%d）→ 不插手",
+                    @"[prog] 1.0s 后抖音自己切了（总时长变=%d 换引擎=%d）→ 不插手",
                     (int)totalChanged, (int)otherEngine]);
             }
             dyyyProgWatchedPtr = 0;
@@ -4409,7 +4442,15 @@ static void DYYYProgOnItemEnd(id host, id player, double cur, double total, NSTi
         }
 
         NSTimeInterval now2 = [NSDate timeIntervalSinceReferenceDate];
-        if (now2 - dyyyProgLastAdvanceAt < 2.0) {
+
+        // 【v72·不按时间算，只按「播完」算】
+        // 抖音横屏片长跨度极大（几小时的长视频 / 十几秒 / 几秒钟都有），
+        // 绝不能用「距上次推页 xx 秒」这种固定时间去拦 —— 老板明确要求「必须等它播完再推下一条」。
+        // 这里只挡「同一次播完被多个 host 类同时回报」：实测 AWELandscapeAdChapterAutoSkipController
+        // 与 AWELandscapeChapterProgressController 会在同一时刻各报一次同样的 cur/total，
+        // 1.0s 足够挡住这种重复，又不会挡掉 1 秒以上的短片。
+        // 「跳两次」的真因在 DYYYProgAdvancePage 里修：offset 被回弹后按回弹值算成同一页，推了等于没推。
+        if (now2 - dyyyProgLastAdvanceAt < 1.0) {
             dyyyProgWatchedPtr = 0;
             return;
         }
@@ -4420,7 +4461,7 @@ static void DYYYProgOnItemEnd(id host, id player, double cur, double total, NSTi
 
         if (DYYYGetBool(@"DYYYDiagLog")) {
             DYYYSpeedDiag([NSString stringWithFormat:
-                @"[prog] 0.35s 后未切（旧引擎还在=%d 新引擎=%d cur=%.2f/%.2f）→ %@：%@",
+                @"[prog] 1.0s 后未切（旧引擎还在=%d 新引擎=%d cur=%.2f/%.2f）→ %@：%@",
                 (int)oldStillAdvancing, (int)otherEngine,
                 dyyyProgWatchedCur, dyyyProgWatchedBaseTotal,
                 ok ? @"自己推一页" : @"推页失败", detail ? detail : @"?"]);
@@ -4429,19 +4470,36 @@ static void DYYYProgOnItemEnd(id host, id player, double cur, double total, NSTi
             }
         }
 
-        // 再等 1.2s 复核：推了到底有没有翻过去（没翻 ⇒ 下一版换手段：直接打抖音的翻页方法）
+        // 再等 1.2s 复核：翻过去了没 + 内容换没换（引擎/总时长任一变化才算真换条）
         if (ok) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
-                if (!DYYYGetBool(@"DYYYDiagLog")) {
-                    return;
-                }
                 CGFloat step = 0;
                 UIScrollView *sv = DYYYProgFindPager(&step);
-                NSString *afterTxt = sv ? [NSString stringWithFormat:@"容器=%@ y=%.0f",
-                                       NSStringFromClass([sv class]), sv.contentOffset.y]
-                                    : @"容器已消失";
-                DYYYSpeedDiag([NSString stringWithFormat:@"[prog] 推页 1.2s 后复核：%@", afterTxt]);
+                BOOL switched = (dyyyProgGlobalPtr != ptr) ||
+                                (fabs(dyyyProgWatchedTotal - total) > 0.6);
+                if (DYYYGetBool(@"DYYYDiagLog")) {
+                    NSString *afterTxt = sv ? [NSString stringWithFormat:@"容器=%@ y=%.0f",
+                                           NSStringFromClass([sv class]), sv.contentOffset.y]
+                                        : @"容器已消失";
+                    DYYYSpeedDiag([NSString stringWithFormat:
+                        @"[prog] 推页 1.2s 后复核：%@ 换条=%@（总长 %.2f→%.2f 引擎 0x%lx→0x%lx）",
+                        afterTxt, switched ? @"✓" : @"✗ 未换条",
+                        total, dyyyProgWatchedTotal, (unsigned long)ptr,
+                        (unsigned long)dyyyProgGlobalPtr]);
+                }
+                if (!switched) {
+                    // 推页没换内容 ⇒ 取证（30s 限流）：这几个类才是真正在横屏报进度的，
+                    // 把它们的 next/scroll/page 方法名 dump 出来 = v73「自己调抖音翻页」的把手。
+                    NSTimeInterval tDump = [NSDate timeIntervalSinceReferenceDate];
+                    if (tDump - dyyyProgLastDumpAt > 30.0) {
+                        dyyyProgLastDumpAt = tDump;
+                        DYYYSpeedDiag(@"[prog] 推页未换条 → 取抖音自己的翻页接口（dump 方法名）");
+                        DYYYAPDumpMethodsForClass(objc_getClass("AWEDPlayerVideoController"));
+                        DYYYAPDumpMethodsForClass(objc_getClass("AWELandscapeChapterProgressController"));
+                        DYYYAPDumpMethodsForClass(objc_getClass("AWELandscapeAdChapterAutoSkipController"));
+                    }
+                }
             });
         }
         dyyyProgWatchedPtr = 0;
@@ -4474,11 +4532,12 @@ static void DYYYProgObserve(id host, id player, double cur, double total) {
             (int)DYYYIsLandscapeFullscreenNow(), (int)gDYYYFSReverseActive]);
     }
 
-    // 末段（≤0.35s）才判播完；2.5s 去抖防重播期间反复触发
+    // 末段（≤0.35s）才判播完。去抖 1.0s：只挡同一次播完被多个 host 类同时回报，
+    // 不能更长 —— 抖音横屏有 1~2 秒的极短片，档太久会把真的下一条吞掉（老板明确要求按播完算）。
     if (total - cur > 0.35) {
         return;
     }
-    if (now - dyyyProgLastVerdictAt < 2.5) {
+    if (now - dyyyProgLastVerdictAt < 1.0) {
         return;
     }
     dyyyProgLastVerdictAt = now;
