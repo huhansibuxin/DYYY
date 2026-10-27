@@ -178,41 +178,29 @@ static void DYYYFSApplyOrientation(UIInterfaceOrientation target) {
     [[UIDevice currentDevice] setValue:@(target) forKey:@"orientation"];
     [UIViewController attemptRotationToDeviceOrientation];
 
-    // ===== 【v63 核心修复】把"设备方向变了"这件事广播出去 =====
-    // 现象（老板 2026-10-27 实机）：反向全屏进去后，视频播完【不自动切下一条】；
-    //   但【手动划几条之后又恢复正常】。正向横屏（原生旋转）一切正常。
-    // 根因推论：抖音（和绝大多数播放器一样）是靠
-    //   UIDeviceOrientationDidChangeNotification 来维护自己那份「当前横屏方向 / 是否横屏」状态缓存的。
-    //   正向横屏时是系统自己转、系统自己发这条通知 → 抖音状态正确 → 播完照常切条。
-    //   反向全屏是我们在它背后硬转：geometry 请求 + KVC 改 UIDevice.orientation + attemptRotation，
-    //   UIKit 自己转过去了（界面确实翻了），但【这条通知一次都没发过】⇒
-    //   抖音的方向缓存还停在原来的方向，全屏容器按旧方向算，播完时"下一条"的判定落空 → 不动。
-    //   手动滑动之所以能治好：滚动/布局把它的容器状态重新算了一遍（自愈路径），所以"滑几个就正常了"。
-    // 修法：转完之后补发这条通知（抖音自己会读 device.orientation，我们已经写成 target），
-    //   让它走它本来就该走的响应逻辑。发两次（0ms + 0.12s）兜住它可能的重入/去抖。
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [[NSNotificationCenter defaultCenter]
-            postNotificationName:@"UIDeviceOrientationDidChangeNotification"
-                          object:[UIDevice currentDevice]];
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        [[NSNotificationCenter defaultCenter]
-            postNotificationName:@"UIDeviceOrientationDidChangeNotification"
-                          object:[UIDevice currentDevice]];
-    });
+    // ===== 【v65 已撤回：这里原来在 v63 补发 UIDeviceOrientationDidChangeNotification】=====
+    // 为什么撤回（2026-10-27 实机日志，铁证）：
+    //   v62（无补发）：已进横屏 cur=3 → 翻到 4 → 0.5s cur=4 → 1.2s cur=4 ✓稳定
+    //   v63/v64（有补发）：已进横屏 cur=3 → 翻到 4 → 0.5s cur=1 → 1.2s cur=1 ✗被拨回
+    //                      外加 geometry 被拒：已请求 landscapeLeft；受支持 portrait
+    // 结论：补发这条通知不是"让抖音知道方向变了"，而是"让抖音去读 UIDevice.orientation"。
+    //   而本文件 DYYYFSClearOrientationBias 的注释早就写明：这个值是用 KVC 硬写进去的伪值，
+    //   【写进去的值读回来对不上】。抖音读到错的设备方向后，反过来把 top VC 的
+    //   supportedInterfaceOrientations 收窄成 portrait，于是我们下一次 geometry 请求被系统拒绝，
+    //   attemptRotationToDeviceOrientation 直接把界面转回竖屏 —— 翻面当场失效，
+    //   用户看到的就是"点反向全屏和正向全屏是一个方向"。
+    // ⇒ 方向状态只能靠 geometry + KVC + attemptRotation 三件套硬转，绝不能用广播去"通知"。
 }
 
-// 【v63 补强】翻面稳定后让 root 重新布局一次。
-// post 通知是让抖音"知道方向变了"，这一步是顺手把当前 window 的布局脏标记打上，
-// 让横屏容器在下一 runloop 按新方向的尺寸重算一遍（不改任何状态，纯 UIKit 常规调用）。
+// 【v63 补强，v65 收窄】翻面稳定后让 root 重新布局一次。
+// ⚠️ 这里刻意【不调 setNeedsUpdateOfSupportedInterfaceOrientations】：
+//   那会让系统立刻重新询问 VC 的 supportedInterfaceOrientations，而抖音此刻很可能回 portrait，
+//   结果就是把刚翻好的方向又拨回去（v63 的教训，见 DYYYFSApplyOrientation 里的日志对照）。
+//   只打布局脏标记，纯 UIKit 常规调用，不参与方向判定。
 static void DYYYFSRequestRelayoutAfterFlip(void) {
     UIWindow *win = [UIApplication sharedApplication].keyWindow;
     if (!win) return;
     UIViewController *root = win.rootViewController;
-    if (@available(iOS 16.0, *)) {
-        [root setNeedsUpdateOfSupportedInterfaceOrientations];
-    }
     [win setNeedsLayout];
     [root.view setNeedsLayout];
     DYYYFSDiag(@"[fs-rev] 翻面稳定 → 已请求 root 重新布局");

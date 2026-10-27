@@ -4071,7 +4071,10 @@ static BOOL DYYYIsLandscapeFullscreenNow(void) {
 //   [eov] 本条播完 cur/rev/landscape id=xxx
 //   [eov] 0.8s 后 → 已切下一条 ✓ / 重播本条 ✗（同一 id）
 //   [eov] 1.8s 后 → 最终结论
-//   [eov] 兜底：…（重播时补发方向广播 + 重布局）
+//   [eov] 兜底：…（重播时只请求重布局；v65 起不再补发方向广播）
+// ⚠️ v65 实测结论：v63 那条"补发 UIDeviceOrientationDidChangeNotification 让抖音重算方向"的思路是错的，
+//   抖音收到通知会去读 UIDevice.orientation（KVC 伪值），读到错值后把 VC 支持方向收窄成 portrait，
+//   导致反向全屏翻面被系统拒掉、直接退回竖屏。已全部撤回，详见 DYYYLongPressPanel.xm。
 extern BOOL gDYYYFSReverseActive;   // 定义在 DYYYLongPressPanel.xm：本次是否从「反向全屏」入口进的横屏
 
 static UIInterfaceOrientation DYYYDiagInterfaceOrientation(void) {
@@ -4086,17 +4089,18 @@ static UIInterfaceOrientation DYYYDiagInterfaceOrientation(void) {
     return (UIInterfaceOrientation)[UIApplication sharedApplication].statusBarOrientation;
 }
 
-// 让抖音"重新算一遍方向 + 布局"的兜底动作：不改方向、不模拟手势、不碰播放器，失败零副作用。
+// 让抖音"重新算一遍布局"的兜底动作：不改方向、不模拟手势、不碰播放器，失败零副作用。
+// ⚠️ 【v65 撤掉两件事，v63/v64 的教训】
+//   ① 不再 post UIDeviceOrientationDidChangeNotification：
+//      实测这一步会让抖音去读 UIDevice.orientation（KVC 写进去的伪值、读回来对不上），
+//      它据此把 VC 的 supportedInterfaceOrientations 收窄成 portrait，
+//      结果反向全屏翻面当场被系统拒掉、界面转回竖屏（v62 ✓稳定 → v63 ✗被拨回 的日志对照）。
+//   ② 不再调 setNeedsUpdateOfSupportedInterfaceOrientations：同样会触发方向能力重算，理由同上。
+//   只剩纯布局脏标记，对方向判定零影响。
 static void DYYYRebroadcastOrientationForDiag(void) {
-    [[NSNotificationCenter defaultCenter]
-        postNotificationName:@"UIDeviceOrientationDidChangeNotification"
-                      object:[UIDevice currentDevice]];
     UIWindow *dyyyWin = [DYYYUtils getActiveWindow];
     if (!dyyyWin) {
         return;
-    }
-    if (@available(iOS 16.0, *)) {
-        [dyyyWin.rootViewController setNeedsUpdateOfSupportedInterfaceOrientations];
     }
     [dyyyWin setNeedsLayout];
     [dyyyWin.rootViewController.view setNeedsLayout];
@@ -4138,7 +4142,7 @@ static void DYYYCheckAdvancedAfterEnd(NSString *baseIdentifier, NSUInteger baseC
                        (unsigned long)(nowCount - baseCount)]);
 
         if (isFinal && !idChanged && gDYYYFSReverseActive && DYYYIsLandscapeFullscreenNow()) {
-            DYYYSpeedDiag(@"[eov] 兜底：重播/停住 → 再补发一次方向广播 + 请求 root 重布局");
+            DYYYSpeedDiag(@"[eov] 兜底：重播/停住 → 只请求 root 重新布局（v65 起不再补发方向广播）");
             DYYYRebroadcastOrientationForDiag();
         }
     });
@@ -4171,14 +4175,11 @@ static void DYYYInstallEndOfVideoDiag(void) {
             // 1.8s：最终结论 + 兜底
             DYYYCheckAdvancedAfterEnd(baseIdentifier, baseCount, 1.8, YES);
 
-            // 【v64】播完那一瞬间就抢一次：反向横屏下抖音此刻正在决定"切下一条 or 重播本条"，
-            // 如果它自己的方向状态还是旧的，这个决策就会走成"重播本条"。
-            // 在这里把方向广播补上去，等于在它决策前把状态刷新一次 —— 这是唯一可能
-            // 真正拦住"重播"的时机（事后 0.8s/1.8s 的通知只能算补救）。
-            // 只在【反向横屏】下做，正向横屏（rev=0）完全不受影响。
+            // 【v65】播完那一瞬间原来会补发一次方向广播，已撤（会把刚翻好的反向全屏拨回竖屏）。
+            // 现在只在反向横屏下打一条日志留痕，不触发任何方向相关动作，
+            // 靠 0.8s / 1.8s 两个检查点的视频 ID 判据给出结论。
             if (gDYYYFSReverseActive && DYYYIsLandscapeFullscreenNow()) {
-                DYYYSpeedDiag(@"[eov] 播完瞬间：反向横屏 → 立刻补发方向广播（抢在重播决策前）");
-                DYYYRebroadcastOrientationForDiag();
+                DYYYSpeedDiag(@"[eov] 播完瞬间：反向横屏（v65 不做方向动作，只观察）");
             }
         }];
         DYYYSpeedDiag(@"[eov] 播完/切条诊断观察者已装（比视频 ID，不比起播次数）");
