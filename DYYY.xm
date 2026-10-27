@@ -4061,13 +4061,17 @@ static BOOL DYYYIsLandscapeFullscreenNow(void) {
     return win != nil && win.bounds.size.width > win.bounds.size.height;
 }
 
-// === 【v63 诊断】本条播完 → 到底有没有接上下一条 ===
+// === 【v63 诊断】本条播完 → 到底是"切了下一条"还是"从头重播本条" ===
 // 背景（老板 2026-10-27 实机反馈）：正向横屏正常自动下一条；反向全屏进去后"播完不滑"，
 //   但【手动划几条之后就恢复正常】，说明是"初始方向状态不一致、被用户交互顺带修好了"。
-// 这条日志用来把这件事钉死：
-//   [eov] 本条播完 ...        ← 视频真播完了（AVPlayerItemDidPlayToEndTimeNotification 到了）
-//   [eov] 2.0s 后已接上新一条 / 无新视频上岗 ← 切条成功与否
-// 有了 正向 vs 反向、rev=0 vs rev=1 的对照，就能证明"不切"发生在哪一侧。
+// ⚠️ 判据演变（老板纠正）：一开始想用"2s 后有没有新视频上岗"来判断，**这是错的** ——
+//   反向全屏下抖音不是停住，而是【把本条从头重播】，重播同样会走一遍起播流，
+//   用"有没有新起播"会误判成"已切新条 ✓"。所以必须比【视频 ID】，不是比起播次数。
+// 日志形态：
+//   [eov] 本条播完 cur/rev/landscape id=xxx
+//   [eov] 0.8s 后 → 已切下一条 ✓ / 重播本条 ✗（同一 id）
+//   [eov] 1.8s 后 → 最终结论
+//   [eov] 兜底：…（重播时补发方向广播 + 重布局）
 extern BOOL gDYYYFSReverseActive;   // 定义在 DYYYLongPressPanel.xm：本次是否从「反向全屏」入口进的横屏
 
 static UIInterfaceOrientation DYYYDiagInterfaceOrientation(void) {
@@ -4080,6 +4084,64 @@ static UIInterfaceOrientation DYYYDiagInterfaceOrientation(void) {
         }
     }
     return (UIInterfaceOrientation)[UIApplication sharedApplication].statusBarOrientation;
+}
+
+// 让抖音"重新算一遍方向 + 布局"的兜底动作：不改方向、不模拟手势、不碰播放器，失败零副作用。
+static void DYYYRebroadcastOrientationForDiag(void) {
+    [[NSNotificationCenter defaultCenter]
+        postNotificationName:@"UIDeviceOrientationDidChangeNotification"
+                      object:[UIDevice currentDevice]];
+    UIWindow *dyyyWin = [DYYYUtils getActiveWindow];
+    if (!dyyyWin) {
+        return;
+    }
+    if (@available(iOS 16.0, *)) {
+        [dyyyWin.rootViewController setNeedsUpdateOfSupportedInterfaceOrientations];
+    }
+    [dyyyWin setNeedsLayout];
+    [dyyyWin.rootViewController.view setNeedsLayout];
+}
+
+// 播完之后的单次检查：比视频 ID 判断是"切了新条"还是"重播本条"。
+// checkAt = 秒；isFinal = 最后一次（打最终结论，并决定要不要兜底）
+static void DYYYCheckAdvancedAfterEnd(NSString *baseIdentifier, NSUInteger baseCount,
+                                     double checkAt, BOOL isFinal) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(checkAt * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!DYYYGetBool(@"DYYYDiagLog")) {
+            return;
+        }
+        NSString *nowIdentifier = DYYYSpeedAwemeIdentifier(dyyyCurrentSpeedAweme);
+        NSUInteger nowCount = gDYYYApplySpeedCount;
+
+        // ① 权威判据：视频 ID 变了 = 真切了下一条
+        BOOL idChanged = baseIdentifier.length > 0 && nowIdentifier.length > 0 &&
+                         ![nowIdentifier isEqualToString:baseIdentifier];
+        // ② 回退判据（ID 取不到时）：起播次数涨了但 ID 没变 → 判定为「重播本条」
+        //    注意：只有 ID 两边都拿得到时才敢说"重播"，否则只说"没变化"。
+        NSString *verdict;
+        if (idChanged) {
+            verdict = @"已切下一条 ✓";
+        } else if (baseIdentifier.length > 0 && nowIdentifier.length > 0 &&
+                   [nowIdentifier isEqualToString:baseIdentifier]) {
+            verdict = (nowCount > baseCount) ? @"重播本条 ✗（同一 id）" : @"停住未动 ✗（同一 id）";
+        } else {
+            verdict = (nowCount > baseCount) ? @"有起播但 ID 不可比 ⚠" : @"无任何起播 ✗";
+        }
+
+        DYYYSpeedDiag([NSString stringWithFormat:@"[eov] %.1fs 后 %@ cur=%ld rev=%d id=%@ 起播=%lu(+%lu)",
+                       checkAt, verdict,
+                       (long)DYYYDiagInterfaceOrientation(),
+                       (int)gDYYYFSReverseActive,
+                       nowIdentifier ?: @"-",
+                       (unsigned long)nowCount,
+                       (unsigned long)(nowCount - baseCount)]);
+
+        if (isFinal && !idChanged && gDYYYFSReverseActive && DYYYIsLandscapeFullscreenNow()) {
+            DYYYSpeedDiag(@"[eov] 兜底：重播/停住 → 再补发一次方向广播 + 请求 root 重布局");
+            DYYYRebroadcastOrientationForDiag();
+        }
+    });
 }
 
 static void DYYYInstallEndOfVideoDiag(void) {
@@ -4096,43 +4158,30 @@ static void DYYYInstallEndOfVideoDiag(void) {
             if (!DYYYGetBool(@"DYYYDiagLog")) {
                 return;
             }
+            NSString *baseIdentifier = DYYYSpeedAwemeIdentifier(dyyyCurrentSpeedAweme);
             NSUInteger baseCount = gDYYYApplySpeedCount;
-            DYYYSpeedDiag([NSString stringWithFormat:@"[eov] 本条播完 cur=%ld rev=%d landscape=%d 已切=%lu",
+            DYYYSpeedDiag([NSString stringWithFormat:@"[eov] 本条播完 cur=%ld rev=%d landscape=%d id=%@ 起播=%lu",
                            (long)DYYYDiagInterfaceOrientation(),
                            (int)gDYYYFSReverseActive,
                            (int)DYYYIsLandscapeFullscreenNow(),
+                           baseIdentifier ?: @"-",
                            (unsigned long)baseCount]);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                if (!DYYYGetBool(@"DYYYDiagLog")) {
-                    return;
-                }
-                NSUInteger nowCount = gDYYYApplySpeedCount;
-                BOOL advanced = (nowCount > baseCount);
-                DYYYSpeedDiag([NSString stringWithFormat:@"[eov] 2.0s 后 %@ cur=%ld rev=%d 已切=%lu(+%lu)",
-                               (advanced ? @"已接上新一条 ✓" : @"无新视频上岗 ✗（没自动切）"),
-                               (long)DYYYDiagInterfaceOrientation(),
-                               (int)gDYYYFSReverseActive,
-                               (unsigned long)nowCount,
-                               (unsigned long)(nowCount - baseCount)]);
-                // 【v63 兜底】横屏里播完没接上，且本次是反向全屏进来的 ⇒ 再敲一次方向广播 + 重布局。
-                // 不发号施令、不改方向、不模拟手势，只做「让抖音重新算一遍」，失败了也无副作用。
-                // 这一手是给主修复（DYYYFSApplyOrientation 里补发通知）兜底的第二道保险。
-                if (!advanced && gDYYYFSReverseActive && DYYYIsLandscapeFullscreenNow()) {
-                    DYYYSpeedDiag(@"[eov] 兜底：补发一次方向广播 + 请求 root 重布局");
-                    [[NSNotificationCenter defaultCenter]
-                        postNotificationName:@"UIDeviceOrientationDidChangeNotification"
-                                      object:[UIDevice currentDevice]];
-                    UIWindow *dyyyWin = [DYYYUtils getActiveWindow];
-                    if (@available(iOS 16.0, *)) {
-                        [dyyyWin.rootViewController setNeedsUpdateOfSupportedInterfaceOrientations];
-                    }
-                    [dyyyWin setNeedsLayout];
-                    [dyyyWin.rootViewController.view setNeedsLayout];
-                }
-            });
+            // 0.8s：老板说重播发生得很早，早点判、早点兜底，别让用户先看到本条重播
+            DYYYCheckAdvancedAfterEnd(baseIdentifier, baseCount, 0.8, NO);
+            // 1.8s：最终结论 + 兜底
+            DYYYCheckAdvancedAfterEnd(baseIdentifier, baseCount, 1.8, YES);
+
+            // 【v64】播完那一瞬间就抢一次：反向横屏下抖音此刻正在决定"切下一条 or 重播本条"，
+            // 如果它自己的方向状态还是旧的，这个决策就会走成"重播本条"。
+            // 在这里把方向广播补上去，等于在它决策前把状态刷新一次 —— 这是唯一可能
+            // 真正拦住"重播"的时机（事后 0.8s/1.8s 的通知只能算补救）。
+            // 只在【反向横屏】下做，正向横屏（rev=0）完全不受影响。
+            if (gDYYYFSReverseActive && DYYYIsLandscapeFullscreenNow()) {
+                DYYYSpeedDiag(@"[eov] 播完瞬间：反向横屏 → 立刻补发方向广播（抢在重播决策前）");
+                DYYYRebroadcastOrientationForDiag();
+            }
         }];
-        DYYYSpeedDiag(@"[eov] 播完/切条诊断观察者已装");
+        DYYYSpeedDiag(@"[eov] 播完/切条诊断观察者已装（比视频 ID，不比起播次数）");
     });
 }
 
