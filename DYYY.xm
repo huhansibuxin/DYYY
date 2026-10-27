@@ -10768,37 +10768,33 @@ static NSHashTable *processedParentViews = nil;
 
 %end
 
-// ===================== 【v76】推荐过滤「限时日常 / 日常」（抖音内部叫 Story / OneDay）=====================
-// 老板 2026-10-27 需求：关注的人发的「限时日常」刷到后不会自动下一条（story 播放器自己 loop），一直放一直放，
-//   而且内容也不好看 ⇒ 和「过滤图文/过滤直播」一样，直接在解析阶段过滤掉，别让它进推荐流。
+// ===================== 【v76→v77】推荐过滤「限时日常 / 日常」（抖音内部叫 Story / OneDay）=====================
+// 老板 2026-10-27 需求：关注的人发的「限时日常」，刷到后不会自动下一条（story 播放器自己 loop 重播），
+//   一直放一直放，而且内容也不好看 ⇒ 和「过滤图文 / 过滤直播」一样，在模型解析阶段直接过滤掉。
 //
-// 二进制取证（AwemeCore 667MB，grep 类名/选择器）：
-//   抖音把「日常」统一叫 Story：AWEStoryKit / AWEStory25*（2.5 版，AWEStory25DraftMessage…）/
-//   AWEOneDay*（AWEOneDayFeedViewController / AWEOneDayDailyModel / AWEOneDayFeedItemModel…）；
-//   「限时」= 24h TTL，字段命名里出现 storyTTL / storyGroupV2Items / kOneDayTimestamp 等。
-//   ⇒ 判定按名字关键字兜网（story / oneday / moment / daily），具体字段名由 [od] 探针在实机打出后收敛。
+// 【和原生写法对齐 —— 原生三条过滤全都是「开关 && 一个字段」】
+//   shouldFilterAllLive = skipAllLive && [self.videoFeedTag isEqualToString:@"直播中"];
+//   shouldskipPhoto     = skipPhoto     && (self.awemeType == 68) && isRecommendFeed;
+//   shouldskipPhotoText = skipPhotoText && self.isNewTextMode     && isRecommendFeed;
+//   shouldFilterMusic   = skipMusic     && self.musicCard         && isRecommendFeed;
+//   ⇒ 日常只要在 AWEAwemeModel 上找到对应的布尔字段（或 awemeType 数值），照抄一行即可。
 //
-// ⚠️ 判定故意「先窄后宽」：过滤只用明确的布尔 getter 和明确的 story 子模型，
-//   不把 storyTTL/storyOpen 这类可能是全局开关的字段算进去，避免把正常视频过滤掉（那是不可接受的副作用）。
-static BOOL DYYYStoryNameMatches(NSString *name) {
-    if (name.length == 0) {
-        return NO;
-    }
-    static NSArray<NSString *> *hints = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        hints = @[ @"story", @"oneday", @"moment", @"daily" ];
-    });
-    NSString *lower = [name lowercaseString];
-    for (NSString *hint in hints) {
-        if ([lower containsString:hint]) {
-            return YES;
-        }
-    }
-    return NO;
-}
-
-// 只按「返回类型」放行：BOOL/c 才当布尔读，避免把返回对象的方法当布尔用（非零指针会被误判成 YES）
+// 【v76 的教训：二进制字符串 grep 拿不到真字段】
+//   搜到的 storyInfo / storyType 全是 Hi-story（HistoryInfoModel / HistoryTypeValue）的误命中；
+//   isStory 实际是 isStory25Enabled（Story 2.5 功能开关）；
+//   isOneDayStory / isFromStory / isStoryVideo / oneDayInfo 在二进制里根本不存在（0 次）。
+//   但 story 相关类名确实是抖音真实模型：
+//     AWEOneDayFeedViewController / AWEOneDayFeedSectionController / AWEOneDayFeedItemModel /
+//     AWEOneDayUserStoryModel / AWEOneDayLifeStoryModel / AWEOneDaySimpleStoryModel /
+//     AWEOneDayStoryWithCommentModel / AWEOneDayFeedViewModel
+//
+// 【v77 做法：属性名在「类」上就是固定的，不需要先拿到一条日常实例】
+//   v76 的探针要等实机刷到日常才有数据 —— 老板说得对，平时刷不到就没法测，这是设计错误。
+//   改成启动后直接把上面这些类的「父类 + 全部属性名」dump 出来（[od] 结构 日志），
+//   一次就能看清 AWEAwemeModel 上到底叫 isStory / hasStory / oneDayXxx 还是别的，
+//   下一版直接照原生写法加一行。同时 contentFilter 里对 (awemeType, referString) 组合做
+//   「首次见到」去重打点 —— 刷任意视频就建立「正常视频长什么样」的基线，
+//   真刷到日常时那个异常 type 会自己冒出来，不需要刻意去找。
 static BOOL DYYYStoryCallBoolGetter(id obj, NSString *selName) {
     SEL sel = NSSelectorFromString(selName);
     if (!sel || ![obj respondsToSelector:sel]) {
@@ -10811,20 +10807,6 @@ static BOOL DYYYStoryCallBoolGetter(id obj, NSString *selName) {
     }
     BOOL (*fn)(id, SEL) = (BOOL (*)(id, SEL))[obj methodForSelector:sel];
     return fn ? fn(obj, sel) : NO;
-}
-
-static NSInteger DYYYStoryCallIntegerGetter(id obj, NSString *selName) {
-    SEL sel = NSSelectorFromString(selName);
-    if (!sel || ![obj respondsToSelector:sel]) {
-        return 0;
-    }
-    NSMethodSignature *sig = [obj methodSignatureForSelector:sel];
-    const char *ret = sig ? sig.methodReturnType : NULL;
-    if (!ret || (ret[0] != 'q' && ret[0] != 'Q' && ret[0] != 'i' && ret[0] != 'I' && ret[0] != 'l' && ret[0] != 'L')) {
-        return 0;
-    }
-    NSInteger (*fn)(id, SEL) = (NSInteger (*)(id, SEL))[obj methodForSelector:sel];
-    return fn ? fn(obj, sel) : 0;
 }
 
 static id DYYYStoryCallObjectGetter(id obj, NSString *selName) {
@@ -10841,127 +10823,170 @@ static id DYYYStoryCallObjectGetter(id obj, NSString *selName) {
     return fn ? fn(obj, sel) : nil;
 }
 
-// 返回命中的字段名（nil = 不是日常）。这个函数只在开关打开时被调用（每次解析每条 aweme 一次）。
+// 判定一条 aweme 是不是日常。开关打开时每条 aweme 调一次。
+// 只收「二进制里确实存在」且语义无歧义的字段（isStory / hasStory / isMoment），
+// 不像 v76 那样罗列一堆根本不存在的选择器（那些 respondsToSelector 恒为 NO，纯浪费）。
+// v77 的结构 dump 出来后，这里按真实字段名收敛。
 static NSString *DYYYStoryHitOnAweme(id model) {
     if (!model) {
         return nil;
     }
     static NSArray<NSString *> *boolSelectors = nil;
-    static NSArray<NSString *> *objectSelectors = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        // 只收语义明确、不会误伤普通视频的字段
-        boolSelectors = @[ @"isStory", @"isOneDayStory", @"isStoryVideo", @"isOneDayVideo",
-                           @"isFromStory", @"isStoryItem", @"isStoryAweme" ];
-        objectSelectors = @[ @"storyInfo", @"storyModel", @"storyMeta", @"storyGroup",
-                             @"oneDayInfo", @"oneDayModel", @"oneDayStoryInfo",
-                             @"momentInfo", @"storyRecommendInfo" ];
+        boolSelectors = @[ @"isStory", @"hasStory", @"isMoment" ];
     });
     for (NSString *selName in boolSelectors) {
         if (DYYYStoryCallBoolGetter(model, selName)) {
             return selName;
         }
     }
-    for (NSString *selName in objectSelectors) {
-        if (DYYYStoryCallObjectGetter(model, selName) != nil) {
-            return selName;
-        }
-    }
     return nil;
 }
 
-// 【取证探针】只在本版诊断期用：把 AWEAwemeModel 上「名字像日常」的属性名一次性列出来，
-// 之后每条 aweme 打一行可疑属性的实际值 + 原始 JSON 里名字像日常的键值。
-// 目的：实机刷到一条限时日常后，日志里能直接看出真正的标记字段是什么（本版判定靠它收敛）。
-static NSArray<NSString *> *DYYYStoryCandidatePropertyNames(void) {
-    static NSArray<NSString *> *names = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        NSMutableArray<NSString *> *found = [NSMutableArray array];
-        Class cls = NSClassFromString(@"AWEAwemeModel");
-        int depth = 0;
-        while (cls && cls != [NSObject class] && depth < 4) {
-            unsigned int count = 0;
-            objc_property_t *props = class_copyPropertyList(cls, &count);
-            for (unsigned int i = 0; i < count; i++) {
-                const char *rawName = property_getName(props[i]);
-                if (!rawName) {
-                    continue;
-                }
-                NSString *propName = [NSString stringWithUTF8String:rawName];
-                if (propName.length > 0 && DYYYStoryNameMatches(propName)) {
-                    [found addObject:propName];
-                }
-            }
-            if (props) {
-                free(props);
-            }
-            cls = class_getSuperclass(cls);
-            depth++;
-        }
-        names = [found copy];
-        DYYYSpeedDiag([NSString stringWithFormat:@"[od] 日常候选属性(%lu)：%@",
-                       (unsigned long)names.count,
-                       names.count ? [names componentsJoinedByString:@","] : @"无"]);
-    });
-    return names;
-}
-
-static NSString *DYYYStoryShortDescription(id value, NSUInteger maxLength) {
-    if (value == nil) {
-        return @"(nil)";
-    }
-    NSString *text = [value isKindOfClass:[NSString class]] ? (NSString *)value : [value description];
-    if (text.length > maxLength) {
-        text = [[text substringToIndex:maxLength] stringByAppendingString:@"…"];
-    }
-    return text;
-}
-
-static void DYYYStoryProbeAweme(id model, id raw) {
-    static NSInteger probeCount = 0;
-    if (probeCount >= 60) {   // 一次启动最多 60 条，免得日志刷爆
+// —— 【v77 结构取证】—— 只在本版诊断期用，开关关掉时零开销（调用方已门控）——
+static void DYYYDumpClassProps(NSString *className, NSUInteger chunk) {
+    Class cls = NSClassFromString(className);
+    if (!cls) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[od] 结构 %@ 不存在（未加载或名字不同）", className]);
         return;
     }
-    probeCount++;
-
-    NSMutableString *detail = [NSMutableString string];
-
-    for (NSString *propName in DYYYStoryCandidatePropertyNames()) {
-        id value = nil;
-        @try {
-            value = [model valueForKey:propName];
-        } @catch (__unused NSException *exception) {
-            value = nil;
-        }
-        if (value == nil) {
-            continue;
-        }
-        [detail appendFormat:@" %@=%@", propName, DYYYStoryShortDescription(value, 60)];
-    }
-
-    if ([raw isKindOfClass:[NSDictionary class]]) {
-        NSDictionary *dict = (NSDictionary *)raw;
-        for (id key in dict) {
-            if (![key isKindOfClass:[NSString class]] || !DYYYStoryNameMatches((NSString *)key)) {
-                continue;
+    NSMutableArray<NSString *> *props = [NSMutableArray array];
+    Class cur = cls;
+    int depth = 0;
+    while (cur && cur != [NSObject class] && depth < 5) {
+        unsigned int count = 0;
+        objc_property_t *list = class_copyPropertyList(cur, &count);
+        for (unsigned int i = 0; i < count; i++) {
+            const char *rawName = property_getName(list[i]);
+            if (rawName) {
+                [props addObject:[NSString stringWithUTF8String:rawName]];
             }
-            [detail appendFormat:@" raw.%@=%@", key, DYYYStoryShortDescription([dict objectForKey:key], 60)];
+        }
+        if (list) {
+            free(list);
+        }
+        cur = class_getSuperclass(cur);
+        depth++;
+    }
+    Class superCls = class_getSuperclass(cls);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[od] 结构 %@ < %@  属性共 %lu",
+                   className,
+                   superCls ? NSStringFromClass(superCls) : @"-",
+                   (unsigned long)props.count]);
+    if (props.count == 0) {
+        return;
+    }
+    if (chunk == 0) {
+        chunk = 40;
+    }
+    for (NSUInteger i = 0; i < props.count; i += chunk) {
+        NSUInteger len = MIN(chunk, props.count - i);
+        NSArray<NSString *> *slice = [props subarrayWithRange:NSMakeRange(i, len)];
+        DYYYSpeedDiag([NSString stringWithFormat:@"[od]   %@ [%lu-%lu] %@",
+                       className,
+                       (unsigned long)i,
+                       (unsigned long)(i + len - 1),
+                       [slice componentsJoinedByString:@","]]);
+    }
+}
+
+// 属性表为空时的第二线索：打类的方法名（只打自己实现的，不含继承）。
+static void DYYYDumpClassMethods(NSString *className, NSUInteger chunk) {
+    Class cls = NSClassFromString(className);
+    if (!cls) {
+        return;
+    }
+    NSMutableArray<NSString *> *sels = [NSMutableArray array];
+    unsigned int count = 0;
+    Method *list = class_copyMethodList(cls, &count);
+    for (unsigned int i = 0; i < count; i++) {
+        const char *rawName = sel_getName(method_getName(list[i]));
+        if (rawName) {
+            [sels addObject:[NSString stringWithUTF8String:rawName]];
         }
     }
-
-    NSString *referString = DYYYStoryCallObjectGetter(model, @"referString");
-    NSString *awemeID = DYYYStoryCallObjectGetter(model, @"awemeID");
-    if (awemeID == nil) {
-        awemeID = DYYYStoryCallObjectGetter(model, @"awemeId");
+    if (list) {
+        free(list);
     }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[od] 方法 %@ 自身实现 %lu 个",
+                   className, (unsigned long)sels.count]);
+    if (chunk == 0) {
+        chunk = 30;
+    }
+    for (NSUInteger i = 0; i < sels.count && i < 120; i += chunk) {
+        NSUInteger len = MIN(chunk, MIN(120, sels.count) - i);
+        NSArray<NSString *> *slice = [sels subarrayWithRange:NSMakeRange(i, len)];
+        DYYYSpeedDiag([NSString stringWithFormat:@"[od]   %@ m[%lu] %@",
+                       className, (unsigned long)i,
+                       [slice componentsJoinedByString:@","]]);
+    }
+}
 
-    DYYYSpeedDiag([NSString stringWithFormat:@"[od] item#%ld type=%ld ref=%@ aid=%@%@",
-                   (long)probeCount,
-                   (long)DYYYStoryCallIntegerGetter(model, @"awemeType"),
-                   referString ? referString : @"-",
-                   awemeID ? awemeID : @"-",
-                   detail.length ? detail : @" 无可疑字段"]);
+// 启动后调用一次：把「日常」相关模型的真实字段全部打出来。
+// 目的只有一个 —— 确认 AWEAwemeModel 上该读哪个字段，然后下一版照原生写法加一行过滤。
+static void DYYYDumpStoryStructure(void) {
+    if (!DYYYDiagOn()) {
+        return;
+    }
+    if (NSClassFromString(@"AWEAwemeModel") == nil) {
+        DYYYSpeedDiag(@"[od] 结构 dump 跳过：AWEAwemeModel 还没加载");
+        return;
+    }
+    DYYYSpeedDiag(@"[od] ===== 日常(Story/OneDay) 模型结构取证开始 =====");
+    // 主角：过滤实际读的就是它
+    DYYYDumpClassProps(@"AWEAwemeModel", 40);
+    // 日常在 feed 里的三种可能形态：item model / section controller / view model
+    DYYYDumpClassProps(@"AWEOneDayFeedItemModel", 40);
+    DYYYDumpClassProps(@"AWEOneDayFeedSectionController", 40);
+    DYYYDumpClassProps(@"AWEOneDayFeedViewModel", 40);
+    // story 实体模型（看它跟 aweme 是什么关系）
+    DYYYDumpClassProps(@"AWEOneDaySimpleStoryModel", 40);
+    DYYYDumpClassProps(@"AWEOneDayUserStoryModel", 40);
+    DYYYDumpClassProps(@"AWEOneDayLifeStoryModel", 40);
+    DYYYDumpClassProps(@"AWEOneDayStoryWithCommentModel", 40);
+    // 独立页面控制器（如果日常是独立页面，点开时会有 [od] 页面 日志）
+    DYYYDumpClassProps(@"AWEOneDayFeedViewController", 40);
+    // 属性表为空时的方法名线索（看它怎么拿数据/怎么判断）
+    DYYYDumpClassMethods(@"AWEOneDayFeedItemModel", 30);
+    DYYYDumpClassMethods(@"AWEOneDayFeedSectionController", 30);
+
+    // 直接回答「AWEAwemeModel 上有没有这几个可疑字段」—— 有的话下一版就是照抄一行的事
+    Class awemeCls = NSClassFromString(@"AWEAwemeModel");
+    NSArray<NSString *> *probe = @[ @"isStory", @"hasStory", @"isMoment", @"storyType", @"awemeType",
+                                    @"videoFeedTag", @"isLive", @"isNewTextMode" ];
+    NSMutableArray<NSString *> *have = [NSMutableArray array];
+    NSMutableArray<NSString *> *miss = [NSMutableArray array];
+    for (NSString *selName in probe) {
+        if ([awemeCls instancesRespondToSelector:NSSelectorFromString(selName)]) {
+            [have addObject:selName];
+        } else {
+            [miss addObject:selName];
+        }
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[od] 探测 AWEAwemeModel 有:%@ 无:%@",
+                   have.count ? [have componentsJoinedByString:@","] : @"(空)",
+                   miss.count ? [miss componentsJoinedByString:@","] : @"(空)"]);
+    DYYYSpeedDiag(@"[od] ===== 日常模型结构取证结束 =====");
+}
+
+// contentFilter 里对 (awemeType, referString) 做「首次见到」去重打点（上限 60 组合，日志很小）。
+// 用处：刷任意视频就能看出正常内容只有哪几个 type；真刷到日常时那个异常的 type 自己会冒出来。
+static void DYYYNoteAwemeTypeOnce(NSInteger awemeType, NSString *referString) {
+    static NSMutableSet<NSString *> *seen = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        seen = [NSMutableSet set];
+    });
+    NSString *key = [NSString stringWithFormat:@"%ld|%@", (long)awemeType, referString ? referString : @"-"];
+    @synchronized (seen) {
+        if ([seen containsObject:key] || seen.count >= 60) {
+            return;
+        }
+        [seen addObject:key];
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[od] 首见 type=%ld ref=%@", (long)awemeType,
+                   referString ? referString : @"-"]);
 }
 // 【v76 取证】抖音的「日常」页：AWEOneDayFeedViewController（二进制里 AWEOneDay* 一整套类）。
 // 只打一行日志，不做任何拦截 —— 先确认限时日常到底是不是独立页面，再决定屏蔽手段。
@@ -10979,11 +11004,6 @@ static void DYYYStoryProbeAweme(id model, id raw) {
 - (id)initWithDictionary:(id)arg1 error:(id *)arg2 {
     id orig = %orig;
     if (orig) {
-        // 【v76 取证】日常真正的标记字段还没确定：开关打开时把「名字像日常」的属性值 + 原始 JSON 键值打出来，
-        // 实机刷到一条限时日常后一眼就能看出该按哪个字段收敛（下一版据此收紧判定）。
-        if (DYYYDiagOn()) {
-            DYYYStoryProbeAweme(self, arg1);
-        }
         BOOL shouldDisableHDR = DYYYShouldDisableAllHDR();
         BOOL shouldFilterOnlyHDRSource = NO;
         if (shouldDisableHDR && ![self dyyy_shouldExcludeFromGlobalHDRFilter]) {
@@ -11117,6 +11137,12 @@ static void DYYYStoryProbeAweme(id model, id raw) {
     BOOL skipAIInteraction = DYYYGetBool(@"DYYYSkipAIInteraction");
     BOOL skipStory = DYYYGetBool(@"DYYYSkipStory");   // 【v76】过滤限时日常/日常
     BOOL filterHDR = DYYYShouldFilterGlobalHDR();
+
+    // 【v77 取证】(awemeType, referString) 组合首次见到就记一行 —— 刷任意视频即可建立基线，
+    // 真刷到日常时那个异常 type 会自己冒出来（不需要刻意去找）。关闭日志开关时零开销。
+    if (DYYYDiagOn()) {
+        DYYYNoteAwemeTypeOnce(self.awemeType, self.referString);
+    }
 
     BOOL shouldFilterAds = noAds && [DYYYUtils isAdvertisementAwemeModel:self];
     BOOL shouldFilterHotSpot = skipHotSpot && self.hotSpotLynxCardModel;
@@ -14303,10 +14329,14 @@ static Class tabBarButtonClass = nil;
 %hook UIViewController
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
-    // 【v76 取证】限时日常如果走独立页面/独立容器，这里会把类名打出来（判断它是「流内卡片」还是「独立 story 页」）
+    // 【v77 取证】限时日常如果走独立页面/独立容器，这里会把类名打出来
+    // （判断它是「流内卡片」还是「独立 story 页」）。只看 OneDay / Story，且排除 History 误命中。
     if (DYYYDiagOn()) {
         NSString *dyyyVCName = NSStringFromClass([self class]);
-        if (DYYYStoryNameMatches(dyyyVCName) && ![dyyyVCName hasPrefix:@"DYYY"]) {
+        if ([dyyyVCName rangeOfString:@"History"].location == NSNotFound &&
+            ([dyyyVCName rangeOfString:@"OneDay"].location != NSNotFound ||
+             [dyyyVCName rangeOfString:@"Story"].location != NSNotFound) &&
+            ![dyyyVCName hasPrefix:@"DYYY"]) {
             DYYYSpeedDiag([NSString stringWithFormat:@"[od] 日常相关页面出现 %@", dyyyVCName]);
         }
     }
@@ -15592,6 +15622,14 @@ static void findTargetViewInView(UIView *view) {
     }];
     // 老版本遗留开关值清掉（该功能已移除，留着只会在设置页/调试时造成困惑）
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"DYYYDisableFeedNowPlayingInfo"];
+
+    // 【v77 取证】启动后 dump「日常(Story/OneDay)」相关模型的真实属性名。
+    // 关键点：属性名在「类」上是固定的，不需要先拿到一条日常实例 —— 所以不用靠运气刷到日常，
+    // 打开 App 等 8 秒就能拿到全部字段表（函数内部自带日志开关门控）。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        DYYYDumpStoryStructure();
+    });
 
     // 源头：按精确类名清单拦截抖音"更新"相关类（25 次 NSClassFromString，微秒级）
     if (DYYYGetBool(@"DYYYNoUpdates")) {
