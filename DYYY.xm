@@ -13,6 +13,7 @@
 #import <math.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#include <os/lock.h>
 #import <substrate.h>
 #import <syslog.h>
 
@@ -4196,6 +4197,10 @@ static void DYYYAPDumpMethodsForClass(Class cls) {
 // ⇒ v71 不再猜类名：运行时全类扫描，凡「自己 method list 里就有这个 SEL」的类全部钩上。
 //   ⚠️ 另一个 v70 隐藏 bug：判完逻辑写在 DYYYDiagLog 门控之内 ⇒ 关掉日志功能就没了。
 //      v71 功能与日志彻底分离：判完 → 推页 永远生效，日志才受开关控制。
+// 【v73·最终判据】抖音**自己会切**，只是有时候不切。我们要做的只有一件事：
+//   「它切了就别碰，它没切才兜底」。v72 判不出「切没切」是因为只用一个全局引擎指针
+//   （原引擎 loop 后一直报 cur=0.24，把「原引擎停不停」当判据永远不成立）。
+//   v73 改成引擎表（8 槽）+ 判据「播完后出现另一台引擎汇报了不同总时长」⇒ 认定抖音已切。
 // 【核心策略】抖音横屏是「播完 → loop 重播本条」而不是「停下来」。所以不能等 1.5s 再看结局，
 //   那 1.5s 里它已经从头播了。正确做法：判到末段（total-cur ≤ 0.35s）后等 1.0s，
 //   这 1.0s 是留给抖音自己切条的时间（它本来就会切，只是有时候不切）；
@@ -4231,9 +4236,26 @@ static double dyyyProgWatchedBaseTotal = 0;
 static double dyyyProgWatchedCur = 0;
 static double dyyyProgWatchedTotal = 0;
 static NSTimeInterval dyyyProgWatchedLastSeen = 0;
-// dyyyProgGlobal* ：最近一次有进度的引擎（任何引擎），用来判「抖音是不是换引擎播新条了」
+// dyyyProgGlobal* ：最近一次有进度的引擎（任何引擎），只用于日志与「1.2s 复核」展示
 static uintptr_t dyyyProgGlobalPtr = 0;
 static NSTimeInterval dyyyProgGlobalAt = 0;
+
+// 【v73】引擎表 —— v72 判不出「抖音到底切没切」的根因就是只有一个全局指针。
+// v72 铁证（speed_diag.v72.run1.log 第 1139~1147 行）：
+//   10:23:39 判播完 引擎 0x16a557600 total=451.54
+//   10:23:40 采样已经是 引擎 0x16a73c600 cur=0.86/total=245.30  ← 抖音 1 秒内就切了（新引擎+新总长）
+//   10:23:40 我们却仍判「未切」并推页 ⇒ 抖音随后自己又切 ⇒ 一次播完跳两条
+//   原因：旧判据要求「原引擎停止推进度」才算切，而原引擎 loop 后一直在报 cur=0.24 ⇒ 永远判不成切。
+// ⇒ 改为引擎表：只要「出现一台不是这一轮的引擎、且播完后仍在推进度」就认定抖音已切，
+//   不再看原引擎死活（它 loop 重播与否跟抖音切不切条无关）。
+#define DYYY_PROG_ENG_MAX 8
+typedef struct {
+    uintptr_t ptr;
+    double total;
+    NSTimeInterval lastSeen;
+} DYYYProgEngSlot;
+static DYYYProgEngSlot dyyyProgEngs[DYYY_PROG_ENG_MAX];
+static os_unfair_lock dyyyProgEngLock = OS_UNFAIR_LOCK_INIT;
 // 节流
 static NSTimeInterval dyyyProgLastSampleAt = 0;
 static NSTimeInterval dyyyProgLastVerdictAt = 0;
@@ -4241,6 +4263,79 @@ static NSTimeInterval dyyyProgLastAdvanceAt = 0;
 static NSTimeInterval dyyyProgLastDumpAt = 0;
 // 【v72】上一次推页的目标 offset：防「被回弹后按回弹值算成同一页」
 static CGFloat dyyyProgLastTargetOffset = -1;
+
+// 引擎落表（进度回调线程调用）
+static void DYYYProgEngTouch(uintptr_t ptr, double total, NSTimeInterval now, id host) {
+    if (ptr == 0) {
+        return;
+    }
+    BOOL isNew = NO;
+    int slot = -1;
+    os_unfair_lock_lock(&dyyyProgEngLock);
+    for (int i = 0; i < DYYY_PROG_ENG_MAX; i++) {
+        if (dyyyProgEngs[i].ptr == ptr) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < DYYY_PROG_ENG_MAX; i++) {
+            if (dyyyProgEngs[i].ptr == 0) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) {   // 满了就换最久没动静的那台
+            slot = 0;
+            for (int i = 1; i < DYYY_PROG_ENG_MAX; i++) {
+                if (dyyyProgEngs[i].lastSeen < dyyyProgEngs[slot].lastSeen) {
+                    slot = i;
+                }
+            }
+        }
+        dyyyProgEngs[slot].ptr = ptr;
+        isNew = YES;
+    }
+    dyyyProgEngs[slot].total = total;
+    dyyyProgEngs[slot].lastSeen = now;
+    os_unfair_lock_unlock(&dyyyProgEngLock);
+
+    if (isNew && DYYYGetBool(@"DYYYDiagLog")) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[prog] 引擎表 +0x%lx total=%.2f 来自%@",
+                       (unsigned long)ptr, total, NSStringFromClass(object_getClass(host))]);
+    }
+}
+
+// 播完后是否出现「另一台引擎在播另一条片」⇒ 抖音自己切了。
+// 这是 v73 的核心判据：跟原引擎死不死活没关系，只认「有没有新引擎接班」。
+// 额外要求「总时长不同」：预加载引擎也可能被塞了下一条的时长，但同一部片的重复回报总长不会变。
+static BOOL DYYYProgNewEngineSince(uintptr_t basePtr, double baseTotal, NSTimeInterval since,
+                                   uintptr_t *outPtr, double *outTotal) {
+    BOOL found = NO;
+    os_unfair_lock_lock(&dyyyProgEngLock);
+    for (int i = 0; i < DYYY_PROG_ENG_MAX; i++) {
+        DYYYProgEngSlot e = dyyyProgEngs[i];
+        if (e.ptr == 0 || e.ptr == basePtr) {
+            continue;
+        }
+        if (e.lastSeen <= since + 0.01) {
+            continue;
+        }
+        if (fabs(e.total - baseTotal) <= 0.6) {   // 总长相仿 = 还是这条，不算切
+            continue;
+        }
+        if (outPtr) {
+            *outPtr = e.ptr;
+        }
+        if (outTotal) {
+            *outTotal = e.total;
+        }
+        found = YES;
+        break;
+    }
+    os_unfair_lock_unlock(&dyyyProgEngLock);
+    return found;
+}
 
 // 横屏下所有滚动容器快照（诊断用，只在门控内打）
 static void DYYYProgDumpScrollViews(void) {
@@ -4427,14 +4522,17 @@ static void DYYYProgOnItemEnd(id host, id player, double cur, double total, NSTi
         BOOL oldStillAdvancing = (dyyyProgWatchedLastSeen > endAt + 0.01);
         BOOL totalChanged = oldStillAdvancing &&
                             (fabs(dyyyProgWatchedTotal - dyyyProgWatchedBaseTotal) > 0.6);
-        BOOL otherEngine = (dyyyProgGlobalPtr != 0 && dyyyProgGlobalPtr != ptr &&
-                            dyyyProgGlobalAt > endAt + 0.01);
-        BOOL switched = totalChanged || (!oldStillAdvancing && otherEngine);
+        uintptr_t newEngPtr = 0;
+        double newEngTotal = 0;
+        // 【v73】只认「有没有新引擎接班」，不再要求原引擎停止推进度
+        // （v72 就是被 oldStillAdvancing 卡死：原引擎 loop 后一直报 cur=0.24，判据永远不成立）
+        BOOL otherEngine = DYYYProgNewEngineSince(ptr, total, endAt, &newEngPtr, &newEngTotal);
+        BOOL switched = totalChanged || otherEngine;
 
         if (switched) {
             if (DYYYGetBool(@"DYYYDiagLog")) {
                 DYYYSpeedDiag([NSString stringWithFormat:
-                    @"[prog] 1.0s 后抖音自己切了（总时长变=%d 换引擎=%d）→ 不插手",
+                    @"[prog] 1.0s 后抖音自己切了（总时长变=%d 新引擎=0x%lx[%.2f]）→ 不插手",
                     (int)totalChanged, (int)otherEngine]);
             }
             dyyyProgWatchedPtr = 0;
@@ -4461,8 +4559,8 @@ static void DYYYProgOnItemEnd(id host, id player, double cur, double total, NSTi
 
         if (DYYYGetBool(@"DYYYDiagLog")) {
             DYYYSpeedDiag([NSString stringWithFormat:
-                @"[prog] 1.0s 后未切（旧引擎还在=%d 新引擎=%d cur=%.2f/%.2f）→ %@：%@",
-                (int)oldStillAdvancing, (int)otherEngine,
+                @"[prog] 1.0s 后未切（旧引擎还在=%d 新引擎=0x%lx cur=%.2f/%.2f）→ %@：%@",
+                (int)oldStillAdvancing, (unsigned long)newEngPtr,
                 dyyyProgWatchedCur, dyyyProgWatchedBaseTotal,
                 ok ? @"自己推一页" : @"推页失败", detail ? detail : @"?"]);
             if (!ok) {
@@ -4476,7 +4574,7 @@ static void DYYYProgOnItemEnd(id host, id player, double cur, double total, NSTi
                            dispatch_get_main_queue(), ^{
                 CGFloat step = 0;
                 UIScrollView *sv = DYYYProgFindPager(&step);
-                BOOL switched = (dyyyProgGlobalPtr != ptr) ||
+                BOOL switched = DYYYProgNewEngineSince(ptr, total, endAt, NULL, NULL) ||
                                 (fabs(dyyyProgWatchedTotal - total) > 0.6);
                 if (DYYYGetBool(@"DYYYDiagLog")) {
                     NSString *afterTxt = sv ? [NSString stringWithFormat:@"容器=%@ y=%.0f",
@@ -4516,6 +4614,7 @@ static void DYYYProgObserve(id host, id player, double cur, double total) {
 
     dyyyProgGlobalPtr = ptr;
     dyyyProgGlobalAt = now;
+    DYYYProgEngTouch(ptr, total, now, host);   // 【v73】每台引擎都进表，切没切靠它判
 
     if (dyyyProgWatchedPtr != 0 && ptr == dyyyProgWatchedPtr) {
         dyyyProgWatchedCur = cur;
