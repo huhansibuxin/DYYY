@@ -4278,6 +4278,17 @@ static void dyyyAPPlayerFinishThunk(id self, SEL _cmd, id player, id err) {
 
 // 静态拿不到类归属，只能在运行时全量扫一遍类列表。
 // 3 万+ 类 × 7 个 SEL，几十毫秒量级，只做一次（启动后延迟执行，不占首帧）。
+// ⚠️ v67：本函数改成【只读扫描】，且跑在后台队列。
+// v66 历史教训（老板 2026-10-27 实机）：
+//   v66 在主线程 3s 后对【全部 3 万多个类 × 7 个 SEL】做了一遍
+//   class_getInstanceMethod + 签名解析 + MSHookMessageEx。结果是整个 App 卡死
+//   （点反向全屏 / 长按唤出按钮毫无反应），而日志里连一条 [ap] 都没有
+//   —— 说明扫描从未返回。
+// 根因两层：① 重活（几十万次 runtime 调用 + 每次参数 malloc）在主线程；
+//   ② 在【不知道 SEL 归属类】的前提下就对猜测类做 swizzle，
+//   命中系统类后 thunk 里又读 UIKit（getActiveWindow），死锁/异常都有可能。
+// 所以现在只做【读】：把 7 个 SEL 到底实现在哪些类上写进日志，
+// 拿到类名之后再做精确到类的 hook（下一版）。不 swizzle = 不可能因它卡死。
 static void DYYYAPScanAndHook(int attempt) {
     static BOOL sScanDone = NO;
     if (sScanDone) {
@@ -4292,21 +4303,8 @@ static void DYYYAPScanAndHook(int attempt) {
         "didFinishPlayingWithError:",
         "playerDidFinish:error:"
     };
-    IMP thunks[DYYY_AP_SEL_COUNT] = {
-        (IMP)dyyyAPShouldNextThunk,
-        (IMP)dyyyAPCanNextThunk,
-        (IMP)dyyyAPAutoNextThunk,
-        (IMP)dyyyAPStartThunk,
-        (IMP)dyyyAPFinishThunk,
-        (IMP)dyyyAPFinishErrThunk,
-        (IMP)dyyyAPPlayerFinishThunk
-    };
-    // 期望的返回类型首字母：should/can 是 BOOL('c'/'B')，其余应是 void('v')。
-    // 不符就跳过并记账 —— 宁可漏钩，也不要用错的函数签名去踩内存。
-    const char *expectRet[DYYY_AP_SEL_COUNT] = {"c", "c", "v", "v", "v", "v", "v"};
-    // 期望的总参数个数（含 self/_cmd）：多一个少一个都不能钩 —— thunk 是按这个布局转发的，
-    // 签名不对会直接丢参数或读错寄存器，表现为随机崩溃（这类尾随参数崩溃极难查）。
-    const int expectArgc[DYYY_AP_SEL_COUNT] = {2, 3, 2, 2, 2, 3, 4};
+
+    double t0 = [NSDate timeIntervalSinceReferenceDate];
 
     int numClasses = objc_getClassList(NULL, 0);
     if (numClasses <= 0) {
@@ -4320,122 +4318,87 @@ static void DYYYAPScanAndHook(int attempt) {
     }
     numClasses = objc_getClassList(classes, numClasses);
 
-    NSMutableSet<NSString *> *hitInfo = [NSMutableSet set];
-    // 同一个 Method 只能钩一次：子类未 override 时 class_getInstanceMethod 返回的是父类 Method，
-    // 二次 MSHookMessageEx 会把 orig 串成嵌套 trampoline（速率探针那边踩过这个坑）。
-    NSMutableSet<NSValue *> *hookedMethods = [NSMutableSet set];
-    // 每个 SEL 最多钩 8 个实现：同一个 SEL 可能在多个类上各自实现（引擎 / ownPlayer / VC / 插件），
-    // 全部钩住意义不大，反而放大日志量与出错面。
-    int perSelHooked[DYYY_AP_SEL_COUNT] = {0, 0, 0, 0, 0, 0, 0};
-
-    // 预先把 SEL 注册出来：内层循环要跑 (类数 × 7) 次，别每次都 sel_registerName
-    SEL sels[DYYY_AP_SEL_COUNT];
-    for (int k = 0; k < DYYY_AP_SEL_COUNT; k++) {
-        sels[k] = sel_registerName(selNames[k]);
-    }
-
+    // ① 类名预筛：只保留类名含 "Play"/"play" 的类。
+    //    AutoPlay 子系统、播放器容器、播放器 VC 都在这个集合里，
+    //    实测把 3 万多类降到几百个，纯 strstr，微秒级。
+    int candCount = 0;
     for (int i = 0; i < numClasses; i++) {
         Class cls = classes[i];
         if (!cls) {
             continue;
         }
+        const char *n = class_getName(cls);
+        if (!n) {
+            continue;
+        }
+        if (strstr(n, "Play") || strstr(n, "play")) {
+            classes[candCount++] = cls;
+        }
+    }
+    double tFilter = ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0;
+
+    SEL sels[DYYY_AP_SEL_COUNT];
+    for (int k = 0; k < DYYY_AP_SEL_COUNT; k++) {
+        sels[k] = sel_registerName(selNames[k]);
+    }
+
+    NSMutableArray<NSString *> *hits[DYYY_AP_SEL_COUNT];
+    for (int k = 0; k < DYYY_AP_SEL_COUNT; k++) {
+        hits[k] = [NSMutableArray array];
+    }
+
+    // ② 只读查找：class_getInstanceMethod 不会修改任何东西。
+    //    同时记下返回类型与参数个数（下一版 hook 前要用它校验签名）。
+    for (int i = 0; i < candCount; i++) {
+        Class cls = classes[i];
         for (int k = 0; k < DYYY_AP_SEL_COUNT; k++) {
-            SEL sel = sels[k];
-            if (perSelHooked[k] >= 8) {
+            if (hits[k].count >= 6) {
                 continue;
             }
-            Method m = class_getInstanceMethod(cls, sel);
+            Method m = class_getInstanceMethod(cls, sels[k]);
             if (!m) {
-                continue;
-            }
-            NSValue *key = [NSValue valueWithPointer:m];
-            if ([hookedMethods containsObject:key]) {
-                continue;
-            }
-            // ⚠️ 重试路径上会重复扫到同一个 Method：此时它的 IMP 已经是我们自己的 thunk，
-            //   再 MSHookMessageEx 一次就会把 orig 指回 thunk ⇒ 无限递归爆栈。
-            //   用 IMP 比对挡掉（这是重试机制唯一的安全阀，别删）。
-            if (method_getImplementation(m) == thunks[k]) {
                 continue;
             }
             char retType[8] = {0};
             method_getReturnType(m, retType, sizeof(retType));
-            char want = expectRet[k][0];
-            BOOL ok = (retType[0] == want) ||
-                      (want == 'c' && (retType[0] == 'B' || retType[0] == 'c'));
-            if (!ok) {
-                [hitInfo addObject:[NSString stringWithFormat:@"%s@%s 返回'%s'跳过",
-                                    selNames[k], class_getName(cls), retType]];
-                continue;
-            }
-            // 参数个数 + 参数类型校验（thunk 只认对象参数）
             unsigned int argc = method_getNumberOfArguments(m);
-            if ((int)argc != expectArgc[k]) {
-                [hitInfo addObject:[NSString stringWithFormat:@"%s@%s argc=%u跳过",
-                                    selNames[k], class_getName(cls), argc]];
-                continue;
+            NSString *entry = [NSString stringWithFormat:@"%s[%s/%u]",
+                               class_getName(cls), retType, argc];
+            if (![hits[k] containsObject:entry]) {
+                [hits[k] addObject:entry];
             }
-            BOOL argsOk = YES;
-            for (unsigned int a = 2; a < argc; a++) {
-                char *at = method_copyArgumentType(m, a);
-                BOOL isObj = (at && at[0] == '@');
-                if (at) {
-                    free(at);
-                }
-                if (!isObj) {
-                    argsOk = NO;
-                    break;
-                }
-            }
-            if (!argsOk) {
-                [hitInfo addObject:[NSString stringWithFormat:@"%s@%s 参数非对象跳过",
-                                    selNames[k], class_getName(cls)]];
-                continue;
-            }
-            [hookedMethods addObject:key];
-
-            IMP oldImp = NULL;
-            MSHookMessageEx(cls, sel, thunks[k], &oldImp);
-
-            // 按类落表（不要按 SEL 存单个 slot，理由见 dyyyAPHookedClasses 的注释）
-            int slot = dyyyAPHookedCount[k];
-            if (oldImp && slot < DYYY_AP_MAX_PER_SEL) {
-                dyyyAPHookedClasses[k][slot] = cls;
-                dyyyAPOrigIMPs[k][slot] = oldImp;
-                dyyyAPHookedCount[k] = slot + 1;
-                perSelHooked[k]++;
-            }
-
-            [hitInfo addObject:[NSString stringWithFormat:@"%s@%s", selNames[k], class_getName(cls)]];
         }
     }
     free(classes);
+
+    double tTotal = ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0;
     sScanDone = YES;
 
-    // 关键 SEL（shouldAutoPlayNext）没扫到 ⇒ 类还没加载，退避重试。
-    // 抖音是巨型 App，AutoPlay 子系统可能是懒加载的，一次扫不到很正常。
-    if (dyyyAPHookedCount[0] == 0 && attempt < 6) {
-        sScanDone = NO;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            DYYYAPScanAndHook(attempt + 1);
-        });
-        DYYYSpeedDiag([NSString stringWithFormat:@"[ap] 第%d次扫描未命中 shouldAutoPlayNext，2s 后重试", attempt]);
-        return;
+    DYYYSpeedDiag([NSString stringWithFormat:@"[ap] 只读扫描完成（第%d次）全类=%d 候选=%d 过滤=%.1fms 总=%.1fms",
+                   attempt, numClasses, candCount, tFilter, tTotal]);
+    for (int k = 0; k < DYYY_AP_SEL_COUNT; k++) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[ap] %s -> %@",
+                       selNames[k],
+                       hits[k].count ? [hits[k] componentsJoinedByString:@" , "] : @"未找到"]);
     }
 
-    DYYYSpeedDiag([NSString stringWithFormat:@"[ap] 探针装载完成（第%d次，扫 %d 类）：%@",
-                   attempt, numClasses,
-                   [[[hitInfo allObjects] subarrayWithRange:NSMakeRange(0, MIN((NSUInteger)40, [hitInfo count]))]
-                       componentsJoinedByString:@" | "]]);
+    // shouldAutoPlayNext 没找到 ⇒ 类可能还没加载，隔 5s 再试（仍在后台）
+    if (hits[0].count == 0 && attempt < 4) {
+        sScanDone = NO;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            DYYYAPScanAndHook(attempt + 1);
+        });
+    }
 }
 
 static void DYYYInstallAutoPlayProbe(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        // 3s：等 AutoPlay 子系统实例化出来（%ctor 时机太早，那时类可能还没加载）
+        // v67：从主线程改到后台队列。v66 放在 main queue 上，
+        // 启动 3s 后把主线程整个占住，表现就是「点反向全屏 / 长按唤出按钮直接卡死」。
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
+                       dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             DYYYAPScanAndHook(1);
         });
     });
