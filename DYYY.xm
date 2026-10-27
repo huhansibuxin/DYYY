@@ -10768,11 +10768,222 @@ static NSHashTable *processedParentViews = nil;
 
 %end
 
+// ===================== 【v76】推荐过滤「限时日常 / 日常」（抖音内部叫 Story / OneDay）=====================
+// 老板 2026-10-27 需求：关注的人发的「限时日常」刷到后不会自动下一条（story 播放器自己 loop），一直放一直放，
+//   而且内容也不好看 ⇒ 和「过滤图文/过滤直播」一样，直接在解析阶段过滤掉，别让它进推荐流。
+//
+// 二进制取证（AwemeCore 667MB，grep 类名/选择器）：
+//   抖音把「日常」统一叫 Story：AWEStoryKit / AWEStory25*（2.5 版，AWEStory25DraftMessage…）/
+//   AWEOneDay*（AWEOneDayFeedViewController / AWEOneDayDailyModel / AWEOneDayFeedItemModel…）；
+//   「限时」= 24h TTL，字段命名里出现 storyTTL / storyGroupV2Items / kOneDayTimestamp 等。
+//   ⇒ 判定按名字关键字兜网（story / oneday / moment / daily），具体字段名由 [od] 探针在实机打出后收敛。
+//
+// ⚠️ 判定故意「先窄后宽」：过滤只用明确的布尔 getter 和明确的 story 子模型，
+//   不把 storyTTL/storyOpen 这类可能是全局开关的字段算进去，避免把正常视频过滤掉（那是不可接受的副作用）。
+static BOOL DYYYStoryNameMatches(NSString *name) {
+    if (name.length == 0) {
+        return NO;
+    }
+    static NSArray<NSString *> *hints = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        hints = @[ @"story", @"oneday", @"moment", @"daily" ];
+    });
+    NSString *lower = [name lowercaseString];
+    for (NSString *hint in hints) {
+        if ([lower containsString:hint]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+// 只按「返回类型」放行：BOOL/c 才当布尔读，避免把返回对象的方法当布尔用（非零指针会被误判成 YES）
+static BOOL DYYYStoryCallBoolGetter(id obj, NSString *selName) {
+    SEL sel = NSSelectorFromString(selName);
+    if (!sel || ![obj respondsToSelector:sel]) {
+        return NO;
+    }
+    NSMethodSignature *sig = [obj methodSignatureForSelector:sel];
+    const char *ret = sig ? sig.methodReturnType : NULL;
+    if (!ret || (ret[0] != 'B' && ret[0] != 'c')) {
+        return NO;
+    }
+    BOOL (*fn)(id, SEL) = (BOOL (*)(id, SEL))[obj methodForSelector:sel];
+    return fn ? fn(obj, sel) : NO;
+}
+
+static NSInteger DYYYStoryCallIntegerGetter(id obj, NSString *selName) {
+    SEL sel = NSSelectorFromString(selName);
+    if (!sel || ![obj respondsToSelector:sel]) {
+        return 0;
+    }
+    NSMethodSignature *sig = [obj methodSignatureForSelector:sel];
+    const char *ret = sig ? sig.methodReturnType : NULL;
+    if (!ret || (ret[0] != 'q' && ret[0] != 'Q' && ret[0] != 'i' && ret[0] != 'I' && ret[0] != 'l' && ret[0] != 'L')) {
+        return 0;
+    }
+    NSInteger (*fn)(id, SEL) = (NSInteger (*)(id, SEL))[obj methodForSelector:sel];
+    return fn ? fn(obj, sel) : 0;
+}
+
+static id DYYYStoryCallObjectGetter(id obj, NSString *selName) {
+    SEL sel = NSSelectorFromString(selName);
+    if (!sel || ![obj respondsToSelector:sel]) {
+        return nil;
+    }
+    NSMethodSignature *sig = [obj methodSignatureForSelector:sel];
+    const char *ret = sig ? sig.methodReturnType : NULL;
+    if (!ret || (ret[0] != '@' && ret[0] != '#')) {
+        return nil;
+    }
+    id (*fn)(id, SEL) = (id (*)(id, SEL))[obj methodForSelector:sel];
+    return fn ? fn(obj, sel) : nil;
+}
+
+// 返回命中的字段名（nil = 不是日常）。这个函数只在开关打开时被调用（每次解析每条 aweme 一次）。
+static NSString *DYYYStoryHitOnAweme(id model) {
+    if (!model) {
+        return nil;
+    }
+    static NSArray<NSString *> *boolSelectors = nil;
+    static NSArray<NSString *> *objectSelectors = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        // 只收语义明确、不会误伤普通视频的字段
+        boolSelectors = @[ @"isStory", @"isOneDayStory", @"isStoryVideo", @"isOneDayVideo",
+                           @"isFromStory", @"isStoryItem", @"isStoryAweme" ];
+        objectSelectors = @[ @"storyInfo", @"storyModel", @"storyMeta", @"storyGroup",
+                             @"oneDayInfo", @"oneDayModel", @"oneDayStoryInfo",
+                             @"momentInfo", @"storyRecommendInfo" ];
+    });
+    for (NSString *selName in boolSelectors) {
+        if (DYYYStoryCallBoolGetter(model, selName)) {
+            return selName;
+        }
+    }
+    for (NSString *selName in objectSelectors) {
+        if (DYYYStoryCallObjectGetter(model, selName) != nil) {
+            return selName;
+        }
+    }
+    return nil;
+}
+
+// 【取证探针】只在本版诊断期用：把 AWEAwemeModel 上「名字像日常」的属性名一次性列出来，
+// 之后每条 aweme 打一行可疑属性的实际值 + 原始 JSON 里名字像日常的键值。
+// 目的：实机刷到一条限时日常后，日志里能直接看出真正的标记字段是什么（本版判定靠它收敛）。
+static NSArray<NSString *> *DYYYStoryCandidatePropertyNames(void) {
+    static NSArray<NSString *> *names = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSMutableArray<NSString *> *found = [NSMutableArray array];
+        Class cls = NSClassFromString(@"AWEAwemeModel");
+        int depth = 0;
+        while (cls && cls != [NSObject class] && depth < 4) {
+            unsigned int count = 0;
+            objc_property_t *props = class_copyPropertyList(cls, &count);
+            for (unsigned int i = 0; i < count; i++) {
+                const char *rawName = property_getName(props[i]);
+                if (!rawName) {
+                    continue;
+                }
+                NSString *propName = [NSString stringWithUTF8String:rawName];
+                if (propName.length > 0 && DYYYStoryNameMatches(propName)) {
+                    [found addObject:propName];
+                }
+            }
+            if (props) {
+                free(props);
+            }
+            cls = class_getSuperclass(cls);
+            depth++;
+        }
+        names = [found copy];
+        DYYYSpeedDiag([NSString stringWithFormat:@"[od] 日常候选属性(%lu)：%@",
+                       (unsigned long)names.count,
+                       names.count ? [names componentsJoinedByString:@","] : @"无"]);
+    });
+    return names;
+}
+
+static NSString *DYYYStoryShortDescription(id value, NSUInteger maxLength) {
+    if (value == nil) {
+        return @"(nil)";
+    }
+    NSString *text = [value isKindOfClass:[NSString class]] ? (NSString *)value : [value description];
+    if (text.length > maxLength) {
+        text = [[text substringToIndex:maxLength] stringByAppendingString:@"…"];
+    }
+    return text;
+}
+
+static void DYYYStoryProbeAweme(id model, id raw) {
+    static NSInteger probeCount = 0;
+    if (probeCount >= 60) {   // 一次启动最多 60 条，免得日志刷爆
+        return;
+    }
+    probeCount++;
+
+    NSMutableString *detail = [NSMutableString string];
+
+    for (NSString *propName in DYYYStoryCandidatePropertyNames()) {
+        id value = nil;
+        @try {
+            value = [model valueForKey:propName];
+        } @catch (__unused NSException *exception) {
+            value = nil;
+        }
+        if (value == nil) {
+            continue;
+        }
+        [detail appendFormat:@" %@=%@", propName, DYYYStoryShortDescription(value, 60)];
+    }
+
+    if ([raw isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dict = (NSDictionary *)raw;
+        for (id key in dict) {
+            if (![key isKindOfClass:[NSString class]] || !DYYYStoryNameMatches((NSString *)key)) {
+                continue;
+            }
+            [detail appendFormat:@" raw.%@=%@", key, DYYYStoryShortDescription([dict objectForKey:key], 60)];
+        }
+    }
+
+    NSString *referString = DYYYStoryCallObjectGetter(model, @"referString");
+    NSString *awemeID = DYYYStoryCallObjectGetter(model, @"awemeID");
+    if (awemeID == nil) {
+        awemeID = DYYYStoryCallObjectGetter(model, @"awemeId");
+    }
+
+    DYYYSpeedDiag([NSString stringWithFormat:@"[od] item#%ld type=%ld ref=%@ aid=%@%@",
+                   (long)probeCount,
+                   (long)DYYYStoryCallIntegerGetter(model, @"awemeType"),
+                   referString ? referString : @"-",
+                   awemeID ? awemeID : @"-",
+                   detail.length ? detail : @" 无可疑字段"]);
+}
+// 【v76 取证】抖音的「日常」页：AWEOneDayFeedViewController（二进制里 AWEOneDay* 一整套类）。
+// 只打一行日志，不做任何拦截 —— 先确认限时日常到底是不是独立页面，再决定屏蔽手段。
+%hook AWEOneDayFeedViewController
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    if (DYYYDiagOn()) {
+        DYYYSpeedDiag(@"[od] OneDayFeedViewController 出现（限时日常独立页面）");
+    }
+}
+%end
+
 %hook AWEAwemeModel
 
 - (id)initWithDictionary:(id)arg1 error:(id *)arg2 {
     id orig = %orig;
     if (orig) {
+        // 【v76 取证】日常真正的标记字段还没确定：开关打开时把「名字像日常」的属性值 + 原始 JSON 键值打出来，
+        // 实机刷到一条限时日常后一眼就能看出该按哪个字段收敛（下一版据此收紧判定）。
+        if (DYYYDiagOn()) {
+            DYYYStoryProbeAweme(self, arg1);
+        }
         BOOL shouldDisableHDR = DYYYShouldDisableAllHDR();
         BOOL shouldFilterOnlyHDRSource = NO;
         if (shouldDisableHDR && ![self dyyy_shouldExcludeFromGlobalHDRFilter]) {
@@ -10904,6 +11115,7 @@ static NSHashTable *processedParentViews = nil;
     BOOL skipPhotoText = DYYYGetBool(@"DYYYSkipPhotoText");
     BOOL skipMusic = DYYYGetBool(@"DYYYSkipMusic");
     BOOL skipAIInteraction = DYYYGetBool(@"DYYYSkipAIInteraction");
+    BOOL skipStory = DYYYGetBool(@"DYYYSkipStory");   // 【v76】过滤限时日常/日常
     BOOL filterHDR = DYYYShouldFilterGlobalHDR();
 
     BOOL shouldFilterAds = noAds && [DYYYUtils isAdvertisementAwemeModel:self];
@@ -10914,6 +11126,21 @@ static NSHashTable *processedParentViews = nil;
     BOOL shouldskipPhotoText = skipPhotoText && self.isNewTextMode && isRecommendFeed;
     BOOL shouldFilterMusic = skipMusic && self.musicCard && isRecommendFeed;
     BOOL shouldFilterAIInteraction = skipAIInteraction && (self.awemeType == 162) && isRecommendFeed;
+
+    // 【v76】限时日常/日常：这类是 24h 限时 Story，播完不会自动下一条（一直放一直放），老板要求直接不刷出来。
+    // 不做 referString 限制 —— 推荐页、关注页、搜索都要挡掉，本来就不想看。
+    NSString *storyHitSelector = nil;
+    BOOL shouldFilterStory = NO;
+    if (skipStory) {
+        storyHitSelector = DYYYStoryHitOnAweme(self);
+        shouldFilterStory = (storyHitSelector != nil);
+        if (shouldFilterStory && DYYYDiagOn()) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[od] 拦截日常 命中=%@ type=%ld aid=%@",
+                           storyHitSelector,
+                           (long)self.awemeType,
+                           DYYYStoryCallObjectGetter(self, @"awemeID") ?: @"-"]);
+        }
+    }
     BOOL shouldFilterHDR = NO;
     BOOL shouldFilterLowLikes = NO;
     BOOL shouldFilterKeywords = NO;
@@ -11030,7 +11257,7 @@ static NSHashTable *processedParentViews = nil;
     }
 
     return shouldFilterAds || shouldFilterAllLive || shouldFilterHotSpot || shouldFilterMusic || shouldFilterHDR || shouldFilterKeywords || shouldFilterProp ||
-           shouldFilterTime || shouldFilterUser;
+           shouldFilterTime || shouldFilterUser || shouldFilterStory;
 }
 
 - (AWEECommerceLabel *)ecommerceBelowLabel {
@@ -14076,6 +14303,13 @@ static Class tabBarButtonClass = nil;
 %hook UIViewController
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
+    // 【v76 取证】限时日常如果走独立页面/独立容器，这里会把类名打出来（判断它是「流内卡片」还是「独立 story 页」）
+    if (DYYYDiagOn()) {
+        NSString *dyyyVCName = NSStringFromClass([self class]);
+        if (DYYYStoryNameMatches(dyyyVCName) && ![dyyyVCName hasPrefix:@"DYYY"]) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[od] 日常相关页面出现 %@", dyyyVCName]);
+        }
+    }
     isAppInTransition = YES;
     if (hideButton && hideButton.isElementsHidden) {
         [hideButton hideUIElements];
