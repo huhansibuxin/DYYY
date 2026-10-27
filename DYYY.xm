@@ -1557,6 +1557,14 @@ static void DYYYBoostNowPlayingAfterPause(void) {
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        // 【v61】入口门控反映的是"调用那一刻"的 App 状态；0.25s 内用户完全可能已切回前台。
+        // 实机日志 2026-10-27 05:07:29 / 05:25:04 出现过
+        //   `[npv] Boost 已发 update=1 resign=1 st=0 vote=2`
+        // —— st=0 说明执行时已在前台，却仍然注入了 resignActive。这里补一次执行时校验。
+        if (DYYYAppStateRaw() == 0) {
+            DYYYSpeedDiag(@"[npv] Boost 放弃（执行时已回前台：不注入 resignActive）");
+            return;
+        }
         if (!DYYYShouldHoldNowPlaying()) {
             return;
         }
@@ -1629,6 +1637,11 @@ static void DYYYBoostNowPlayingAfterPause(void) {
         // 1.2s 后确认发布是否落地；没落地先再催一轮原生链，仍无则【单发兜底】
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
+            // 【v61】同 0.25s 处的道理：1.2s 窗口更长，用户切回前台的概率更大。
+            if (DYYYAppStateRaw() == 0) {
+                DYYYSpeedDiag(@"[npv] Boost 补轮放弃（已回前台）");
+                return;
+            }
             if (!DYYYShouldHoldNowPlaying() || dyyyNpPublishedSinceBoost) {
                 if (dyyyNpPublishedSinceBoost) {
                     DYYYSpeedDiag(@"[npv] Boost 确认：发布已落地 ✓");
@@ -4206,25 +4219,71 @@ static BOOL dyyyIsSystemVolumeSlider(UISlider *slider) {
 }
 %end
 
-// 竖滑手势源头拦截：老板实测按钮 hidden 后原位置"点一下+竖滑"仍能真调音量
-// （音量走 MPVolumeView 私有路径，效果层 AVSystemController 拦不到）。
-// 手势源头 = AWEDPlayerInteractionView 上的 UIPanGestureRecognizer（[gscan] 实锤
-// delegate 就是它自己）。竖直分量>水平分量直接不让手势 begin：调节和滑块 UI 一起死；
-// 水平滑动放行，锁屏/暂停是 tap 手势不经过这里。
+// === 横屏竖滑手势拦截（v61 收窄：只拦亮度/音量按钮区域）===
+// 【来历】2026-09-04（commit 41a9922）为"按钮 hidden 后原位置点一下+竖滑仍能真调音量"
+//   加了【无差别】拦截：横屏下任何 |vel.y| > |vel.x| 的 pan 一律 return NO。
+// 【2026-10-27 实机日志实锤它误杀切条】
+//   07:33:47 [reapply:landscape] 精确命中 → 07:34:41 [pan-block] vel=(64,-408)
+//   → 07:34:43 [pan-block] vel=(64,280)，两次竖滑全被拒，其后无任何切条记录。
+//   return NO 的后果是【事件根本进不了抖音的手势识别器】⇒ 原生也切不了下一条。
+//   老板体感"有时候划不了" = 斜划（x 分量大）能过、正着上下划就死。
+// 【v61 判据】只拦「起点落在 AWELandscapeVolumeBrightnessContainer（亮度/音量按钮容器，
+//   [gscan] 实锤 frame x=59 / x=837，各 36x36）外扩 30pt 区域内」的 pan，其余一律放行。
+//   容器实例由下方 AWELandscapeVolumeBrightnessContainer hook 用【弱表】登记
+//   （didMoveToWindow 时）；我们只 hidden 不 remove，frame/superview 仍在，判据有效。
+//   若弱表为空（容器被移除）⇒ 一律放行：宁可让音量手势复活，也绝不误杀切条。
 // ⚠️ 编译坑：该类只有前向声明，self.frame/self.hidden/传 UIView* 参数都要强转 (UIView *)self。
+
+// 亮度/音量按钮容器的弱登记表（hidden 不 remove，所以 frame 一直在）
+static NSHashTable *DYYYLandscapeVolContainers(void) {
+    static NSHashTable *table = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        table = [NSHashTable weakObjectsHashTable];
+    });
+    return table;
+}
+
+// 手势起点是否落在亮度/音量按钮区域内（容错外扩 30pt）
+static BOOL DYYYLandscapePanHitsVolumeRegion(UIGestureRecognizer *gesture, UIView *host) {
+    if (!gesture || !host) {
+        return NO;
+    }
+    CGPoint loc = [gesture locationInView:host];
+    for (UIView *container in [DYYYLandscapeVolContainers() allObjects]) {
+        if (![container isKindOfClass:[UIView class]] || !container.superview) {
+            continue;
+        }
+        CGRect rect = [container.superview convertRect:container.frame toView:host];
+        if (rect.size.width < 1.0 || rect.size.height < 1.0) {
+            continue;
+        }
+        if (CGRectContainsPoint(CGRectInset(rect, -30.0, -30.0), loc)) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
 %hook AWEDPlayerInteractionView
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
     if (DYYYIsLandscapeFullscreenNow() && [gestureRecognizer isKindOfClass:[UIPanGestureRecognizer class]]) {
         CGPoint vel = [(UIPanGestureRecognizer *)gestureRecognizer velocityInView:(UIView *)self];
         if (fabs(vel.y) > fabs(vel.x)) {
-            static NSTimeInterval dyyyLastPanBlockLog = 0;
+            BOOL inVolumeRegion = DYYYLandscapePanHitsVolumeRegion(gestureRecognizer, (UIView *)self);
+            static NSTimeInterval dyyyLastPanLog = 0;
             NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-            if (now - dyyyLastPanBlockLog > 1.0) {
-                dyyyLastPanBlockLog = now;
-                DYYYSpeedDiag([NSString stringWithFormat:@"[pan-block] 竖滑已拦 vel=(%.0f,%.0f)",
-                    vel.x, vel.y]);
+            if (now - dyyyLastPanLog > 0.5) {
+                dyyyLastPanLog = now;
+                CGPoint loc = [gestureRecognizer locationInView:(UIView *)self];
+                DYYYSpeedDiag([NSString stringWithFormat:@"[pan-%s] 竖滑 loc=(%.0f,%.0f) vel=(%.0f,%.0f) 音量区=%d 容器数=%lu",
+                    inVolumeRegion ? "block" : "pass", loc.x, loc.y, vel.x, vel.y,
+                    (int)inVolumeRegion,
+                    (unsigned long)[DYYYLandscapeVolContainers() allObjects].count]);
             }
-            return NO;
+            if (inVolumeRegion) {
+                return NO;
+            }
         }
     }
     return %orig;
@@ -4249,6 +4308,8 @@ static BOOL dyyyIsSystemVolumeSlider(UISlider *slider) {
 - (void)didMoveToWindow {
     %orig;
     ((UIView *)self).hidden = YES;
+    // v61：登记给竖滑手势判据用（弱表，容器释放自动出表）
+    [DYYYLandscapeVolContainers() addObject:(UIView *)self];
 }
 %end
 
