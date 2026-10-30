@@ -16558,20 +16558,66 @@ static volatile BOOL dyyyKillNoSel = NO;
 static volatile NSTimeInterval dyyyFirstWebViewTime = 0;
 static volatile int32_t dyyyKillSkipped = 0;
 
+// 【v96】v95 实机（p36200 / p36212）留下的最后两个壳，来路已经查清：
+//   ① `回收#1 后 4s：pid 36215 → 36219 (已重建!)` —— 这个是 **WebKit 自己拉回来的**。
+//      `_killWebContentProcess` 只杀了进程，`WebPageProxy` 还挂着这个 page，
+//      WebKit 发现进程没了就按 page 列表把它重新拉起来 ⇒ 杀进程根本断不了根。
+//      ⇒ 必须先用 `-_close`（WebPageProxy::close，把 page 从进程里摘掉），再杀进程，
+//        杀完就没有「为谁重启」的理由了。
+//   ② ②是 v94 那个「12 秒窗口外一律保留」留下的 #8 空壳（pid 36225）。
+//      当时保留它是怕跟池补货打成 15 秒循环；现在既然有了 `_close`，
+//      杀掉就不再引发补货，这条保守策略可以撤掉 —— 改成「只放行抖音真在用的页面」。
+static volatile int32_t dyyyClosedCount = 0;
+static volatile int32_t dyyyRelaunchFixes = 0;
+
+// 空壳判定：不在任何窗口层级 = 池里备用、没人看。
+// 抖音真在展示的 webview（window / superview 非空）绝不碰，避免它拿着死 page 崩。
+static BOOL DYYYIsBlankShell(id wv) {
+    if (!wv) {
+        return NO;
+    }
+    if ([wv isKindOfClass:[UIView class]]) {
+        UIView *v = (UIView *)wv;
+        if (v.window != nil || v.superview != nil) {
+            return NO;
+        }
+    }
+    return YES;
+}
+
+// 真正断链：`-_close` 让 WebPageProxy 关闭 page，之后杀进程**不会**被自动 relaunch。
+// 返回类型是 id，但我们不取返回值（v85 就是改 init 返回值改崩的，这里一个字节都不改）。
+static BOOL DYYYCloseWebPage(id wv) {
+    SEL sClose = sel_registerName("_close");
+    if (!wv || ![wv respondsToSelector:sClose]) {
+        return NO;
+    }
+    ((void (*)(id, SEL))objc_msgSend)(wv, sClose);
+    int32_t n = __sync_add_and_fetch(&dyyyClosedCount, 1);
+    if (n <= 3) {
+        DYYYSpeedDiag([NSString stringWithFormat:
+            @"[webview] 已 _close 第 %d 个实例的 page（%@，断开 kill→自动 relaunch）",
+            (int)n, DYYYIsBlankShell(wv) ? @"空壳" : @"在用"]);
+    }
+    return YES;
+}
+
 static void DYYYKillWebContentOnce(id wv) {
     if (!DYYYNoWebViewOn() || !wv) {
         return;
     }
-    // 启动批窗口：以「第一个 WKWebView 创建时刻」为基准，只处理 12 秒内的。
+    // 启动批窗口：以「第一个 WKWebView 创建时刻」为基准取 12 秒。
+    // 【v96】窗口外**仍然不主动杀**（v93/v94 的教训：主动杀 → 抖音池补货 → 15 秒循环）。
+    //   v95 剩下的第 2 个壳（pid 36219）不是我们杀的，是 WebKit 为「已 kill 但 page 还挂着」
+    //   的实例自动 relaunch 出来的 —— 那个由 `_close` + 4s 自愈补刀收拾，不靠窗口外乱杀。
     NSTimeInterval t0 = dyyyFirstWebViewTime;
     if (t0 > 0 && CFAbsoluteTimeGetCurrent() - t0 > 12.0) {
         static volatile int32_t skipLog = 0;
         if (__sync_add_and_fetch(&skipLog, 1) <= 3) {
-            DYYYSpeedDiag(@"[webview] 已过启动批窗口，后续新建的一律不再回收"
-                          @"（否则会跟池补货打成 15 秒循环）");
+            DYYYSpeedDiag(@"[webview] 已过启动批窗口，不主动回收（避免触发池补货循环）");
         }
         if (__sync_add_and_fetch(&dyyyKillSkipped, 1) == 1) {
-            DYYYSpeedDiag(@"[webview] 回收策略切换：保留 1 个空壳，换取不再循环");
+            DYYYSpeedDiag(@"[webview] 窗口外只剩 WebKit relaunch 一条路，交给 4s 自愈补刀");
         }
         return;
     }
@@ -16591,12 +16637,16 @@ static void DYYYKillWebContentOnce(id wv) {
     objc_setAssociatedObject(wv, &kDYYYKilledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     int32_t n = __sync_add_and_fetch(&dyyyKillCount, 1);
-    if (n > 12) {
-        if (n == 13) {
-            DYYYSpeedDiag(@"[webview] 回收已达上限 12 次，停手（防建-杀死循环）");
+    if (n > 20) {
+        if (n == 21) {
+            DYYYSpeedDiag(@"[webview] 回收已达上限 20 次，停手（防建-杀死循环）");
         }
         return;
     }
+
+    // 【v96】顺序很重要：先 _close 摘掉 page，再杀进程。
+    //   反过来的话（v95 的做法）进程一死，WebKit 就按还挂着的 page 把它重新拉起来。
+    DYYYCloseWebPage(wv);
 
     const char *names[2] = { "_killWebContentProcess", "_killWebContentProcessAndResetState" };
     for (int i = 0; i < 2; i++) {
@@ -16631,6 +16681,20 @@ static void DYYYKillWebContentOnce(id wv) {
                                  @"[webview] 回收#%d 后 %.0fs：pid %d → %d %@",
                                  (int)tag, dtv, basePid, now,
                                  now == 0 ? @"(已退出)" : (now == basePid ? @"(仍是原进程)" : @"(已重建!)")]);
+                             // 【v96】自愈：万一 _close 没断干净、WebKit 又把进程拉起来了，
+                             //   这里补一刀（_close + kill），总补刀次数封顶 6 次防失控。
+                             if (now > 0 && now != basePid && dtv < 4.1) {
+                                 if (__sync_add_and_fetch(&dyyyRelaunchFixes, 1) <= 6) {
+                                     DYYYCloseWebPage(weakWV);
+                                     SEL sk = sel_registerName("_killWebContentProcess");
+                                     if ([weakWV respondsToSelector:sk]) {
+                                         ((void (*)(id, SEL))objc_msgSend)(weakWV, sk);
+                                     }
+                                     DYYYSpeedDiag([NSString stringWithFormat:
+                                         @"[webview] 检测到 relaunch（%d），已补一刀 _close+kill（第 %d 次）",
+                                         now, (int)dyyyRelaunchFixes]);
+                                 }
+                             }
                            });
         }
         return;
@@ -17199,7 +17263,7 @@ static void DYYYClampPoolCapacities(void) {
                                  DYYYClampPoolCapacities();   // 【v95】池类可能是之后才注册的
                                });
             }
-            DYYYSpeedDiag(@"[webview] 已挂 v95 WebView 治理钩子（禁加载/废预加载/禁预热/禁缓存/吞死通知/只回收启动批/池容量钳到1，已废弃改 config 池）");
+            DYYYSpeedDiag(@"[webview] 已挂 v96 WebView 治理钩子（禁加载/废预加载/禁预热/禁缓存/吞死通知/只回收启动批/池容量钳到1/回收前先 _close 断 relaunch）");
         } else {
             DYYYSpeedDiag(@"[webview] WKWebView 类不存在，跳过");
         }
