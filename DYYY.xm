@@ -15898,8 +15898,10 @@ static __weak id dyyyAnyPool = nil;
 static volatile int32_t dyyyPoolSeen = 0;
 static volatile int32_t dyyyCreateDump = 0;
 
-// 用私有 SEL 直接读 WebKit 的进程计数 —— 这是唯一能在不看 CocoaTop 的情况下
-// 证明「到底还剩几个 WebContent」的手段。
+// 用私有 SEL 直接读 WebKit 的进程计数 —— 注意这**只是单个池**的数字，
+// 真实验收看 DYYYCountWebContentProcs() 数出来的全系统 WebContent 进程数。
+static int DYYYCountWebContentProcs(void);   // 定义在下方 v92 段，前置声明
+
 static void DYYYDumpWebProcessCount(NSString *tag) {
     id pool = dyyyAnyPool;
     if (!pool) {
@@ -15927,8 +15929,9 @@ static void DYYYDumpWebProcessCount(NSString *tag) {
         prewarmed = ((int32_t(*)(id, SEL))objc_msgSend)(pool, sPre);
     }
     DYYYSpeedDiag([NSString stringWithFormat:
-        @"[webview] 进程数(%@)：WebProcess=%lu 其中页面=%lu 缓存=%lu 预热pid=%d",
-        tag, (unsigned long)total, (unsigned long)pages, (unsigned long)cache, (int)prewarmed]);
+        @"[webview] 进程数(%@)：全系统WebContent=%d | 本池 WebProcess=%lu 页面=%lu 缓存=%lu 预热pid=%d",
+        tag, DYYYCountWebContentProcs(),
+        (unsigned long)total, (unsigned long)pages, (unsigned long)cache, (int)prewarmed]);
 }
 
 // ============ v90 核心：把 5~6 个 WKProcessPool 合成 1 个（安全做法） ============
@@ -16094,6 +16097,92 @@ static void DYYYInstallConfigInitHook(void) {
     }
     dyyyOrigCfgInit = method_setImplementation(target, (IMP)DYYYCfgInitHook);
     DYYYSpeedDiag(@"[webview] 已在 WKWebViewConfiguration init 处归并池（启动峰值也应为 1）");
+}
+
+// 【v92】真实全局进程数：遍历系统进程表，数名字含 WebContent 的进程。
+//
+// 为什么必须要有这个：`-[WKProcessPool _webProcessCount]` 是**单个池**的实例方法，
+//   只数「这个池自己」管的进程。v90/v91 归并之后，新 webview 全挂到池 A，
+//   池 A 自报 WebProcess=1 —— 但旧池 B/C/D/E 的进程只要有 webview 还连着就一个都不退，
+//   于是日志笑眯眯地写「1 个」，CocoaTop 里老老实实摆着 5 个。
+//   ⇒ 只有这张真实进程表才能作为验收标准，池自报的数字一律不可信。
+#include <sys/sysctl.h>
+
+static int DYYYCountWebContentProcs(void) {
+    int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
+    size_t size = 0;
+    if (sysctl(mib, 3, NULL, &size, NULL, 0) != 0 || size == 0) {
+        return -1;
+    }
+    struct kinfo_proc *buf = (struct kinfo_proc *)malloc(size);
+    if (!buf) {
+        return -1;
+    }
+    if (sysctl(mib, 3, buf, &size, NULL, 0) != 0) {
+        free(buf);
+        return -1;
+    }
+    int total = (int)(size / sizeof(struct kinfo_proc));
+    int hits = 0;
+    for (int i = 0; i < total; i++) {
+        const char *nm = buf[i].kp_proc.p_comm;
+        if (nm && strstr(nm, "WebContent")) {
+            hits++;
+        }
+    }
+    free(buf);
+    return hits;
+}
+
+// 【v92】copy 才是真正的拦截点。
+//
+// 老板实测：v90 之后跑 3 分钟，CocoaTop 里 5 个 WebContent 一直在，而池自报 WebProcess=1。
+// 两个事实放一起只有一个解释：**归并被覆盖了**。
+// v87 的崩溃栈已经给过线索 —— `-[WKWebView _initializeWithConfiguration:]` 里会
+// `-[WKWebViewConfiguration copyWithZone:]`，而这一步会**重新处理 processPool**。
+// 也就是说：我们在 init 时改好的池，进入 WKWebView 时又被 copy 出来的新池换掉了。
+// ⇒ 必须在 copyWithZone: 之后再归并一次，才能保证 webview 真正拿到共享池。
+
+static IMP dyyyOrigCfgCopy = NULL;
+static volatile BOOL dyyyCfgCopyTried = NO;
+
+static id DYYYCfgCopyHook(id self, SEL _cmd, NSZone *zone) {
+    id r = ((id(*)(id, SEL, NSZone *))dyyyOrigCfgCopy)(self, _cmd, zone);
+    if (r && DYYYNoWebViewOn()) {
+        DYYYAdoptSharedPool(r);
+    }
+    return r;
+}
+
+static void DYYYInstallConfigCopyHook(void) {
+    if (dyyyCfgCopyTried) {
+        return;
+    }
+    dyyyCfgCopyTried = YES;
+    Class cls = objc_getClass("WKWebViewConfiguration");
+    if (!cls) {
+        return;
+    }
+    unsigned int cnt = 0;
+    Method *list = class_copyMethodList(cls, &cnt);
+    if (!list) {
+        return;
+    }
+    Method target = NULL;
+    for (unsigned int i = 0; i < cnt; i++) {
+        const char *n = sel_getName(method_getName(list[i]));
+        if (n && strcmp(n, "copyWithZone:") == 0) {
+            target = list[i];
+            break;
+        }
+    }
+    free(list);
+    if (!target) {
+        DYYYSpeedDiag(@"[webview] WKWebViewConfiguration 未自己实现 copyWithZone:，copy 归并跳过");
+        return;
+    }
+    dyyyOrigCfgCopy = method_setImplementation(target, (IMP)DYYYCfgCopyHook);
+    DYYYSpeedDiag(@"[webview] 已在 WKWebViewConfiguration copyWithZone: 处归并池");
 }
 
 // 装 v89 的两把刀：禁预热 + 缓存容量 0。用一个标志保证只装一次，
@@ -16513,6 +16602,9 @@ static void DYYYNoWebViewKillPreloadersRetry(void) {
             // 【v91】把归并提前到 config 创建时：从第一个 webview 起就只有一份池，
             //   启动峰值也应该是 1 个进程（v90 只能做到稳态 1 个）
             DYYYInstallConfigInitHook();
+            // 【v92】copy 是真正的拦截点：WKWebView 内部会用 copy 出来的 config，
+            //   copy 过程中池会被重新处理，不在这里补一刀，前面的归并等于白做
+            DYYYInstallConfigCopyHook();
             DYYYNoWebViewKillPreloadersRetry();
             DYYYDumpProcessPoolSELs();
             // 【v89】定时打真实进程数：日志里直接看 WebProcess 数量，
@@ -16533,7 +16625,7 @@ static void DYYYNoWebViewKillPreloadersRetry(void) {
                                  DYYYNoWebViewKillPreloadersRetry();
                                });
             }
-            DYYYSpeedDiag(@"[webview] 已挂 v91 WebView 治理钩子（放行创建/禁加载/废预加载/禁预热/禁缓存/config级池归并）");
+            DYYYSpeedDiag(@"[webview] 已挂 v92 WebView 治理钩子（放行创建/禁加载/废预加载/禁预热/禁缓存/池归并含copy）");
         } else {
             DYYYSpeedDiag(@"[webview] WKWebView 类不存在，跳过");
         }
