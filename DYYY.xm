@@ -15931,6 +15931,107 @@ static void DYYYDumpWebProcessCount(NSString *tag) {
         tag, (unsigned long)total, (unsigned long)pages, (unsigned long)cache, (int)prewarmed]);
 }
 
+// ============ v90 核心：把 5~6 个 WKProcessPool 合成 1 个（安全做法） ============
+//
+// v89 实机数据（2026-10-30 17:41，p35841）证明了两件事：
+//   ① 禁预热**真的生效**：`预热pid=0`、`缓存=0`、之前那个 15 秒 kill-回填循环彻底消失
+//   ② 但 WebProcess 数**严格等于 WKWebView 数**（建 1 个→1，建 2 个→2，建 3 个→3）
+//      ⇒ 进程不是预热来的，是**每个 WKWebView 各自那份 configuration.processPool
+//        持有的 WebProcessProxy 实体化的**。抖音建 5~6 个 config（每个自带一个新池），
+//        所以必然 5~6 个进程，跟 load 拦不拦依旧无关。
+//
+// 因此唯一能把 5~6 压成 1 的办法：**让所有 configuration 共用同一个池**。
+//   WebKit 的规则就是「同一个 WebProcessPool 下的多个 WKWebView 共享同一个 WebContent
+//   进程」（Apple 文档里明确建议多 webview 共享 pool 以复用进程）。
+//
+// 为什么这次不会像 v87 那样崩：
+//   v87 改的是 `-[WKProcessPool init]` 的**返回值**，导致 alloc 出来的半初始化对象被 ARC
+//   释放、dealloc 解空指针（IPS 已证）。这次**完全不碰池对象的生命周期**，
+//   只在 WKWebView 拿到 configuration、尚未初始化之前，把它的 `_processPool` ivar
+//   直接指向已经存在的那个池。Shared pool 是 WebKit 设计内支持的用法，对象全部
+//   正常存活，没有半初始化对象被释放的问题。
+//
+// 用 ivar 而不是 setProcessPool:：后者是私有 setter，可能带内部一致性检查/断言；
+//   直接改已存在的 ivar 最接近「当初就设成这样」，且不需要知道方法名。
+
+static Ivar dyyyCfgPoolIvar = NULL;
+static volatile BOOL dyyyCfgIvarLooked = NO;
+static id dyyySharedPoolRef = nil;            // strong：共享池必须一直活着
+static volatile int32_t dyyyPoolAdoptCount = 0;
+
+static Ivar DYYYConfigPoolIvar(void) {
+    if (dyyyCfgIvarLooked) {
+        return dyyyCfgPoolIvar;
+    }
+    dyyyCfgIvarLooked = YES;
+    Class cls = objc_getClass("WKWebViewConfiguration");
+    if (!cls) {
+        return NULL;
+    }
+    unsigned int n = 0;
+    Ivar *ivars = class_copyIvarList(cls, &n);
+    if (!ivars) {
+        return NULL;
+    }
+    NSMutableString *dump = [NSMutableString string];
+    for (unsigned int i = 0; i < n; i++) {
+        const char *nm = ivar_getName(ivars[i]);
+        if (!nm) {
+            continue;
+        }
+        if (dump.length < 400) {
+            [dump appendFormat:@"%s ", nm];
+        }
+        if (!dyyyCfgPoolIvar && strstr(nm, "rocessPool")) {
+            dyyyCfgPoolIvar = ivars[i];
+            DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 找到池 ivar：%s", nm]);
+        }
+    }
+    free(ivars);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[webview] WKWebViewConfiguration ivars：%@", dump]);
+    if (!dyyyCfgPoolIvar) {
+        DYYYSpeedDiag(@"[webview] 没找到池 ivar，池归并跳过（进程数不会降）");
+    }
+    return dyyyCfgPoolIvar;
+}
+
+// 在 WKWebView 初始化之前调用：把这份 configuration 的池换成全局共享池。
+static void DYYYAdoptSharedPool(id configuration) {
+    if (!configuration) {
+        return;
+    }
+    Ivar iv = DYYYConfigPoolIvar();
+    if (!iv) {
+        return;
+    }
+    // 先用 getter 把池逼出来（第一次访问时 WebKit 是 lazy 创建的），再读 ivar
+    id cur = nil;
+    SEL sPool = sel_registerName("processPool");
+    if ([configuration respondsToSelector:sPool]) {
+        cur = ((id(*)(id, SEL))objc_msgSend)(configuration, sPool);
+    }
+    if (!cur) {
+        cur = object_getIvar(configuration, iv);
+    }
+    if (!dyyySharedPoolRef) {
+        if (!cur) {
+            return;   // 还没有池，等下一个
+        }
+        dyyySharedPoolRef = cur;
+        DYYYSpeedDiag(@"[webview] 已锁定共享池（后续 config 全部指向它）");
+        return;
+    }
+    if (cur == dyyySharedPoolRef) {
+        return;
+    }
+    // object_setIvar 不做 ARC 内存管理，但 shared 池是 strong 静态引用、永不释放，安全。
+    object_setIvar(configuration, iv, dyyySharedPoolRef);
+    int32_t n = __sync_add_and_fetch(&dyyyPoolAdoptCount, 1);
+    if (n <= 8) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 池归并#%d（config 的池 → 共享池）", (int)n]);
+    }
+}
+
 // 装 v89 的两把刀：禁预热 + 缓存容量 0。用一个标志保证只装一次，
 // 之后每次新建 pool 只顺手清一次缓存（method_setImplementation 反复设会不断生成 block）。
 static volatile BOOL dyyyPoolTuned = NO;
@@ -16194,19 +16295,18 @@ static void DYYYNoWebViewKillPreloadersRetry(void) {
 //   nil/半初始化对象进去后 WebPageProxy 指针是野的，+0x170 直接 EXC_BAD_ACCESS）。
 //   只记录「谁在建」，然后老老实实给真对象。
 - (instancetype)initWithFrame:(CGRect)frame configuration:(id)configuration {
-    // 【v89】趁 configuration 还在手上，取它的 processPool 实例（只读属性，安全）
-    if (DYYYNoWebViewOn() && !dyyyAnyPool && configuration) {
-        SEL sPool = sel_registerName("processPool");
-        if ([configuration respondsToSelector:sPool]) {
-            id p = ((id(*)(id, SEL))objc_msgSend)(configuration, sPool);
-            if (p) {
-                dyyyAnyPool = p;
-                int32_t n = __sync_add_and_fetch(&dyyyPoolSeen, 1);
-                if (n <= 6) {
-                    DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 取到 WKProcessPool #%d", (int)n]);
-                }
-                DYYYWebViewPoolTune();
+    // 【v90】关键：在 %orig 之前把这份 config 的池换成共享池
+    //   ⇒ 抖音建 5~6 个 webview 也只会共享同一个 WebContent 进程。
+    //   （v87 是改池 init 返回值 → ARC 释放半初始化对象 → 必崩；这次只改 config 的引用，不碰池生命周期）
+    if (DYYYNoWebViewOn() && configuration) {
+        DYYYAdoptSharedPool(configuration);
+        if (!dyyyAnyPool && dyyySharedPoolRef) {
+            dyyyAnyPool = dyyySharedPoolRef;
+            int32_t n = __sync_add_and_fetch(&dyyyPoolSeen, 1);
+            if (n <= 6) {
+                DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 共享池就绪（第 %d 个池见到的）", (int)n]);
             }
+            DYYYWebViewPoolTune();
         }
     }
     id ret = %orig;
@@ -16366,7 +16466,7 @@ static void DYYYNoWebViewKillPreloadersRetry(void) {
                                  DYYYNoWebViewKillPreloadersRetry();
                                });
             }
-            DYYYSpeedDiag(@"[webview] 已挂 v89 WebView 治理钩子（放行创建/禁加载/废预加载/禁预热/禁进程缓存）");
+            DYYYSpeedDiag(@"[webview] 已挂 v90 WebView 治理钩子（放行创建/禁加载/废预加载/禁预热/禁缓存/池归并）");
         } else {
             DYYYSpeedDiag(@"[webview] WKWebView 类不存在，跳过");
         }
