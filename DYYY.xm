@@ -10946,6 +10946,7 @@ static NSHashTable *processedParentViews = nil;
 
 %new
 - (BOOL)contentFilter {
+    DYYYDiagCardProbe(self);   // 【v80】只做卡片字段命中统计，不参与下面任何判断
     BOOL noAds = DYYYGetBool(@"DYYYNoAds");
     BOOL skipAllLive = DYYYGetBool(@"DYYYSkipAllLive");
     BOOL skipHotSpot = DYYYGetBool(@"DYYYSkipHotSpot");
@@ -15433,6 +15434,276 @@ static void findTargetViewInView(UIView *view) {
 // 另注：崩溃栈恰好说明 beginReceivingRemoteControlEvents 内部会调它 —— 那是系统【启用】
 //   远程控制（传 1），并不是撤身份，本来就不是我们要拦的目标。
 
+// ============================================================================
+// 【v80】内存诊断（只测量，零行为改动）
+// 起因：老板要省内存，但「Lynx 卡片」和「图片内存缓存」各占多少是未知数，先测再动。
+// 本区块【不拦截、不过滤、不清理、不改任何既有行为】，只输出四类测量值，
+// 全部走 DYYYSpeedDiag（同一个日志开关，开关一关连拼接都不求值）：
+//   ① [mem]      进程 phys_footprint（与 ltop 的 phys_footprint 同口径，单位 MB）
+//   ② [imgcache] BDImageCache 单例统计 + BDImageCacheConfig 属性表（看内存上限到底设了多少）
+//   ③ [lynx]     LynxView / LynxBackgroundRuntime 存活数 + 累计创建数
+//   ④ [card]     推荐流里 18 项卡片字段的命中计数（每 40 条模型汇总一行）
+// 采样节奏：启动 10s 后第一发，之后每 30s 一发，最多 20 发（约 10 分钟）自动停，不常驻。
+// 看日志：搜 [mem] / [imgcache] / [lynx] / [card] 四个前缀。
+// ============================================================================
+#include <mach/mach.h>
+#include <mach/task_info.h>
+
+static unsigned long long DYYYDiagPhysFootprint(void) {
+    task_vm_info_data_t info;
+    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    kern_return_t kr = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &cnt);
+    if (kr != KERN_SUCCESS) {
+        return 0;
+    }
+    return (unsigned long long)info.phys_footprint;
+}
+
+// 把任意对象的属性表 + 当前值拼成一行（只读，全部 @try 兜住）。
+// 用途：BDImageCacheConfig 这类 SDK 对象的属性名不同版本会变，静态分析拿不到，只能运行时反射。
+static NSString *DYYYDiagPropsOf(id obj, NSUInteger maxLen) {
+    if (!obj) {
+        return @"(nil)";
+    }
+    NSMutableString *out = [NSMutableString string];
+    Class cls = [obj class];
+    int depth = 0;
+    while (cls && cls != [NSObject class] && depth < 4) {
+        unsigned int count = 0;
+        objc_property_t *props = class_copyPropertyList(cls, &count);
+        for (unsigned int i = 0; i < count; i++) {
+            const char *name = property_getName(props[i]);
+            if (!name) {
+                continue;
+            }
+            NSString *key = [NSString stringWithUTF8String:name];
+            id val = nil;
+            @try {
+                val = [obj valueForKey:key];
+            } @catch (__unused NSException *e) {
+                val = @"<抛异常>";
+            }
+            if ([val isKindOfClass:[NSNumber class]] || [val isKindOfClass:[NSString class]]) {
+                [out appendFormat:@"%@=%@ ", key, val];
+            } else if (val) {
+                [out appendFormat:@"%@=<%@> ", key, NSStringFromClass([val class])];
+            } else {
+                [out appendFormat:@"%@=nil ", key];
+            }
+            if (out.length > maxLen) {
+                [out appendString:@"...(已截断)"];
+                free(props);
+                return out;
+            }
+        }
+        free(props);
+        cls = class_getSuperclass(cls);
+        depth++;
+    }
+    return out.length ? out : @"(无属性)";
+}
+
+static id DYYYDiagCallObj(id obj, NSString *selName) {
+    if (!obj || selName.length == 0) {
+        return nil;
+    }
+    SEL sel = NSSelectorFromString(selName);
+    if (!sel || ![obj respondsToSelector:sel]) {
+        return nil;
+    }
+    id (*fn)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+    return fn(obj, sel);
+}
+
+static BOOL DYYYDiagCallULL(id obj, NSString *selName, unsigned long long *out) {
+    if (!obj || selName.length == 0) {
+        return NO;
+    }
+    SEL sel = NSSelectorFromString(selName);
+    if (!sel || ![obj respondsToSelector:sel]) {
+        return NO;
+    }
+    unsigned long long (*fn)(id, SEL) = (unsigned long long (*)(id, SEL))objc_msgSend;
+    unsigned long long v = fn(obj, sel);
+    if (out) {
+        *out = v;
+    }
+    return YES;
+}
+
+static void DYYYDiagDumpImageCache(NSString *tag) {
+    Class cacheCls = NSClassFromString(@"BDImageCache");
+    if (!cacheCls) {
+        DYYYSpeedDiag(@"[imgcache] %@ BDImageCache 类不存在", tag);
+        return;
+    }
+    id cache = DYYYDiagCallObj(cacheCls, @"sharedImageCache");
+    if (!cache) {
+        DYYYSpeedDiag(@"[imgcache] %@ sharedImageCache 返回 nil（可能不是单例模式）", tag);
+        return;
+    }
+    // 统计口径未知，把常见方法名全试一遍，命中的才打（未命中说明这一版 SDK 用了别的名字）
+    NSMutableString *stat = [NSMutableString string];
+    NSArray<NSString *> *sels = @[
+        @"totalMemorySize", @"totalMemoryCost", @"totalMemoryCount", @"totalCount",
+        @"totalDiskSize", @"totalDiskCost", @"totalDiskCount"
+    ];
+    for (NSString *s in sels) {
+        unsigned long long v = 0;
+        if (DYYYDiagCallULL(cache, s, &v)) {
+            [stat appendFormat:@"%@=%llu ", s, v];
+        }
+    }
+    DYYYSpeedDiag(@"[imgcache] %@ 单例统计 %@", tag, stat.length ? stat : @"(未命中任何统计方法)");
+
+    id cfg = DYYYDiagCallObj(cache, @"config");
+    DYYYSpeedDiag(@"[imgcache] %@ config(%@) %@", tag,
+                  cfg ? NSStringFromClass([cfg class]) : @"nil",
+                  DYYYDiagPropsOf(cfg, 1200));
+}
+
+// ---- Lynx 实例计数：只加/减，不做任何干预 ----
+static volatile int32_t dyyyLynxViewLive = 0;
+static volatile int32_t dyyyLynxViewTotal = 0;
+static volatile int32_t dyyyLynxBgLive = 0;
+static volatile int32_t dyyyLynxBgTotal = 0;
+
+@interface LynxView : UIView
+@end
+
+@interface LynxBackgroundRuntime : NSObject
+@end
+
+// ⚠️ 两个类各用一个 group：万一某一版抖音没有这个类，只跳过它自己，不连累另一个。
+%group DYYYLynxViewDiagGroup
+%hook LynxView
+
+- (instancetype)init {
+    id r = %orig;
+    if (r) {
+        __sync_fetch_and_add(&dyyyLynxViewLive, 1);
+        __sync_fetch_and_add(&dyyyLynxViewTotal, 1);
+    }
+    return r;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    id r = %orig;
+    if (r) {
+        __sync_fetch_and_add(&dyyyLynxViewLive, 1);
+        __sync_fetch_and_add(&dyyyLynxViewTotal, 1);
+    }
+    return r;
+}
+
+- (void)dealloc {
+    __sync_fetch_and_sub(&dyyyLynxViewLive, 1);
+    %orig;
+}
+
+%end
+%end
+
+%group DYYYLynxBgDiagGroup
+%hook LynxBackgroundRuntime
+
+- (instancetype)init {
+    id r = %orig;
+    if (r) {
+        __sync_fetch_and_add(&dyyyLynxBgLive, 1);
+        __sync_fetch_and_add(&dyyyLynxBgTotal, 1);
+    }
+    return r;
+}
+
+- (void)dealloc {
+    __sync_fetch_and_sub(&dyyyLynxBgLive, 1);
+    %orig;
+}
+
+%end
+%end
+
+// ---- 卡片字段命中统计：contentFilter 每喂一条记一次，每 40 条汇总 ----
+#define DYYY_CARD_FIELD_COUNT 18
+
+static volatile int32_t dyyyCardSamples = 0;
+static volatile int32_t dyyyCardHit[DYYY_CARD_FIELD_COUNT] = {0};
+
+static const char *kDYYYCardFieldNames[DYYY_CARD_FIELD_COUNT] = {
+    "ec商品卡", "ec卡标记", "d卡", "引导卡", "推荐引导卡", "同城卡", "同城schema",
+    "团购大卡", "POI商城卡", "POI店铺卡", "兜底卡", "休闲卡", "插入卡", "问答卡",
+    "推荐用户卡", "热榜卡(已拦)", "音乐卡(已拦)", "含任一卡"
+};
+
+void DYYYDiagCardProbe(AWEAwemeModel *model) {
+    if (!model || !DYYYDiagOn()) {
+        return;
+    }
+    int32_t n = __sync_add_and_fetch(&dyyyCardSamples, 1);
+    BOOL any = NO;
+
+    if (model.ecFeedGoodsCardModel) { __sync_fetch_and_add(&dyyyCardHit[0], 1); any = YES; }
+    if (model.hasEcomGoodsCard)     { __sync_fetch_and_add(&dyyyCardHit[1], 1); any = YES; }
+    if (model.dCardModel)           { __sync_fetch_and_add(&dyyyCardHit[2], 1); any = YES; }
+    if (model.guideTipCardModel)    { __sync_fetch_and_add(&dyyyCardHit[3], 1); any = YES; }
+    if (model.nicolCardModel)       { __sync_fetch_and_add(&dyyyCardHit[4], 1); any = YES; }
+    if (model.nearbyCardModel)      { __sync_fetch_and_add(&dyyyCardHit[5], 1); any = YES; }
+    if (model.nearbyLynxCardSchema) { __sync_fetch_and_add(&dyyyCardHit[6], 1); any = YES; }
+    if (model.grouponLargeCard)     { __sync_fetch_and_add(&dyyyCardHit[7], 1); any = YES; }
+    if (model.poiMallCard)          { __sync_fetch_and_add(&dyyyCardHit[8], 1); any = YES; }
+    if (model.poiShopCard)          { __sync_fetch_and_add(&dyyyCardHit[9], 1); any = YES; }
+    if (model.fallCardModel)        { __sync_fetch_and_add(&dyyyCardHit[10], 1); any = YES; }
+    if (model.hangoutCard)          { __sync_fetch_and_add(&dyyyCardHit[11], 1); any = YES; }
+    if (model.isInsertCard)         { __sync_fetch_and_add(&dyyyCardHit[12], 1); any = YES; }
+    if (model.isDeepQACard)         { __sync_fetch_and_add(&dyyyCardHit[13], 1); any = YES; }
+    if (model.isRecommendUserCard)  { __sync_fetch_and_add(&dyyyCardHit[14], 1); any = YES; }
+    if (model.hotSpotLynxCardModel) { __sync_fetch_and_add(&dyyyCardHit[15], 1); any = YES; }
+    if (model.musicCard)            { __sync_fetch_and_add(&dyyyCardHit[16], 1); any = YES; }
+    if (any)                        { __sync_fetch_and_add(&dyyyCardHit[17], 1); }
+
+    if ((n % 40) == 0) {
+        NSMutableString *s = [NSMutableString string];
+        for (int i = 0; i < DYYY_CARD_FIELD_COUNT; i++) {
+            if (dyyyCardHit[i] > 0) {
+                [s appendFormat:@"%s=%d ", kDYYYCardFieldNames[i], (int)dyyyCardHit[i]];
+            }
+        }
+        DYYYSpeedDiag(@"[card] 样本=%d 命中(仅列非零): %@", (int)n, s.length ? s : @"全零");
+    }
+}
+
+// ---- 定时采样（最多 20 发，约 10 分钟，之后彻底静默）----
+static void DYYYDiagScheduleTick(int round);
+
+static void DYYYDiagTick(int round) {
+    if (!DYYYDiagOn()) {
+        return;
+    }
+    unsigned long long fp = DYYYDiagPhysFootprint();
+    DYYYSpeedDiag(@"[mem] #%d footprint=%.1fMB lynxLive=%d lynxTotal=%d bgLive=%d bgTotal=%d 样本=%d",
+                  round, (double)fp / 1048576.0,
+                  (int)dyyyLynxViewLive, (int)dyyyLynxViewTotal,
+                  (int)dyyyLynxBgLive, (int)dyyyLynxBgTotal,
+                  (int)dyyyCardSamples);
+    // 图片缓存：首采必测，之后每 2 分钟测一次（属性表较长，别刷屏）
+    if (round == 1 || (round % 4) == 1) {
+        DYYYDiagDumpImageCache([NSString stringWithFormat:@"#%d", round]);
+    }
+}
+
+static void DYYYDiagScheduleTick(int round) {
+    if (round > 20) {
+        return;
+    }
+    int64_t delaySec = (round == 1) ? 10 : 30;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delaySec * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+                     DYYYDiagTick(round);
+                     DYYYDiagScheduleTick(round + 1);
+                   });
+}
+
 %ctor {
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
         @"DYYYKeepNowPlayingInBackground" : @YES,
@@ -15450,6 +15721,15 @@ static void findTargetViewInView(UIView *view) {
     }
 
     DYYYMigrateCombinedHDRModeIfNeeded();
+
+    // 【v80】内存诊断：只有类真的存在才挂（Logos 的 %init 不能对不存在的类调用）
+    if (objc_getClass("LynxView")) {
+        %init(DYYYLynxViewDiagGroup);
+    }
+    if (objc_getClass("LynxBackgroundRuntime")) {
+        %init(DYYYLynxBgDiagGroup);
+    }
+    DYYYDiagScheduleTick(1);
 
     Class interactionBaseLabelClass = objc_getClass("AWECommentSwiftBizUI.CommentInteractionBaseLabel");
     if (interactionBaseLabelClass) {
