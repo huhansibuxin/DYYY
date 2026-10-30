@@ -15473,10 +15473,15 @@ static NSString *DYYYDiagVMBuckets(void) {
     if (kr != KERN_SUCCESS) {
         return @"(task_info 失败)";
     }
-    return [NSString stringWithFormat:@"fp=%.1f internal=%.1f iokit=%.1f external=%.1f comp=%.1f altComp=%.1f",
-                                      DYYY_MB(info.phys_footprint), DYYY_MB(info.internal),
-                                      DYYY_MB(info.iokit_mapped), DYYY_MB(info.external),
-                                      DYYY_MB(info.compressed), DYYY_MB(info.alternate_accounting_compressed)];
+    // ⚠️ 只能用 TASK_VM_INFO_REV0 的字段：Theos 自带 SDK 的 task_vm_info 是老的，
+    //    iokit_mapped / alternate_accounting_compressed（REV3/REV4）编译期就不存在。
+    //    差值法代替：fp - internal - external - compressed ≈ iokit(IOSurface) + 其他
+    double fp = DYYY_MB(info.phys_footprint);
+    double in = DYYY_MB(info.internal);
+    double ex = DYYY_MB(info.external);
+    double cp = DYYY_MB(info.compressed);
+    return [NSString stringWithFormat:@"fp=%.1f internal=%.1f external=%.1f comp=%.1f 其余≈%.1f",
+                                      fp, in, ex, cp, fp - in - ex - cp];
 }
 
 // 【v82】malloc zone 逐个统计：internal 那几百 MB 到底在哪个 zone 里。
