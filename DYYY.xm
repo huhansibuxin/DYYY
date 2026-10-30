@@ -7,6 +7,7 @@
 //
 #import <QuartzCore/QuartzCore.h>
 #include <unistd.h>   // getpid()（v75：日志每行带 pid）
+#include <string.h>   // strlen/memcmp（v86：预加载方法名关键字匹配）
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
@@ -15703,10 +15704,19 @@ static void DYYYImgCacheApplyLimit(void) {
 //   ⇒ 不是用户点网页，是**提前把广告落地页渲染进程起好**，防白屏掉转化。
 //
 // 本机用途只是看视频、付款走极速版 ⇒ 这些 WebView 一律没用，直接掐死。
-// 做法：WKWebView 的所有 init 直接返回 nil（连进程都不给它起），
-//   再补一层 load* 拦截（万一有绕过 init 的实例，也绝不加载内容）。
-// 附带保险：DK 容器常见写法 `[view addSubview:webView]`，webView 为 nil 会抛
-//   NSInvalidArgumentException，所以给 UIView 的 addSubview/insertSubview 加 nil 兜底。
+//
+// ⚠️ v85 实测结论（2026-10-30，血的教训）：**init 返回 nil 的方案对抖音必崩**。
+//   日志证据：启动 3 秒内 addSubview:nil 刷了 12 条，而 [webview] 拦截#N 一条都没有
+//   —— 说明命中的是 DYYYNoWebViewSwizzleOwnInits（它静默 return nil，没打日志），
+//   抖音拿到 nil 后不但没判空，还把 nil 继续塞进视图层级/布局链路，随后 EXC 闪退。
+//   抖音的 AWE/BDWebView 容器代码假设 webView 一定非 nil，这条路走不通。
+//
+// v86 定的正解（iOS 社区/工程上的唯一稳法）：**不去拦 WKWebView 本身，改拦「谁在建它」**。
+//   ① WKWebView 的 init 一律放行（给它真对象，不崩），但所有 load*/evaluateJavaScript 置空
+//      ⇒ 进程即使起来也永远不渲染任何页面，没有内容内存。
+//   ② 把所有「预加载 / 预取」管理器的方法整体废掉（按 sel 名关键字 + 返回类型自动生成空实现）
+//      ⇒ 广告落地页、webview 池预热这些进程根本就不再被创建 —— 这才是真正省内存的源头。
+//   ③ 绝不再碰 UIView 的 addSubview（全局 hook 影响整个 App，风险与收益完全不成比例）。
 
 @interface WKWebView : UIView
 - (instancetype)initWithFrame:(CGRect)frame configuration:(id)configuration;
@@ -15756,41 +15766,200 @@ static void DYYYNoWebViewLog(NSString *what) {
     DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 拦截#%d %@ 调用方=%@", (int)n, what, caller]);
 }
 
-// 补齐 WKWebView 自己的其它 init（Apple 文档写明「想要默认配置可以直接用继承来的
-// init(frame:)」—— 说明 WKWebView 自己重写了 initWithFrame:，这条路也能起进程）。
-// ⚠️ 只能用 class_copyMethodList 取「WKWebView 自己的方法表」再逐个换 IMP：
-//   如果直接 %hook -initWithFrame: 而 WKWebView 并没有自己实现它，Logos 可能改到
-//   UIView 的那个 Method 上 —— 那会把全 App 所有 UIView 的 initWithFrame: 变成返回 nil，必崩。
-//   这里按自己的方法表对比名字，命中才换，碰不到父类。
-static void DYYYNoWebViewSwizzleOwnInits(void) {
-    Class cls = objc_getClass("WKWebView");
-    if (!cls) {
-        return;
+// ============ v86 核心：把「预加载器」整体废掉（真正的省内存源头） ============
+//
+// 为什么这样做而不是拦 init：
+//   WKWebView 的 init 一旦返回 nil，调用方（AWE 的容器、穿山甲的广告落地页 Loader）
+//   就会拿到 nil 继续往下跑，实测必崩。而「预加载器」这一层的语义本来就是
+//   **可失败的最佳努力**：拿不到预热好的 webview，业务会自动走「现场创建」兜底，
+//   不会崩。所以在这一层返回空，是既安全又真正省内存的位置。
+//
+// 实现：不硬编码每个方法签名（抖音版本一升就白干），改成
+//   按 sel 名关键字匹配 + 按 method_getTypeEncoding 的返回类型自动生成空实现。
+//   只碰名字里含 preload / prefetch 的方法，语义边界清楚，误伤面极小。
+
+// 大小写无关的子串查找（不用 strcasestr —— 该符号在 iOS SDK 上不保证可见）
+static BOOL DYYYNameHasKeyword(const char *name, const char *kw) {
+    if (!name || !kw || !*kw) {
+        return NO;
     }
-    unsigned int cnt = 0;
-    Method *list = class_copyMethodList(cls, &cnt);
-    if (!list) {
-        return;
+    size_t nl = strlen(name);
+    size_t kl = strlen(kw);
+    if (kl > nl) {
+        return NO;
     }
-    for (unsigned int i = 0; i < cnt; i++) {
-        const char *n = sel_getName(method_getName(list[i]));
-        if (strcmp(n, "initWithFrame:") == 0 || strcmp(n, "init") == 0) {
-            IMP imp = imp_implementationWithBlock(^id(id obj) {
+    for (size_t i = 0; i + kl <= nl; i++) {
+        size_t j = 0;
+        while (j < kl) {
+            char a = name[i + j];
+            char b = kw[j];
+            if (a >= 'A' && a <= 'Z') {
+                a = (char)(a - 'A' + 'a');
+            }
+            if (b >= 'A' && b <= 'Z') {
+                b = (char)(b - 'A' + 'a');
+            }
+            if (a != b) {
+                break;
+            }
+            j++;
+        }
+        if (j == kl) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+// 按返回类型生成空实现。
+// 注意：block 不能写成可变参数（^id(id self, ...) 是非法语法），
+//   统一只声明 (id self) —— arm64 上多出来的实参只落在没人读的寄存器里，安全。
+//   结构体返回（'{' 开头）走 stret 约定，宁可不碰直接跳过。
+static IMP DYYYEmptyIMPForReturnType(const char *encoding) {
+    if (!encoding || !encoding[0]) {
+        return NULL;
+    }
+    switch (encoding[0]) {
+        case '@':   // 对象
+        case '#':   // Class
+        case ':':   // SEL
+            return imp_implementationWithBlock(^id(id self) {
               return nil;
             });
+        case 'v':   // void
+            return imp_implementationWithBlock(^void(id self) {
+            });
+        case 'B':
+        case 'c':
+        case 'C':
+            return imp_implementationWithBlock(^BOOL(id self) {
+              return NO;
+            });
+        case 'q':
+        case 'Q':
+        case 'l':
+        case 'L':
+        case 'i':
+        case 'I':
+        case 's':
+        case 'S':
+            return imp_implementationWithBlock(^long(id self) {
+              return 0;
+            });
+        case 'd':
+            return imp_implementationWithBlock(^double(id self) {
+              return 0.0;
+            });
+        case 'f':
+            return imp_implementationWithBlock(^float(id self) {
+              return 0.0f;
+            });
+        default:
+            return NULL;
+    }
+}
+
+// 返回被废掉的方法个数
+static int DYYYNeuterPreloadMethodsInClass(Class cls) {
+    if (!cls) {
+        return 0;
+    }
+    int hit = 0;
+    unsigned int cnt = 0;
+    Method *list = class_copyMethodList(cls, &cnt);   // 只取自己的方法表，绝不碰父类
+    if (!list) {
+        return 0;
+    }
+    for (unsigned int i = 0; i < cnt; i++) {
+        const char *name = sel_getName(method_getName(list[i]));
+        if (!name) {
+            continue;
+        }
+        // 关键字：preload(ing) / prefetch
+        if (!DYYYNameHasKeyword(name, "preload") && !DYYYNameHasKeyword(name, "prefetch")) {
+            continue;
+        }
+        IMP imp = DYYYEmptyIMPForReturnType(method_getTypeEncoding(list[i]));
+        if (imp) {
             method_setImplementation(list[i], imp);
+            hit++;
         }
     }
     free(list);
+    return hit;
+}
+
+// 已知在建 WebView / 预热 WebView 的类（v85 溯源所得，逐个真实类名，不做前缀扫描防误伤）
+static const char *kDYYYWebViewPreloadClasses[] = {
+    // AWE 主容器侧
+    "AWEWebViewPreloadManager",
+    "AWEWebViewPreloadContainer",
+    "AWEWebViewPrefetchManager",
+    "AWEWebViewGurdPreloadManager",
+    "AWEWebViewPool",
+    // 广告落地页预加载（4 个 WebContent 的主要来源）
+    "AWEAdWebViewPreloadAdapter",
+    "CSJWebViewPoolManager",
+    // 通用 BDWebView
+    "BDWebViewPreloadManager",
+    "BDWebViewPreloadOperation",
+    "BDWebViewPreloadTask",
+    // 直播 / 小程序
+    "IESLiveWebViewPool",
+    "BDPWKGameWebviewPreloadManager",
+    "BDPStarkWebviewPreloadManager",
+};
+
+static volatile BOOL dyyyPreloadersDone = NO;
+
+static int DYYYNoWebViewKillPreloaders(void) {
+    int total = 0;
+    int clsHit = 0;
+    NSMutableString *missing = [NSMutableString string];
+    for (size_t i = 0; i < sizeof(kDYYYWebViewPreloadClasses) / sizeof(char *); i++) {
+        Class cls = objc_getClass(kDYYYWebViewPreloadClasses[i]);
+        if (!cls) {
+            if (missing.length < 300) {
+                [missing appendFormat:@"%s,", kDYYYWebViewPreloadClasses[i]];
+            }
+            continue;
+        }
+        int n = DYYYNeuterPreloadMethodsInClass(cls);
+        if (n > 0) {
+            clsHit++;
+            total += n;
+            DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 废掉预加载 %s 的 %d 个方法",
+                                                     kDYYYWebViewPreloadClasses[i], n]);
+        }
+    }
+    if (missing.length > 0) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 未找到的类：%@", missing]);
+    }
+    if (total > 0) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 预加载治理完成：%d 个类 / %d 个方法",
+                                                 clsHit, total]);
+    }
+    return total;
+}
+
+// ⚠️ 时序：%ctor 跑的时候 AwemeCore 的类不一定已经注册好（objc_getClass 会返回 nil），
+//   而预加载又发生在启动后几秒，所以分几档重试；一旦命中就停（幂等，重复设同一个 IMP 也无害）。
+static void DYYYNoWebViewKillPreloadersRetry(void) {
+    if (dyyyPreloadersDone) {
+        return;
+    }
+    if (DYYYNoWebViewKillPreloaders() > 0) {
+        dyyyPreloadersDone = YES;
+    }
 }
 
 %group DYYYNoWebViewGroup
 %hook WKWebView
 
+// ⚠️ 这里绝对不能 return nil（v85 实测必崩）。只记录「谁在建」，然后老老实实给真对象。
 - (instancetype)initWithFrame:(CGRect)frame configuration:(id)configuration {
     if (DYYYNoWebViewOn()) {
         DYYYNoWebViewLog(@"initWithFrame:configuration:");
-        return nil;
     }
     return %orig;
 }
@@ -15798,14 +15967,14 @@ static void DYYYNoWebViewSwizzleOwnInits(void) {
 - (instancetype)initWithCoder:(NSCoder *)coder {
     if (DYYYNoWebViewOn()) {
         DYYYNoWebViewLog(@"initWithCoder:");
-        return nil;
     }
     return %orig;
 }
 
-// 双保险：即使有实例漏网，也不让它加载任何内容
+// 放行创建，但一律不允许加载/执行任何内容：进程即使起来也永远是一张白纸，无页面内存。
 - (id)loadRequest:(id)request {
     if (DYYYNoWebViewOn()) {
+        DYYYNoWebViewLog(@"loadRequest:");
         return nil;
     }
     return %orig;
@@ -15813,6 +15982,7 @@ static void DYYYNoWebViewSwizzleOwnInits(void) {
 
 - (id)loadHTMLString:(NSString *)string baseURL:(NSURL *)baseURL {
     if (DYYYNoWebViewOn()) {
+        DYYYNoWebViewLog(@"loadHTMLString:baseURL:");
         return nil;
     }
     return %orig;
@@ -15820,6 +15990,7 @@ static void DYYYNoWebViewSwizzleOwnInits(void) {
 
 - (id)loadFileURL:(NSURL *)URL allowingReadAccessToURL:(NSURL *)readAccessURL {
     if (DYYYNoWebViewOn()) {
+        DYYYNoWebViewLog(@"loadFileURL:");
         return nil;
     }
     return %orig;
@@ -15830,29 +16001,23 @@ static void DYYYNoWebViewSwizzleOwnInits(void) {
     characterEncodingName:(NSString *)characterEncodingName
            baseURL:(NSURL *)baseURL {
     if (DYYYNoWebViewOn()) {
+        DYYYNoWebViewLog(@"loadData:");
         return nil;
     }
     return %orig;
 }
 
-%end
-%end
-
-// nil 兜底：容器把 nil 的 webView 塞进视图层级时不要抛异常
-%group DYYYNilSubviewGuardGroup
-%hook UIView
-
-- (void)addSubview:(UIView *)view {
-    if (!view) {
-        DYYYNoWebViewLog(@"addSubview:nil 已忽略");
-        return;
+- (id)evaluateJavaScript:(NSString *)javaScriptString completionHandler:(void (^)(id, NSError *))completionHandler {
+    if (DYYYNoWebViewOn()) {
+        return nil;
     }
-    %orig;
+    return %orig;
 }
 
-- (void)insertSubview:(UIView *)view atIndex:(NSInteger)index {
-    if (!view) {
-        DYYYNoWebViewLog(@"insertSubview:nil 已忽略");
+- (void)loadAlternateHTMLString:(NSString *)string
+                        baseURL:(NSURL *)baseURL
+               forUnreachableURL:(NSURL *)unreachableURL {
+    if (DYYYNoWebViewOn()) {
         return;
     }
     %orig;
@@ -15860,6 +16025,7 @@ static void DYYYNoWebViewSwizzleOwnInits(void) {
 
 %end
 %end
+
 
 %ctor {
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
@@ -15906,16 +16072,24 @@ static void DYYYNoWebViewSwizzleOwnInits(void) {
                        });
     }
 
-    // 【v85】彻底禁用 WebView：先把 WebKit 逼出来（抖音若还没用上它，类就不存在，
-    // 钩子会落空；这里是系统共享缓存，dlopen 代价极低），再挂钩子。
+    // 【v85/v86】WebView 治理：
+    //   v85 的「init 返回 nil」方案实测会让抖音闪退（容器不判空），v86 改为
+    //   **放行创建 + 禁掉一切加载 + 废掉全部预加载器**。这才是既安全又真正省内存的路子。
     if (DYYYNoWebViewOn()) {
         dlopen("/System/Library/Frameworks/WebKit.framework/WebKit", RTLD_NOW | RTLD_GLOBAL);
         Class wkCls = objc_getClass("WKWebView");
         if (wkCls) {
             %init(DYYYNoWebViewGroup);
-            %init(DYYYNilSubviewGuardGroup);
-            DYYYNoWebViewSwizzleOwnInits();   // 补 initWithFrame: / init 两条路
-            DYYYSpeedDiag(@"[webview] 已挂 WKWebView 禁用钩子");
+            DYYYNoWebViewKillPreloadersRetry();
+            // 预加载类多在 AwemeCore 里、注册时间晚于 %ctor ⇒ 分档重试（命中即停）
+            for (NSNumber *delay in @[ @0.5, @2.0, @5.0, @10.0, @20.0 ]) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                             (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                                 DYYYNoWebViewKillPreloadersRetry();
+                               });
+            }
+            DYYYSpeedDiag(@"[webview] 已挂 v86 WebView 治理钩子（放行创建/禁加载/废预加载）");
         } else {
             DYYYSpeedDiag(@"[webview] WKWebView 类不存在，跳过");
         }
