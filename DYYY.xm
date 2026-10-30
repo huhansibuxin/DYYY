@@ -16048,6 +16048,66 @@ static void DYYYAdoptSharedPool(id configuration) {
     }
 }
 
+// ============ v97：从「建了再杀」改成「让进程根本起不来」 ============
+//
+// v96 实机（p36268）两条硬结论：
+//   ① `_close` + kill 这一刀是对的：回收#1~#5 在 4s / 18s / 38s 复查全是 `(已退出)`，
+//      v95 那个「4s 就 relaunch 回来」的 36219 再也没出现。回收侧到此收工。
+//   ② 但窗口外的 #7 / #9 还是老老实实起了 36280 / 36281 —— 说明**回收根本不解决创建**，
+//      老板这句话是对的：「不建立空壳的方法就是拦截它建立空壳」。
+//
+// 那 WebContent 是谁拉起来的？把 v96 日志里 9 次拦截的调用方摊开看：
+//   全部是同一个地址 `AwemeCore+270650372`，每次后面紧跟一条
+//   `loadRequest:`（调用方 `kIronManSchemaHost+23025152`）。
+//   而我们 loadRequest 早就返回 nil 了、`_warmInitialProcess` 也空转了，
+//   进程照样在 init 之后 2 秒内起来 ⇒ **进程是 initWithFrame:configuration: 自己拉起来的**
+//   （WebPageProxy 构造 → WebProcessPool::processForRegistrableDomain → fork WebContent）。
+//
+// 真能拦这一层的只有一个私有 SEL（v95 日志里已经把它列出来了）：
+//   `-[WKProcessPool _makeNextWebProcessLaunchFailForTesting]`
+//   它把池上的 `shouldMakeNextWebProcessLaunchFailForTesting` 置 true，
+//   WebKit 在下一次真正 fork 进程时**直接返回失败**，不 fork、不建进程。
+//   ⇒ 每次建 webview 前先设一次，进程就压根不会出现，不是「起来再杀」。
+//
+// 安全边界：它只影响「下一次启动」这一个 bool，不碰任何对象引用、不碰 page、不碰池生命周期；
+//   万一某个系统版本没有这个 SEL，就自动退回 v96 的 close+kill 兜底（这条永远保留）。
+static volatile int32_t dyyyLaunchFailCount = 0;
+static volatile BOOL dyyyNoLaunchFailSel = NO;
+
+// cfg 为 nil 时用已经拿到的池（loadRequest 等没有 config 的场合走这里）。
+static void DYYYFailNextProcessLaunch(id configuration) {
+    if (!DYYYNoWebViewOn()) {
+        return;
+    }
+    id pool = nil;
+    if (configuration) {
+        SEL sPool = sel_registerName("processPool");
+        if ([configuration respondsToSelector:sPool]) {
+            pool = ((id(*)(id, SEL))objc_msgSend)(configuration, sPool);
+        }
+    }
+    if (!pool) {
+        pool = dyyyAnyPool ?: dyyySharedPoolRef;
+    }
+    if (!pool) {
+        return;
+    }
+    SEL s = sel_registerName("_makeNextWebProcessLaunchFailForTesting");
+    if (![pool respondsToSelector:s]) {
+        if (!dyyyNoLaunchFailSel) {
+            dyyyNoLaunchFailSel = YES;
+            DYYYSpeedDiag(@"[webview] 本系统没有 _makeNextWebProcessLaunchFailForTesting，只能靠 close+kill 兜底");
+        }
+        return;
+    }
+    ((void (*)(id, SEL))objc_msgSend)(pool, s);
+    int32_t n = __sync_add_and_fetch(&dyyyLaunchFailCount, 1);
+    if (n <= 10) {
+        DYYYSpeedDiag([NSString stringWithFormat:
+            @"[webview] 第 %d 次设「下一次进程启动失败」（拦创建）", (int)n]);
+    }
+}
+
 // ============ v91：把池归并提前到「configuration 创建那一刻」 ============
 //
 // v90 实机（2026-10-30 17:49，p35898）结论：
@@ -16626,11 +16686,11 @@ static void DYYYKillWebContentOnce(id wv) {
     }
     int pidBefore = DYYYWebViewPID(wv);
     if (pidBefore <= 0) {
-        // 这个 webview 压根没把 WebContent 拉起来（正是我们想要的结果）。
+        // 这个 webview 压根没把 WebContent 拉起来 —— v97 毒丸生效的正面读数。
         // 不打「已回收」标记，万一它后面真起了进程还能补一刀。
         static volatile int32_t noPidLog = 0;
         if (__sync_add_and_fetch(&noPidLog, 1) <= 8) {
-            DYYYSpeedDiag(@"[webview] 本实例没有 WebContent 进程（未起进程，无需回收）");
+            DYYYSpeedDiag(@"[webview] 本实例没有 WebContent 进程（毒丸生效，压根没 fork）");
         }
         return;
     }
@@ -17054,6 +17114,9 @@ static void DYYYClampPoolCapacities(void) {
     //   （v87 是改池 init 返回值 → ARC 释放半初始化对象 → 必崩；这次只改 config 的引用，不碰池生命周期）
     if (DYYYNoWebViewOn() && configuration) {
         DYYYAdoptSharedPool(configuration);
+        // 【v97】%orig 之前先放这个「毒丸」：init 内部要 fork WebContent 时直接失败。
+        //   放在 %orig 之后没用 —— 进程是 init 期间就起来的。
+        DYYYFailNextProcessLaunch(configuration);
         DYYYDumpPageConfiguration(configuration);   // 【v94】摊开真身那一层
         if (!dyyyAnyPool && dyyySharedPoolRef) {
             dyyyAnyPool = dyyySharedPoolRef;
@@ -17114,6 +17177,9 @@ static void DYYYClampPoolCapacities(void) {
 - (id)loadRequest:(id)request {
     if (DYYYNoWebViewOn()) {
         DYYYNoWebViewLog(@"loadRequest:");
+        // 【v97】再放一次毒丸：init 时那颗可能已被别的池消耗掉，
+        //   真正把进程拉起来的动作恰好是这次 load → 在它之前补一颗。
+        DYYYFailNextProcessLaunch(nil);
         return nil;
     }
     return %orig;
@@ -17263,7 +17329,7 @@ static void DYYYClampPoolCapacities(void) {
                                  DYYYClampPoolCapacities();   // 【v95】池类可能是之后才注册的
                                });
             }
-            DYYYSpeedDiag(@"[webview] 已挂 v96 WebView 治理钩子（禁加载/废预加载/禁预热/禁缓存/吞死通知/只回收启动批/池容量钳到1/回收前先 _close 断 relaunch）");
+            DYYYSpeedDiag(@"[webview] 已挂 v97 WebView 治理钩子（毒丸拦创建+禁加载+废预加载+禁预热+禁缓存+吞死通知+_close断relaunch+池容量1）");
         } else {
             DYYYSpeedDiag(@"[webview] WKWebView 类不存在，跳过");
         }
