@@ -15534,12 +15534,12 @@ static BOOL DYYYDiagCallULL(id obj, NSString *selName, unsigned long long *out) 
 static void DYYYDiagDumpImageCache(NSString *tag) {
     Class cacheCls = NSClassFromString(@"BDImageCache");
     if (!cacheCls) {
-        DYYYSpeedDiag(@"[imgcache] %@ BDImageCache 类不存在", tag);
+        DYYYSpeedDiag([NSString stringWithFormat:@"[imgcache] %@ BDImageCache 类不存在", tag]);
         return;
     }
     id cache = DYYYDiagCallObj(cacheCls, @"sharedImageCache");
     if (!cache) {
-        DYYYSpeedDiag(@"[imgcache] %@ sharedImageCache 返回 nil（可能不是单例模式）", tag);
+        DYYYSpeedDiag([NSString stringWithFormat:@"[imgcache] %@ sharedImageCache 返回 nil（可能不是单例模式）", tag]);
         return;
     }
     // 统计口径未知，把常见方法名全试一遍，命中的才打（未命中说明这一版 SDK 用了别的名字）
@@ -15554,12 +15554,13 @@ static void DYYYDiagDumpImageCache(NSString *tag) {
             [stat appendFormat:@"%@=%llu ", s, v];
         }
     }
-    DYYYSpeedDiag(@"[imgcache] %@ 单例统计 %@", tag, stat.length ? stat : @"(未命中任何统计方法)");
+    DYYYSpeedDiag([NSString stringWithFormat:@"[imgcache] %@ 单例统计 %@", tag,
+                   stat.length ? stat : @"(未命中任何统计方法)"]);
 
     id cfg = DYYYDiagCallObj(cache, @"config");
-    DYYYSpeedDiag(@"[imgcache] %@ config(%@) %@", tag,
-                  cfg ? NSStringFromClass([cfg class]) : @"nil",
-                  DYYYDiagPropsOf(cfg, 1200));
+    DYYYSpeedDiag([NSString stringWithFormat:@"[imgcache] %@ config(%@) %@", tag,
+                   cfg ? NSStringFromClass([cfg class]) : @"nil",
+                   DYYYDiagPropsOf(cfg, 1200)]);
 }
 
 // ---- Lynx 实例计数：只加/减，不做任何干预 ----
@@ -15669,7 +15670,7 @@ void DYYYDiagCardProbe(AWEAwemeModel *model) {
                 [s appendFormat:@"%s=%d ", kDYYYCardFieldNames[i], (int)dyyyCardHit[i]];
             }
         }
-        DYYYSpeedDiag(@"[card] 样本=%d 命中(仅列非零): %@", (int)n, s.length ? s : @"全零");
+        DYYYSpeedDiag([NSString stringWithFormat:@"[card] 样本=%d 命中(仅列非零): %@", (int)n, s.length ? s : @"全零"]);
     }
 }
 
@@ -15681,11 +15682,11 @@ static void DYYYDiagTick(int round) {
         return;
     }
     unsigned long long fp = DYYYDiagPhysFootprint();
-    DYYYSpeedDiag(@"[mem] #%d footprint=%.1fMB lynxLive=%d lynxTotal=%d bgLive=%d bgTotal=%d 样本=%d",
-                  round, (double)fp / 1048576.0,
-                  (int)dyyyLynxViewLive, (int)dyyyLynxViewTotal,
-                  (int)dyyyLynxBgLive, (int)dyyyLynxBgTotal,
-                  (int)dyyyCardSamples);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[mem] #%d footprint=%.1fMB lynxLive=%d lynxTotal=%d bgLive=%d bgTotal=%d 样本=%d",
+                   round, (double)fp / 1048576.0,
+                   (int)dyyyLynxViewLive, (int)dyyyLynxViewTotal,
+                   (int)dyyyLynxBgLive, (int)dyyyLynxBgTotal,
+                   (int)dyyyCardSamples]);
     // 图片缓存：首采必测，之后每 2 分钟测一次（属性表较长，别刷屏）
     if (round == 1 || (round % 4) == 1) {
         DYYYDiagDumpImageCache([NSString stringWithFormat:@"#%d", round]);
