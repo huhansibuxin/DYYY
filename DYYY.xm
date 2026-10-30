@@ -16032,6 +16032,70 @@ static void DYYYAdoptSharedPool(id configuration) {
     }
 }
 
+// ============ v91：把池归并提前到「configuration 创建那一刻」 ============
+//
+// v90 实机（2026-10-30 17:49，p35898）结论：
+//   · 归并确实生效：`池归并#1` / `池归并#2` 都打出来了
+//   · 稳态已经是 1 个进程：启动后 30s / 90s 都是 `WebProcess=1 页面=1 缓存=0 预热pid=0`
+//   · 但启动头 10 秒还有 3 个：`进程数(创建后3s)：WebProcess=3`
+//
+// 为什么头几秒还有：v90 的归并发生在 `WKWebView initWithFrame:configuration:` 里，
+//   那时**前几个 webview 已经绑在各自的旧池上并把进程实体化了**；归并只影响「之后」
+//   新建的 webview，已经实体化的旧池进程要等那些 webview 自己释放才退。
+//
+// v91：把同一个动作提前到 `-[WKWebViewConfiguration init]` 之后 —— config 一创建就
+//   指向共享池，于是从**第一个** webview 起就只有一份池，启动峰值也是 1 个进程。
+//
+// ⚠️ 两个必须守住的点：
+//   ① 不能改 init 的返回值（v87 的死因：ARC 会释放 alloc 出来的半初始化对象，dealloc 崩）。
+//      这里 %orig 之后原样返回，只在对象已完整初始化后改它内部的池引用。
+//   ② 不能用 %hook -init 裸挂：若该类没自己实现 init，Logos 会把钩子挂到 NSObject 上，
+//      全 App 所有对象的 init 都受影响。所以先翻自身方法表确认有 init 才装。
+
+static IMP dyyyOrigCfgInit = NULL;
+static volatile BOOL dyyyCfgHookTried = NO;
+
+static id DYYYCfgInitHook(id self, SEL _cmd) {
+    id r = ((id(*)(id, SEL))dyyyOrigCfgInit)(self, _cmd);
+    if (r && DYYYNoWebViewOn()) {
+        DYYYAdoptSharedPool(r);
+    }
+    return r;
+}
+
+static void DYYYInstallConfigInitHook(void) {
+    if (dyyyCfgHookTried) {
+        return;
+    }
+    dyyyCfgHookTried = YES;
+    Class cls = objc_getClass("WKWebViewConfiguration");
+    if (!cls) {
+        DYYYSpeedDiag(@"[webview] WKWebViewConfiguration 类不存在，config 归并跳过");
+        return;
+    }
+    unsigned int cnt = 0;
+    Method *list = class_copyMethodList(cls, &cnt);
+    if (!list) {
+        return;
+    }
+    Method target = NULL;
+    for (unsigned int i = 0; i < cnt; i++) {
+        const char *n = sel_getName(method_getName(list[i]));
+        if (n && strcmp(n, "init") == 0) {
+            target = list[i];
+            break;
+        }
+    }
+    free(list);
+    if (!target) {
+        // 没自己实现 init ⇒ 绝不挂，否则等于 hook 了 NSObject 的 init
+        DYYYSpeedDiag(@"[webview] WKWebViewConfiguration 未自己实现 init，config 归并跳过");
+        return;
+    }
+    dyyyOrigCfgInit = method_setImplementation(target, (IMP)DYYYCfgInitHook);
+    DYYYSpeedDiag(@"[webview] 已在 WKWebViewConfiguration init 处归并池（启动峰值也应为 1）");
+}
+
 // 装 v89 的两把刀：禁预热 + 缓存容量 0。用一个标志保证只装一次，
 // 之后每次新建 pool 只顺手清一次缓存（method_setImplementation 反复设会不断生成 block）。
 static volatile BOOL dyyyPoolTuned = NO;
@@ -16446,11 +16510,14 @@ static void DYYYNoWebViewKillPreloadersRetry(void) {
             if (objc_getClass("WKProcessPool")) {
                 DYYYWebViewPoolTune();
             }
+            // 【v91】把归并提前到 config 创建时：从第一个 webview 起就只有一份池，
+            //   启动峰值也应该是 1 个进程（v90 只能做到稳态 1 个）
+            DYYYInstallConfigInitHook();
             DYYYNoWebViewKillPreloadersRetry();
             DYYYDumpProcessPoolSELs();
-            // 【v89】定时打真实进程数：5s / 30s / 90s 各一次，日志里直接看
-            //   WebProcess 数量，不用再靠 CocoaTop 数进程。
-            for (NSNumber *dt in @[ @5.0, @30.0, @90.0 ]) {
+            // 【v89】定时打真实进程数：日志里直接看 WebProcess 数量，
+            //   不用再靠 CocoaTop 数进程。v91 加了 3s/10s，专门盯启动峰值。
+            for (NSNumber *dt in @[ @3.0, @10.0, @30.0, @90.0 ]) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                              (int64_t)(dt.doubleValue * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), ^{
@@ -16466,7 +16533,7 @@ static void DYYYNoWebViewKillPreloadersRetry(void) {
                                  DYYYNoWebViewKillPreloadersRetry();
                                });
             }
-            DYYYSpeedDiag(@"[webview] 已挂 v90 WebView 治理钩子（放行创建/禁加载/废预加载/禁预热/禁缓存/池归并）");
+            DYYYSpeedDiag(@"[webview] 已挂 v91 WebView 治理钩子（放行创建/禁加载/废预加载/禁预热/禁缓存/config级池归并）");
         } else {
             DYYYSpeedDiag(@"[webview] WKWebView 类不存在，跳过");
         }
