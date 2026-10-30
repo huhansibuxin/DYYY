@@ -79,7 +79,15 @@ static NSString *DYYYFSDiagDirectory(void) {
     static NSString *dir = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DYYY"];
+        // 【v98】从 tmp 改到 Library —— tmp/DYYY 整个目录被系统清掉过，
+        // 直接后果是「一条日志都没有」被误判成「插件没加载」（老板当时纠正过）。
+        // Library 不会被系统清、也不会被 iCloud 备份（Documents 会）。
+        NSString *lib = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES)
+            firstObject];
+        if (lib.length == 0) {
+            lib = NSTemporaryDirectory();   // 极端兜底，正常走不到
+        }
+        dir = [lib stringByAppendingPathComponent:@"DYYY"];
         [[NSFileManager defaultManager] createDirectoryAtPath:dir
                                   withIntermediateDirectories:YES
                                                    attributes:nil
@@ -105,6 +113,7 @@ static void DYYYFSDiagImpl(NSString *msg) {
             }
             @try {
                 NSString *path = [DYYYFSDiagDirectory() stringByAppendingPathComponent:@"speed_diag.log"];
+                DYYYDiagRotateIfNeeded(path);   // 【v98】与 DYYYSpeedDiag 共用同一份 2MB 轮转
                 NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
                 if (fh) {
                     [fh seekToEndOfFile];

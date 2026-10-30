@@ -19,7 +19,8 @@
 //   说明"只读 defaults"这一层门控不够铁。现在门控收敛成唯一入口 DYYYDiagOn()，三层：
 //     ① 进程内 volatile 硬开关：设置页切换那一刻立刻置位，零 I/O、零缓存、零延迟；
 //     ② defaults（DYYYDiagLog）：保留，外部改库/跨版本也认；
-//     ③ 跨进程标记文件 tmp/DYYY/diag.state：别的进程/子进程也能立刻看到（0.3s 缓存）。
+//     ③ 跨进程标记文件 Library/DYYY/diag.state（v87 起从 tmp 迁到 Library，
+//        因为 tmp/DYYY 被系统清理过）：别的进程/子进程也能立刻看到（0.3s 缓存）。
 //   三者任一为"关"即不写。定义在 DYYY.xm（Logos 编成 .mm，故必须 extern "C"）。
 #ifdef __cplusplus
 extern "C" {
@@ -27,6 +28,7 @@ extern "C" {
 BOOL DYYYDiagOn(void);                     // 当前是否允许写日志（唯一真相）
 void DYYYDiagSetEnabled(BOOL on);          // 设置页切换开关时调用：立即生效 + 落跨进程标记
 void DYYYDiagMarkSwitchChange(BOOL on);    // 切换前落一条取证行（能精确标记"关"的时刻）
+void DYYYDiagRotateIfNeeded(NSString *path); // 【v98】写盘前判大小，超 2MB 滚成 .1.log
 #ifdef __cplusplus
 }
 #endif

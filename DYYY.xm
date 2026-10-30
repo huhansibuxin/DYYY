@@ -17,6 +17,7 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <substrate.h>
+#include <sys/stat.h>   // stat()（v98：日志轮转判大小）
 #import <syslog.h>
 
 #import "AwemeHeaders.h"
@@ -669,6 +670,39 @@ extern "C" void DYYYDiagMarkSwitchChange(BOOL on) {
 }
 
 static void DYYYSpeedDiagImpl(NSString *msg);
+
+// ============================================================================
+// 【v98】日志轮转：单文件封顶 2MB，超了把旧的滚成 speed_diag.1.log（只保留一份旧档）。
+//   为什么现在才加：实测增速约 17KB/小时，一天 ~400KB，正常用半年才到 2MB；
+//   但抖音在多 webview / 全屏反排等场景会短时爆发，长期挂着也必须有个上界。
+//   为什么这样做：
+//     · 不启定时器、不轮询（本项目铁律：event-driven，不做 heartbeat 写盘）；
+//       只在真正要写盘那一刻、每 32 行判一次 stat —— 代价可忽略。
+//     · 用 stat 而不是 NSFileManager 属性：少一次对象创建，热路径上更省。
+//     · 轮转必须是「先删旧档再 rename」，否则 rename 会因目标存在失败，
+//       结果是文件无限长大（这类坑在别的项目上踩过）。
+//   ⚠️ 轮转本身也在门控之内：关掉日志开关后连这个函数都不会被调到。
+// ============================================================================
+extern "C" void DYYYDiagRotateIfNeeded(NSString *path) {
+    @try {
+        static volatile int32_t tick = 0;
+        if ((__sync_add_and_fetch(&tick, 1) & 31) != 1) {
+            return;   // 每 32 行才真判一次
+        }
+        struct stat st;
+        if (stat([path fileSystemRepresentation], &st) != 0) {
+            return;    // 文件还不存在，没什么可轮转的
+        }
+        if (st.st_size < (2 * 1024 * 1024)) {
+            return;
+        }
+        NSString *old = [[path stringByDeletingPathExtension] stringByAppendingPathExtension:@"1.log"];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        [fm removeItemAtPath:old error:nil];
+        [fm moveItemAtPath:path toPath:old error:nil];
+    } @catch (__unused NSException *e) {}
+}
+
 #define DYYYSpeedDiag(...) do { if (DYYYDiagOn()) DYYYSpeedDiagImpl(__VA_ARGS__); } while (0)
 static void DYYYSpeedDiagImpl(NSString *msg) {
     // 开关判断已由上面的 DYYYSpeedDiag 宏完成（调用点连同参数拼接一起被短路，
@@ -693,6 +727,7 @@ static void DYYYSpeedDiagImpl(NSString *msg) {
             }
             @try {
                 NSString *path = [DYYYSpeedDiagDirectory() stringByAppendingPathComponent:@"speed_diag.log"];
+                DYYYDiagRotateIfNeeded(path);   // 【v98】超 2MB 滚成 .1.log，防止无上界增长
                 NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
                 if (fh) {
                     [fh seekToEndOfFile];
@@ -15898,40 +15933,11 @@ static BOOL DYYYNeuterOwnMethod(Class cls, const char *selName, const char **hit
 static __weak id dyyyAnyPool = nil;
 static volatile int32_t dyyyPoolSeen = 0;
 
-// 用私有 SEL 直接读 WebKit 的进程计数 —— 注意这**只是单个池**的数字。
-// 【v93】删掉 v92 那个 sysctl(KERN_PROC_ALL) 的「全系统 WebContent 数」：
-//   实机返回 -1，App 沙盒根本不允许遍历系统进程表，那行诊断永远是废数。
-//   现在改成读「每个 WKWebView 自己的 WebContent pid」——这才是能对得上 CocoaTop 的证据。
-static void DYYYDumpWebProcessCount(NSString *tag) {
-    id pool = dyyyAnyPool;
-    if (!pool) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 进程数(%@)：还没有 pool 实例", tag]);
-        return;
-    }
-    NSUInteger total = 0;
-    NSUInteger pages = 0;
-    NSUInteger cache = 0;
-    int32_t prewarmed = 0;
-    SEL sTotal = sel_registerName("_webProcessCount");
-    SEL sPages = sel_registerName("_webPageContentProcessCount");
-    SEL sCache = sel_registerName("_processCacheSize");
-    SEL sPre = sel_registerName("_prewarmedProcessIdentifier");
-    if ([pool respondsToSelector:sTotal]) {
-        total = ((NSUInteger(*)(id, SEL))objc_msgSend)(pool, sTotal);
-    }
-    if ([pool respondsToSelector:sPages]) {
-        pages = ((NSUInteger(*)(id, SEL))objc_msgSend)(pool, sPages);
-    }
-    if ([pool respondsToSelector:sCache]) {
-        cache = ((NSUInteger(*)(id, SEL))objc_msgSend)(pool, sCache);
-    }
-    if ([pool respondsToSelector:sPre]) {
-        prewarmed = ((int32_t(*)(id, SEL))objc_msgSend)(pool, sPre);
-    }
-    DYYYSpeedDiag([NSString stringWithFormat:
-        @"[webview] 进程数(%@)：本池 WebProcess=%lu 页面=%lu 缓存=%lu 预热pid=%d",
-        tag, (unsigned long)total, (unsigned long)pages, (unsigned long)cache, (int)prewarmed]);
-}
+// 【v98】删掉 v89 起的「进程数(启动后 Ns)：本池 WebProcess=0 页面=0 缓存=0」诊断。
+//   为什么删：_webProcessCount 只数「我们抓到的那个池」，抖音实际有 4~5 个独立池 ⇒
+//   日志写 0/1 而 CocoaTop 摆 5 个，老板已经被这个假读数骗过一次。
+//   现在验收只看 `launchctl list | grep -i webkit`（WebContent / Networking 是否为 0），
+//   比池自报数靠谱得多；毒丸生效后这个读数恒为 0，留着纯噪音。
 
 // ============ v90 核心：把 5~6 个 WKProcessPool 合成 1 个（安全做法） ============
 //
@@ -17043,6 +17049,8 @@ static Method DYYYOwnMethod(Class cls, const char *name) {
     return hit;
 }
 
+static volatile int32_t dyyyClampLogged = 0;
+
 static void DYYYClampOneCapacity(Class cls, const char *getter, const char *setter) {
     int done = 0;
     Method g = DYYYOwnMethod(cls, getter);
@@ -17071,8 +17079,15 @@ static void DYYYClampOneCapacity(Class cls, const char *getter, const char *sett
         }
     }
     if (done) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 已钳 %s 的 %s = 1",
-                                                 class_getName(cls), getter]);
+        // 【v98】每个池类只报一次。这函数会被 ctor + 5 档重试共调 ~24 次，
+        //   原来每次都打 3 行「已钳 …」= 72 行纯噪音（占整份日志 4.5%）。
+        //   毒丸（_makeNextWebProcessLaunchFailForTesting）接管后，钳容量本来就只是兜底，
+        //   一条汇总足够，重复装同一实现是幂等的，没有每次都记的必要。
+        int32_t n = __sync_add_and_fetch(&dyyyClampLogged, 1);
+        if (n <= 3) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 已钳 %s 的 %s = 1",
+                                                     class_getName(cls), getter]);
+        }
     }
 }
 
@@ -17310,16 +17325,8 @@ static void DYYYClampPoolCapacities(void) {
             // 【v95】真正的「不创建」：把抖音自己的 WebView 池容量钳成 1。
             //   池类注册晚于 %ctor，所以和预加载一样分档重试（幂等，重复装无害）。
             DYYYClampPoolCapacities();
-            // 【v89】定时打真实进程数：日志里直接看 WebProcess 数量，
-            //   不用再靠 CocoaTop 数进程。v91 加了 3s/10s，专门盯启动峰值。
-            for (NSNumber *dt in @[ @3.0, @10.0, @30.0, @90.0 ]) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                             (int64_t)(dt.doubleValue * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                                 DYYYDumpWebProcessCount(
-                                     [NSString stringWithFormat:@"启动后%.0fs", dt.doubleValue]);
-                               });
-            }
+            // 【v98】删掉 v89 的「启动后 3s/10s/30s/90s 打进程数」——
+            //   那是单池读数（恒为 0），不是全局数，留着只会误判。验收改用 launchctl。
             // 预加载类多在 AwemeCore 里、注册时间晚于 %ctor ⇒ 分档重试（命中即停）
             for (NSNumber *delay in @[ @0.5, @2.0, @5.0, @10.0, @20.0 ]) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
@@ -17329,7 +17336,7 @@ static void DYYYClampPoolCapacities(void) {
                                  DYYYClampPoolCapacities();   // 【v95】池类可能是之后才注册的
                                });
             }
-            DYYYSpeedDiag(@"[webview] 已挂 v97 WebView 治理钩子（毒丸拦创建+禁加载+废预加载+禁预热+禁缓存+吞死通知+_close断relaunch+池容量1）");
+            DYYYSpeedDiag(@"[webview] 已挂 v98 WebView 治理钩子（毒丸拦创建+禁加载+废预加载+禁预热+禁缓存+吞死通知+_close断relaunch+池容量1；已清噪音）");
         } else {
             DYYYSpeedDiag(@"[webview] WKWebView 类不存在，跳过");
         }
