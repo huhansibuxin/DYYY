@@ -8,6 +8,7 @@
 #import <QuartzCore/QuartzCore.h>
 #include <unistd.h>   // getpid()（v75：日志每行带 pid）
 #include <string.h>   // strlen/memcmp（v86：预加载方法名关键字匹配）
+#include <execinfo.h> // backtrace()（v94：创建点反查，替代被 dispatch 截断的 callStackReturnAddresses）
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
@@ -16529,11 +16530,35 @@ static char kDYYYKilledKey;
 static volatile int32_t dyyyKillCount = 0;
 static volatile BOOL dyyyKillNoSel = NO;
 
-// 对本实例回收一次 WebContent 进程。
-// 每实例只做一次（关联对象打标），全局上限 12 次 —— 万一抖音还是重建，
-// 也不会变成「建→杀→建」的死循环，日志里能直接看出来。
+// 【v94】只回收「启动批」，绝不再跟着抖音的补货定时器跑。
+//
+// v93 实机（p36069）时间线：
+//   10:13:09  拦截#1~#5（启动批 5 个）
+//   10:13:11~16  回收#1~#5         ⇒ 老板看到的「开头建四五个，后面只剩一个」
+//   10:13:26 / 40 / 54 / 14:08  拦截#8~#11，每次间隔正好 14 秒
+//   每次建成 2s 就回收            ⇒ 老板看到的「15 秒循环，杀一个建一个」
+// 结论：**kill 就是循环的诱因** —— 抖音的 WebView 池在维持固定容量，
+//   我们杀掉一个它就补一个，这不是「它在重建」，是「它在补货」。
+//   ⇒ 只有启动那批（12 秒窗口内）值得杀，之后建的一律放行：
+//     池自然填满后补货定时器自己就停了，稳态就是 1 个空壳（~20MB）。
+static volatile NSTimeInterval dyyyFirstWebViewTime = 0;
+static volatile int32_t dyyyKillSkipped = 0;
+
 static void DYYYKillWebContentOnce(id wv) {
     if (!DYYYNoWebViewOn() || !wv) {
+        return;
+    }
+    // 启动批窗口：以「第一个 WKWebView 创建时刻」为基准，只处理 12 秒内的。
+    NSTimeInterval t0 = dyyyFirstWebViewTime;
+    if (t0 > 0 && CFAbsoluteTimeGetCurrent() - t0 > 12.0) {
+        static volatile int32_t skipLog = 0;
+        if (__sync_add_and_fetch(&skipLog, 1) <= 3) {
+            DYYYSpeedDiag(@"[webview] 已过启动批窗口，后续新建的一律不再回收"
+                          @"（否则会跟池补货打成 15 秒循环）");
+        }
+        if (__sync_add_and_fetch(&dyyyKillSkipped, 1) == 1) {
+            DYYYSpeedDiag(@"[webview] 回收策略切换：保留 1 个空壳，换取不再循环");
+        }
         return;
     }
     if (objc_getAssociatedObject(wv, &kDYYYKilledKey)) {
@@ -16602,34 +16627,59 @@ static void DYYYKillWebContentOnce(id wv) {
     }
 }
 
-// 【v93】地址反查真实方法名 —— 为「让抖音别调 WebKit」找出真正的调用点。
+// 【v93/v94】地址反查真实方法名 —— 为「让抖音别调 WebKit」找出真正的调用点。
 // 背景：AwemeCore 是 698MB 的大家伙且符号被剥，callStackSymbols 里给的是伪符号
 //   （`AELogSystem::SetLogFileFuncCaller + 369208` 这种明显挂到了无关的导出符号上）。
-// 做法：把当前栈里的返回地址全收进来，遍历所有已注册类（含元类，覆盖类方法）的方法表，
-//   谁的 IMP 落在「候选地址 - 8KB ~ 候选地址」区间内，谁就是真正的调用者。
-// 只跑一次、放后台线程，慢几秒无所谓，换来的是**能直接点杀的类名 + 方法名**。
+//
+// ⭐ v93 为什么反查失败（这是关键教训）：取栈动作是在 `dispatch_async` 的 block 里做的，
+//   那时线程已经是 libdispatch 的队列线程，`callStackReturnAddresses` 拿到的
+//   自然是 dispatch 自己的栈 —— 所以结果全是 `OS_object retain (+2828)` 这类。
+//   ⇒ 取栈**必须在 init hook 的调用线程上同步做**，解析（遍历几万个类）才放后台。
 static volatile BOOL dyyyResolvedCaller = NO;
+static uintptr_t dyyyCreateFrames[16];
+static int dyyyCreateFrameCount = 0;
 
+// 同步捕获：只在创建线程上跑，开销微秒级。
+static void DYYYCaptureCreateStack(void) {
+    if (dyyyCreateFrameCount > 0) {
+        return;
+    }
+    void *frames[48];
+    int fn = backtrace(frames, 48);
+    NSMutableString *imgLog = [NSMutableString string];
+    for (int i = 0; i < fn && dyyyCreateFrameCount < 16; i++) {
+        uintptr_t a = (uintptr_t)frames[i];
+        Dl_info info;
+        if (a == 0 || dladdr((void *)a, &info) == 0 || !info.dli_fname) {
+            continue;
+        }
+        const char *base = strrchr(info.dli_fname, '/');
+        base = base ? base + 1 : info.dli_fname;
+        if (imgLog.length < 460) {
+            [imgLog appendFormat:@"%d:%s+%ld ", i, base, (long)(a - (uintptr_t)info.dli_fbase)];
+        }
+        if (strstr(base, "Aweme")) {
+            dyyyCreateFrames[dyyyCreateFrameCount++] = a;
+        }
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 创建栈全帧(backtrace)：%@", imgLog]);
+    if (dyyyCreateFrameCount == 0) {
+        DYYYSpeedDiag(@"[webview] 创建栈里没有 Aweme 自己的帧");
+    }
+}
+
+// 异步解析：拿上面捕获到的地址去反查 ObjC 方法表（遍历几万个类，会慢，所以放后台）。
 static void DYYYResolveCallerFromStack(void) {
     if (dyyyResolvedCaller) {
         return;
     }
     dyyyResolvedCaller = YES;
 
-    NSArray *addrs = [NSThread callStackReturnAddresses];
-    uintptr_t cand[8];
-    int nc = 0;
-    // 跳过第 0 帧（就是我们自己），其余取前 8 个落在 App 代码段（>4GB）的地址
-    for (NSUInteger i = 1; i < addrs.count && nc < 8; i++) {
-        uintptr_t a = (uintptr_t)[addrs[i] unsignedLongLongValue];
-        if (a > 0x100000000ULL) {
-            cand[nc++] = a;
-        }
-    }
+    int nc = dyyyCreateFrameCount;
     if (nc == 0) {
-        DYYYSpeedDiag(@"[webview] 创建点反查：栈里没有可用地址");
         return;
     }
+    uintptr_t *cand = dyyyCreateFrames;
 
     int count = objc_getClassList(NULL, 0);
     if (count <= 0) {
@@ -16659,7 +16709,9 @@ static void DYYYResolveCallerFromStack(void) {
                     continue;
                 }
                 for (int k = 0; k < nc; k++) {
-                    if (cand[k] >= imp && cand[k] - imp < 0x2000) {
+                    // 窗口放大到 128KB：抖音的池管理器方法体可能很大，
+                    // 窗口太小会漏（v93 用 8KB 结果一个 Aweme 方法都没命中）
+                    if (cand[k] >= imp && cand[k] - imp < 0x20000) {
                         const char *sign = (pass == 0) ? "-" : "+";
                         [found appendFormat:@"\n    → %s%s[%s %s] (+%lu)",
                                             sign, sign, class_getName(classes[i]),
@@ -16683,6 +16735,101 @@ static void DYYYResolveCallerFromStack(void) {
 }
 
 
+// ============ v94：把 `_pageConfiguration` 这层摊开（真身在这里） ============
+//
+// v93 已确认的事实：`_processPool` 只是 ObjC 层的缓存字段，我们归并了 8 次
+//   （日志 `池归并#1~#8` 全部执行），进程数却一个都没降 —— 因为 **没人读它**。
+//   WebKit 真正拿去建 page 的是 `WKWebViewConfiguration._pageConfiguration`
+//   （私有封装对象，config init 那一刻就按当时的池生成好了）。
+//
+// 这一版先不动手改它（改错 = 可能崩，得先知道字段名和类型），只把它摊开打印：
+//   类名 + 全部 ivar + 每个 ivar 的值类型。只要里面有池/进程池字段，
+//   下一版直接改那个字段，5~6 个 WebContent 才算真正塌成 1 个。
+static volatile BOOL dyyyPageCfgDumped = NO;
+
+static void DYYYDumpPageConfiguration(id configuration) {
+    if (dyyyPageCfgDumped || !DYYYNoWebViewOn() || !configuration) {
+        return;
+    }
+    dyyyPageCfgDumped = YES;
+    Class cfgCls = objc_getClass("WKWebViewConfiguration");
+    if (!cfgCls) {
+        return;
+    }
+    Ivar pcIvar = class_getInstanceVariable(cfgCls, "_pageConfiguration");
+    if (!pcIvar) {
+        DYYYSpeedDiag(@"[webview] 没有 _pageConfiguration 这个 ivar");
+        return;
+    }
+    id pc = object_getIvar(configuration, pcIvar);
+    if (!pc) {
+        DYYYSpeedDiag(@"[webview] _pageConfiguration 还是 nil（page 尚未建立）");
+        return;
+    }
+    NSMutableString *s = [NSMutableString stringWithFormat:
+        @"[webview] _pageConfiguration 类=%s", class_getName(object_getClass(pc))];
+    unsigned int n = 0;
+    Ivar *ivars = class_copyIvarList(object_getClass(pc), &n);
+    int shown = 0;
+    for (unsigned int i = 0; i < n && shown < 36; i++) {
+        const char *nm = ivar_getName(ivars[i]);
+        const char *enc = ivar_getTypeEncoding(ivars[i]);
+        if (!nm || !enc) {
+            continue;
+        }
+        const char *val = "-";
+        if (enc[0] == '@') {   // 只对对象类型读值，非对象 ivar 用 object_getIvar 会崩
+            id v = object_getIvar(pc, ivars[i]);
+            val = v ? class_getName(object_getClass(v)) : "nil";
+        }
+        [s appendFormat:@"\n    %s (%s) = %s", nm, enc, val];
+        shown++;
+    }
+    if (ivars) {
+        free(ivars);
+    }
+    DYYYSpeedDiag(s);
+}
+
+// 【v94】池本体的方法表 —— v86 的预加载治理只按 sel 名含 preload/prefetch 匹配，
+//   而池本体的「取货 / 创建」方法名里根本没这两个词，所以一个都没废
+//   （v86 日志：14 个类只有 7 个命中）。这里把真名全打出来，
+//   下一版直接冻结「取货入口」= 从源头不建，而不是靠杀。
+static void DYYYDumpPoolClassMethods(void) {
+    static volatile BOOL done = NO;
+    if (done) {
+        return;
+    }
+    done = YES;
+    const char *names[] = { "AWEWebViewPool", "AWEWebViewPreloadContainer",
+                            "IESLiveWebViewPool", "CSJWebViewPoolManager" };
+    for (size_t i = 0; i < sizeof(names) / sizeof(char *); i++) {
+        Class cls = objc_getClass(names[i]);
+        if (!cls) {
+            DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 池类 %s 不存在", names[i]]);
+            continue;
+        }
+        unsigned int mc = 0;
+        Method *mlist = class_copyMethodList(cls, &mc);
+        NSMutableString *s = [NSMutableString stringWithFormat:
+            @"[webview] 池类 %s 方法(%u)：", names[i], mc];
+        int shown = 0;
+        for (unsigned int j = 0; mlist && j < mc && shown < 30; j++) {
+            const char *sn = sel_getName(method_getName(mlist[j]));
+            if (!sn) {
+                continue;
+            }
+            [s appendFormat:@"%s ", sn];
+            shown++;
+        }
+        if (mlist) {
+            free(mlist);
+        }
+        DYYYSpeedDiag(s);
+    }
+}
+
+
 %group DYYYNoWebViewGroup
 %hook WKWebView
 
@@ -16695,6 +16842,7 @@ static void DYYYResolveCallerFromStack(void) {
     //   （v87 是改池 init 返回值 → ARC 释放半初始化对象 → 必崩；这次只改 config 的引用，不碰池生命周期）
     if (DYYYNoWebViewOn() && configuration) {
         DYYYAdoptSharedPool(configuration);
+        DYYYDumpPageConfiguration(configuration);   // 【v94】摊开真身那一层
         if (!dyyyAnyPool && dyyySharedPoolRef) {
             dyyyAnyPool = dyyySharedPoolRef;
             int32_t n = __sync_add_and_fetch(&dyyyPoolSeen, 1);
@@ -16706,12 +16854,19 @@ static void DYYYResolveCallerFromStack(void) {
     }
     id ret = %orig;
     if (DYYYNoWebViewOn() && ret) {
+        // 【v94】记下「第一个 webview 诞生的时刻」—— 回收策略只看启动批 12 秒窗口
+        if (dyyyFirstWebViewTime == 0) {
+            dyyyFirstWebViewTime = CFAbsoluteTimeGetCurrent();
+        }
         DYYYNoWebViewLog(@"initWithFrame:configuration:");
         DYYYNoWebViewLogStack(@"initWithFrame:configuration:");
         // 【v93】反查真正的创建点：callStackReturnAddresses 里拿返回地址，
         //   再反查是哪个 ObjC 方法（不能用 callStackSymbols —— AwemeCore 698MB 且符号被剥，
         //   那些 `AELogSystem...+369208` 全是假符号，偏移落到了完全无关的导出符号上）。
-        if (!dyyyResolvedCaller) {
+        // 【v94】取栈必须在这条线程上同步做（v93 在 dispatch_async 里取，拿到的是
+        //   libdispatch 自己的栈，所以反查全落到 OS_object 上）；解析再放后台。
+        if (!dyyyResolvedCaller && dyyyCreateFrameCount == 0) {
+            DYYYCaptureCreateStack();
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
               DYYYResolveCallerFromStack();
             });
@@ -16873,6 +17028,7 @@ static void DYYYResolveCallerFromStack(void) {
             DYYYNeuterPageTouchingSetters();
             DYYYNoWebViewKillPreloadersRetry();
             DYYYDumpProcessPoolSELs();
+            DYYYDumpPoolClassMethods();   // 【v94】池本体真实方法名（下版点杀取货入口）
             // 【v89】定时打真实进程数：日志里直接看 WebProcess 数量，
             //   不用再靠 CocoaTop 数进程。v91 加了 3s/10s，专门盯启动峰值。
             for (NSNumber *dt in @[ @3.0, @10.0, @30.0, @90.0 ]) {
@@ -16891,7 +17047,7 @@ static void DYYYResolveCallerFromStack(void) {
                                  DYYYNoWebViewKillPreloadersRetry();
                                });
             }
-            DYYYSpeedDiag(@"[webview] 已挂 v93 WebView 治理钩子（禁加载/废预加载/禁预热/禁缓存/池归并/吞死通知/回收进程）");
+            DYYYSpeedDiag(@"[webview] 已挂 v94 WebView 治理钩子（禁加载/废预加载/禁预热/禁缓存/吞死通知/只回收启动批/摊开_pageConfiguration）");
         } else {
             DYYYSpeedDiag(@"[webview] WKWebView 类不存在，跳过");
         }
