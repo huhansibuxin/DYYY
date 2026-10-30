@@ -567,20 +567,22 @@ static double DYYYPreparedPlaybackSpeedForPlayer(id playerViewController) {
 //   `[NSString stringWithFormat:@"x", a, b]` 里方括号内的逗号会被误当成参数分隔符。
 // 【优化】日志目录解析 + 创建只做一次（原先每写一行都重新走一遍 NSFileManager）。
 //
-// 【v87】目录从 tmp 迁到 Documents —— 2026-10-30 实测教训：
+// 【v87】目录从 tmp 迁到 Library —— 2026-10-30 实测教训：
 //   tmp/DYYY 连同 speed_diag.log 被系统整目录清掉过，导致「日志一条都没有」被误判成
 //   「插件没加载」（白查半小时）。tmp 天生就是系统随时可清的空地，日志绝不能放那儿。
-//   Documents 不会被系统清理（只有用户删 App 才没），代价是会被 iCloud 备份 —— 可接受。
+//   也**不放 Documents**（老板要求）：Documents 会走 iCloud 备份、也可能被 App 自身的
+//   清理逻辑扫到；Library 下才是 App 自己的私有数据区，系统不碰。
+//   落点：Library/DYYY/speed_diag.log
 static NSString *DYYYSpeedDiagDirectory(void) {
     static NSString *dir = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)
+        NSString *lib = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES)
             firstObject];
-        if (docs.length == 0) {
-            docs = NSTemporaryDirectory();   // 极端兜底，正常走不到
+        if (lib.length == 0) {
+            lib = NSTemporaryDirectory();   // 极端兜底，正常走不到
         }
-        dir = [docs stringByAppendingPathComponent:@"DYYY"];
+        dir = [lib stringByAppendingPathComponent:@"DYYY"];
         [[NSFileManager defaultManager] createDirectoryAtPath:dir
                                   withIntermediateDirectories:YES
                                                    attributes:nil
@@ -593,7 +595,7 @@ static NSString *DYYYSpeedDiagDirectory(void) {
 // 【v75】日志总开关：唯一真相 DYYYDiagOn()，三层铁门控（详见 AwemeHeaders.h 说明）
 //   ① dyyyDiagHardOff —— 设置页点关闭那一刻立刻置 YES，纯内存、零 I/O、零延迟
 //   ② defaults DYYYDiagLog —— 每次仍读（外部改库 / 旧版本写入也认）
-//   ③ DYYY/diag.state（v87 起在 Documents 下，不再放 tmp）—— 跨进程标记文件，0.3s 缓存
+//   ③ Library/DYYY/diag.state（v87 起在 Library 下，不再放 tmp/Documents）—— 跨进程标记文件，0.3s 缓存
 // 为什么不在"只读 defaults"上再加猜：v74 实测关掉后还写了 100 秒，
 //   而 slow path 只有一个可能——某个写入方读到的不是我们以为的那份值。
 //   所以把状态同时落到"任何进程都能 stat 到"的文件，从根上消除歧义。
