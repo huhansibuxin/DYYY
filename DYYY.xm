@@ -15554,6 +15554,24 @@ static void DYYYDiagDumpImageCache(NSString *tag) {
             [stat appendFormat:@"%@=%llu ", s, v];
         }
     }
+    // 【v81】内存侧真实占用：BDImageCache 内部真正管内存淘汰的是 memoryCache(BDMemoryCache，
+    //   与 YYMemoryCache 同源)。config 只是配置源，totalCost 才是当前吃掉的字节数。
+    id mc = nil;
+    @try {
+        mc = [cache valueForKey:@"memoryCache"];
+    } @catch (__unused NSException *e) {
+        mc = nil;
+    }
+    if (mc) {
+        for (NSString *s in @[ @"totalCost", @"totalCount", @"totalCostLimit", @"countLimit", @"ageLimit" ]) {
+            unsigned long long v = 0;
+            if (DYYYDiagCallULL(mc, s, &v)) {
+                [stat appendFormat:@"mem.%@=%.1fMB(%llu) ", s, (double)v / 1048576.0, v];
+            }
+        }
+    } else {
+        [stat appendString:@"memCache=取不到 "];
+    }
     DYYYSpeedDiag([NSString stringWithFormat:@"[imgcache] %@ 单例统计 %@", tag,
                    stat.length ? stat : @"(未命中任何统计方法)"]);
 
@@ -15562,6 +15580,110 @@ static void DYYYDiagDumpImageCache(NSString *tag) {
                    cfg ? NSStringFromClass([cfg class]) : @"nil",
                    DYYYDiagPropsOf(cfg, 1200)]);
 }
+
+// ================= 【v81】图片内存缓存上限 =================
+// 实测抖音自己设的 BDImageCacheConfig（v80 运行时读到的真实值）：
+//   memorySizeLimit            = 328MB
+//   memoryCountLimit           = UINT_MAX   （对象数完全不限）
+//   singleImageMemorySizeLimit = ULONG_MAX  （单图不限，原图直接进内存）
+// 这里统一压到保守值：总上限 96MB、单图上限 8MB、对象数 3000。
+// 真正决定淘汰的是 BDImageCache 内部 memoryCache（BDMemoryCache，与 YYMemoryCache 同源）
+// 的 totalCostLimit —— config 只是配置源，两条路径都改，防抖。
+#define DYYY_IMG_MEM_LIMIT_BYTES ((NSUInteger)96 * 1024ULL * 1024ULL)
+#define DYYY_IMG_SINGLE_LIMIT_BYTES ((NSUInteger)8 * 1024ULL * 1024ULL)
+#define DYYY_IMG_COUNT_LIMIT ((NSUInteger)3000)
+
+static BOOL DYYYImgCacheLimitOn(void) {
+    return DYYYGetBool(@"DYYYLimitImageCache");
+}
+
+// 兜底路径：把限制直接写到 memoryCache 上（config 改完不一定会同步到它）
+static void DYYYImgCacheApplyLimit(void) {
+    if (!DYYYImgCacheLimitOn()) {
+        return;
+    }
+    Class cls = NSClassFromString(@"BDImageCache");
+    if (!cls) {
+        return;
+    }
+    SEL sharedSel = NSSelectorFromString(@"sharedImageCache");
+    if (![cls respondsToSelector:sharedSel]) {
+        return;
+    }
+    id cache = ((id(*)(id, SEL))objc_msgSend)(cls, sharedSel);
+    if (!cache) {
+        return;
+    }
+    id mc = nil;
+    @try {
+        mc = [cache valueForKey:@"memoryCache"];
+    } @catch (__unused NSException *e) {
+        mc = nil;
+    }
+    if (!mc) {
+        return;
+    }
+    SEL costSel = NSSelectorFromString(@"setTotalCostLimit:");
+    if ([mc respondsToSelector:costSel]) {
+        ((void(*)(id, SEL, NSUInteger))objc_msgSend)(mc, costSel, DYYY_IMG_MEM_LIMIT_BYTES);
+    }
+    SEL cntSel = NSSelectorFromString(@"setCountLimit:");
+    if ([mc respondsToSelector:cntSel]) {
+        ((void(*)(id, SEL, NSUInteger))objc_msgSend)(mc, cntSel, DYYY_IMG_COUNT_LIMIT);
+    }
+
+    // 只在真正生效后的第一轮打一行，方便核对；之后静默
+    static BOOL logged = NO;
+    if (!logged) {
+        logged = YES;
+        if (DYYYDiagOn()) {
+            unsigned long long cost = 0, costLimit = 0;
+            DYYYDiagCallULL(mc, @"totalCost", &cost);
+            DYYYDiagCallULL(mc, @"totalCostLimit", &costLimit);
+            DYYYSpeedDiag([NSString stringWithFormat:
+                                          @"[imgcache] 限制已应用 总上限=%lluMB 单图上限=%lluMB 对象数=%llu "
+                                          @"| 当前 totalCost=%.1fMB totalCostLimit=%.1fMB",
+                                          (unsigned long long)(DYYY_IMG_MEM_LIMIT_BYTES / 1048576ULL),
+                                          (unsigned long long)(DYYY_IMG_SINGLE_LIMIT_BYTES / 1048576ULL),
+                                          (unsigned long long)DYYY_IMG_COUNT_LIMIT,
+                                          (double)cost / 1048576.0, (double)costLimit / 1048576.0]);
+        }
+    }
+}
+
+// 主路径：抖音每次给 config 赋值都在这里被压住。之后谁重建 config 都跑不掉。
+@interface BDImageCacheConfig : NSObject
+- (void)setMemorySizeLimit:(NSUInteger)v;
+- (void)setMemoryCountLimit:(NSUInteger)v;
+- (void)setSingleImageMemorySizeLimit:(NSUInteger)v;
+@end
+
+%group DYYYImgCacheLimitGroup
+%hook BDImageCacheConfig
+
+- (void)setMemorySizeLimit:(NSUInteger)v {
+    if (DYYYImgCacheLimitOn() && v > DYYY_IMG_MEM_LIMIT_BYTES) {
+        v = DYYY_IMG_MEM_LIMIT_BYTES;
+    }
+    %orig(v);
+}
+
+- (void)setMemoryCountLimit:(NSUInteger)v {
+    if (DYYYImgCacheLimitOn() && v > DYYY_IMG_COUNT_LIMIT) {
+        v = DYYY_IMG_COUNT_LIMIT;
+    }
+    %orig(v);
+}
+
+- (void)setSingleImageMemorySizeLimit:(NSUInteger)v {
+    if (DYYYImgCacheLimitOn() && v > DYYY_IMG_SINGLE_LIMIT_BYTES) {
+        v = DYYY_IMG_SINGLE_LIMIT_BYTES;
+    }
+    %orig(v);
+}
+
+%end
+%end
 
 // ---- Lynx 实例计数：只加/减，不做任何干预 ----
 static volatile int32_t dyyyLynxViewLive = 0;
@@ -15678,6 +15800,8 @@ void DYYYDiagCardProbe(AWEAwemeModel *model) {
 static void DYYYDiagScheduleTick(int round);
 
 static void DYYYDiagTick(int round) {
+    // 【v81】限制复查放在日志门控之前：日志关掉也要继续压上限，否则用户关日志后限制就丢了。
+    DYYYImgCacheApplyLimit();
     if (!DYYYDiagOn()) {
         return;
     }
@@ -15708,7 +15832,8 @@ static void DYYYDiagScheduleTick(int round) {
 %ctor {
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
         @"DYYYKeepNowPlayingInBackground" : @YES,
-        @"DYYYDiagLog" : @YES
+        @"DYYYDiagLog" : @YES,
+        @"DYYYLimitImageCache" : @YES
     }];
     // 老版本遗留开关值清掉（该功能已移除，留着只会在设置页/调试时造成困惑）
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"DYYYDisableFeedNowPlayingInfo"];
@@ -15729,6 +15854,21 @@ static void DYYYDiagScheduleTick(int round) {
     }
     if (objc_getClass("LynxBackgroundRuntime")) {
         %init(DYYYLynxBgDiagGroup);
+    }
+    // 【v81】图片缓存上限：类与 setter 都在才挂，然后立刻补一次（抖音可能在我们之前就设过了）
+    Class imgCfgCls = objc_getClass("BDImageCacheConfig");
+    if (imgCfgCls && class_getInstanceMethod(imgCfgCls, @selector(setMemorySizeLimit:))) {
+        %init(DYYYImgCacheLimitGroup);
+    }
+    if (DYYYImgCacheLimitOn()) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+                         DYYYImgCacheApplyLimit();
+                       });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+                         DYYYImgCacheApplyLimit();
+                       });
     }
     DYYYDiagScheduleTick(1);
 
