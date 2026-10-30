@@ -566,12 +566,21 @@ static double DYYYPreparedPlaybackSpeedForPlayer(id playerViewController) {
 //   注意必须用 (...) + __VA_ARGS__：预处理器只跟踪圆括号，写成单参数宏的话
 //   `[NSString stringWithFormat:@"x", a, b]` 里方括号内的逗号会被误当成参数分隔符。
 // 【优化】日志目录解析 + 创建只做一次（原先每写一行都重新走一遍 NSFileManager）。
-// NSTemporaryDirectory() 在进程生命周期内稳定，缓存安全。
+//
+// 【v87】目录从 tmp 迁到 Documents —— 2026-10-30 实测教训：
+//   tmp/DYYY 连同 speed_diag.log 被系统整目录清掉过，导致「日志一条都没有」被误判成
+//   「插件没加载」（白查半小时）。tmp 天生就是系统随时可清的空地，日志绝不能放那儿。
+//   Documents 不会被系统清理（只有用户删 App 才没），代价是会被 iCloud 备份 —— 可接受。
 static NSString *DYYYSpeedDiagDirectory(void) {
     static NSString *dir = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DYYY"];
+        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)
+            firstObject];
+        if (docs.length == 0) {
+            docs = NSTemporaryDirectory();   // 极端兜底，正常走不到
+        }
+        dir = [docs stringByAppendingPathComponent:@"DYYY"];
         [[NSFileManager defaultManager] createDirectoryAtPath:dir
                                   withIntermediateDirectories:YES
                                                    attributes:nil
@@ -584,7 +593,7 @@ static NSString *DYYYSpeedDiagDirectory(void) {
 // 【v75】日志总开关：唯一真相 DYYYDiagOn()，三层铁门控（详见 AwemeHeaders.h 说明）
 //   ① dyyyDiagHardOff —— 设置页点关闭那一刻立刻置 YES，纯内存、零 I/O、零延迟
 //   ② defaults DYYYDiagLog —— 每次仍读（外部改库 / 旧版本写入也认）
-//   ③ tmp/DYYY/diag.state —— 跨进程标记文件（内容 "1"/"0"），0.3s 缓存
+//   ③ DYYY/diag.state（v87 起在 Documents 下，不再放 tmp）—— 跨进程标记文件，0.3s 缓存
 // 为什么不在"只读 defaults"上再加猜：v74 实测关掉后还写了 100 秒，
 //   而 slow path 只有一个可能——某个写入方读到的不是我们以为的那份值。
 //   所以把状态同时落到"任何进程都能 stat 到"的文件，从根上消除歧义。
@@ -15728,6 +15737,18 @@ static void DYYYImgCacheApplyLimit(void) {
     characterEncodingName:(NSString *)characterEncodingName baseURL:(NSURL *)baseURL;
 @end
 
+// 【v87】进程池：iOS 里 WebContent 进程是**按 WKProcessPool 分的**，
+//   而 WKWebViewConfiguration 的 processPool 默认值是「一个新的池」——
+//   于是 AWE 启动时 new 5 个 config 就必然拉起 5 个 WebContent（实测每个 ~20MB 空壳）。
+//   把池收敛成全局唯一一个，5 个空壳立刻合并成 1 个（官方支持的合法用法，不做任何 hack）。
+@interface WKProcessPool : NSObject
+@end
+
+@interface WKWebViewConfiguration : NSObject
+- (id)processPool;
+- (void)setProcessPool:(id)pool;
+@end
+
 static BOOL DYYYNoWebViewOn(void) {
     return DYYYGetBool(@"DYYYDisableWebView");
 }
@@ -15766,7 +15787,90 @@ static void DYYYNoWebViewLog(NSString *what) {
     DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 拦截#%d %@ 调用方=%@", (int)n, what, caller]);
 }
 
-// ============ v86 核心：把「预加载器」整体废掉（真正的省内存源头） ============
+// 【v87】完整调用栈：只对前 3 次 WKWebView 创建打印 16 帧。
+//   v86 只打了「第一个含 AWE 的栈行」，结果得到一个伪符号（最近符号 + 巨大偏移），
+//   根本看不出是谁建的。要定位就得多帧。
+static volatile int32_t dyyyWebViewStackCount = 0;
+static void DYYYNoWebViewLogStack(NSString *what) {
+    if (!DYYYDiagOn()) {
+        return;
+    }
+    int32_t n = __sync_add_and_fetch(&dyyyWebViewStackCount, 1);
+    if (n > 3) {
+        return;
+    }
+    NSArray *syms = [NSThread callStackSymbols];
+    NSMutableString *buf = [NSMutableString string];
+    NSUInteger limit = MIN(syms.count, (NSUInteger)16);
+    for (NSUInteger i = 1; i < limit; i++) {
+        [buf appendFormat:@"\n    #%lu %@", (unsigned long)i, syms[i]];
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 创建栈#%d %@%@", (int)n, what, buf]);
+}
+
+// ============ v87 核心：把 WebContent 进程池收敛成一个 ============
+//
+// 事实链（2026-10-30 实测）：
+//   ① 预加载器已经废干净（7 类 / 46 方法），可启动 5 秒内仍有 5 个 WKWebView 被创建，
+//      且**全部来自同一个调用点**（AwemeCore 同一个偏移），随后 4 分钟没再建过。
+//   ② 这 5 个对象只调过 1 次 loadRequest（还被我们拦了）⇒ 全是空壳，没有任何页面。
+//   ③ WebKit 的 WebContent 进程是**按 WKProcessPool 分组**的，而
+//      WKWebViewConfiguration.processPool 的默认值就是「一个新的池」——
+//      new 5 个 config ⇒ 5 个池 ⇒ 5 个空壳进程，每个 ~20MB。
+//
+// 对策：让所有池都指向同一个实例。共享池是 Apple 官方支持的用法（同一 App 内多个
+//   WKWebView 共用一个池是常规优化），不碰私有 API，不会让对象失效，崩不了。
+//   预期效果：5 个空壳进程合并成 1 个。
+
+static id dyyySharedProcessPool = nil;
+static volatile BOOL dyyyCreatingPool = NO;
+static volatile int32_t dyyyPoolReuseCount = 0;
+
+%group DYYYWebViewPoolGroup
+%hook WKProcessPool
+
+- (instancetype)init {
+    if (!DYYYNoWebViewOn()) {
+        return %orig;
+    }
+    if (dyyyCreatingPool) {   // 防递归（我们自己 alloc 的那一次）
+        return %orig;
+    }
+    if (dyyySharedProcessPool) {
+        int32_t n = __sync_add_and_fetch(&dyyyPoolReuseCount, 1);
+        if (n <= 8) {
+            DYYYSpeedDiag([NSString stringWithFormat:
+                @"[webview] 进程池复用#%d（第 %d 个池被合并进共享池）", (int)n, (int)n + 1]);
+        }
+        return dyyySharedProcessPool;
+    }
+    dyyyCreatingPool = YES;
+    dyyySharedProcessPool = %orig;
+    dyyyCreatingPool = NO;
+    DYYYSpeedDiag(@"[webview] 进程池：已建立全局共享池，后续所有池都复用它");
+    return dyyySharedProcessPool;
+}
+
+%end
+%end
+
+// 双保险：SDK 显式 setProcessPool: 设自己的池时，也强制改成共享池
+%group DYYYWebViewConfigGroup
+%hook WKWebViewConfiguration
+
+- (void)setProcessPool:(id)pool {
+    if (DYYYNoWebViewOn() && dyyySharedProcessPool && pool != dyyySharedProcessPool) {
+        %orig(dyyySharedProcessPool);
+        return;
+    }
+    %orig;
+}
+
+%end
+%end
+
+
+// ============ v86：把「预加载器」整体废掉（省内存的第二层） ============
 //
 // 为什么这样做而不是拦 init：
 //   WKWebView 的 init 一旦返回 nil，调用方（AWE 的容器、穿山甲的广告落地页 Loader）
@@ -15960,6 +16064,7 @@ static void DYYYNoWebViewKillPreloadersRetry(void) {
 - (instancetype)initWithFrame:(CGRect)frame configuration:(id)configuration {
     if (DYYYNoWebViewOn()) {
         DYYYNoWebViewLog(@"initWithFrame:configuration:");
+        DYYYNoWebViewLogStack(@"initWithFrame:configuration:");
     }
     return %orig;
 }
@@ -16080,6 +16185,13 @@ static void DYYYNoWebViewKillPreloadersRetry(void) {
         Class wkCls = objc_getClass("WKWebView");
         if (wkCls) {
             %init(DYYYNoWebViewGroup);
+            // 【v87】进程池收敛：5 个 config ⇒ 5 个 WebContent 进程的根因
+            if (objc_getClass("WKProcessPool")) {
+                %init(DYYYWebViewPoolGroup);
+            }
+            if (objc_getClass("WKWebViewConfiguration")) {
+                %init(DYYYWebViewConfigGroup);
+            }
             DYYYNoWebViewKillPreloadersRetry();
             // 预加载类多在 AwemeCore 里、注册时间晚于 %ctor ⇒ 分档重试（命中即停）
             for (NSNumber *delay in @[ @0.5, @2.0, @5.0, @10.0, @20.0 ]) {
@@ -16089,7 +16201,7 @@ static void DYYYNoWebViewKillPreloadersRetry(void) {
                                  DYYYNoWebViewKillPreloadersRetry();
                                });
             }
-            DYYYSpeedDiag(@"[webview] 已挂 v86 WebView 治理钩子（放行创建/禁加载/废预加载）");
+            DYYYSpeedDiag(@"[webview] 已挂 v87 WebView 治理钩子（放行创建/禁加载/废预加载/合并进程池）");
         } else {
             DYYYSpeedDiag(@"[webview] WKWebView 类不存在，跳过");
         }
