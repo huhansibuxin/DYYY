@@ -15810,66 +15810,115 @@ static void DYYYNoWebViewLogStack(NSString *what) {
     DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 创建栈#%d %@%@", (int)n, what, buf]);
 }
 
-// ============ v87 核心：把 WebContent 进程池收敛成一个 ============
+// ============ v87 的进程池合并方案：已废弃（实测必崩） ============
 //
-// 事实链（2026-10-30 实测）：
-//   ① 预加载器已经废干净（7 类 / 46 方法），可启动 5 秒内仍有 5 个 WKWebView 被创建，
-//      且**全部来自同一个调用点**（AwemeCore 同一个偏移），随后 4 分钟没再建过。
-//   ② 这 5 个对象只调过 1 次 loadRequest（还被我们拦了）⇒ 全是空壳，没有任何页面。
-//   ③ WebKit 的 WebContent 进程是**按 WKProcessPool 分组**的，而
-//      WKWebViewConfiguration.processPool 的默认值就是「一个新的池」——
-//      new 5 个 config ⇒ 5 个池 ⇒ 5 个空壳进程，每个 ~20MB。
+// v87 曾把 `-[WKProcessPool init]` 改成返回全局单例，想让 5 个池合并成 1 个。
+// 实机崩溃栈（Aweme-2026-10-30-172119.ips）铁证如下，自下往上读：
 //
-// 对策：让所有池都指向同一个实例。共享池是 Apple 官方支持的用法（同一 App 内多个
-//   WKWebView 共用一个池是常规优化），不碰私有 API，不会让对象失效，崩不了。
-//   预期效果：5 个空壳进程合并成 1 个。
+//   -[WKWebView initWithFrame:]
+//     -[WKWebView _initializeWithConfiguration:]
+//       -[WKWebViewConfiguration copyWithZone:]
+//         -[WKWebViewConfiguration processPool]
+//           -[WKProcessPool dealloc]                    ← 开始析构一个半初始化的池
+//             WebKit::WebProcessPool::~WebProcessPool()
+//               WebKit::WebProcessCache::clear()        ← EXC_BAD_ACCESS at 0x8
+//
+// 原因：`[[WKProcessPool alloc] init]` 里 alloc 已经产出一个真实对象，init 返回单例后
+//   ARC 会立刻释放那个「刚 alloc 出来的对象」。它是个**没走完 init 的空壳**，
+//   内部 WebKit::WebProcessPool 指针还是 null，dealloc 一进去就解引用空指针 +8。
+//   ⇒ 单例化 init 这条路的崩溃是 100% 必现的，与「什么时候用到池」无关。
+//
+// 结论：进程池对象**绝对不能碰身份**（不能改 init 返回值，也不能强改 setProcessPool:）。
+//   v88 起彻底移除这两处 hook，改走下面「创建后回收进程」的方案。
 
-static id dyyySharedProcessPool = nil;
-static volatile BOOL dyyyCreatingPool = NO;
-static volatile int32_t dyyyPoolReuseCount = 0;
 
-%group DYYYWebViewPoolGroup
-%hook WKProcessPool
+// ============ v88 核心：不碰对象身份，改成「建完就把 WebContent 进程回收掉」 ============
+//
+// 为什么 load 全拦了进程还在（老板的原问题）：
+//   WKWebView 的渲染不在本进程 —— 只要 init 成功，WebKit 就必须为它建立一条到
+//   com.apple.WebKit.WebContent 的 XPC 连接并拉起那个进程（WebCore/渲染/JS 全在里面）。
+//   所以「拦 load」只能保证不渲染页面、不占网页内容内存，但那 20MB 的**进程骨架**
+//   是 init 的必然产物，拦 load 消不掉。
+//   而抖音启动时在后台队列一口气 new 3~5 个这种 webview 当池子（同一调用点），
+//   全部空壳常驻 ⇒ 5 × 20MB。
+//
+// 唯一不崩的消除路径：
+//   对象照建（不返回 nil，抖音拿到的永远是合法对象，不会崩）→
+//   3 秒后（确认它没被真的用起来；load 已全拦）调用 WebKit 自己的进程回收私有方法
+//   `-_killWebContentProcess`（找不到就退到 `-_killWebContentProcessAndResetState`）→
+//   WebContent 进程退出，20MB 释放。WKWebView 对象本身还在、仍然合法，
+//   万一后面真被使用，WebKit 会自动重新拉起进程（我们 load 全拦，所以实际不会重建）。
+//
+// 防循环：每个实例只回收一次（关联对象打标），全局上限 24 次；超限停手并记日志，
+//   这样万一抖音监听 `webViewWebContentProcessDidTerminate:` 后疯狂重建，
+//   也不会变成「建→杀→建」的死循环，日志里能直接看出来。
 
-- (instancetype)init {
-    if (!DYYYNoWebViewOn()) {
-        return %orig;
-    }
-    if (dyyyCreatingPool) {   // 防递归（我们自己 alloc 的那一次）
-        return %orig;
-    }
-    if (dyyySharedProcessPool) {
-        int32_t n = __sync_add_and_fetch(&dyyyPoolReuseCount, 1);
-        if (n <= 8) {
-            DYYYSpeedDiag([NSString stringWithFormat:
-                @"[webview] 进程池复用#%d（第 %d 个池被合并进共享池）", (int)n, (int)n + 1]);
-        }
-        return dyyySharedProcessPool;
-    }
-    dyyyCreatingPool = YES;
-    dyyySharedProcessPool = %orig;
-    dyyyCreatingPool = NO;
-    DYYYSpeedDiag(@"[webview] 进程池：已建立全局共享池，后续所有池都复用它");
-    return dyyySharedProcessPool;
-}
+static char kDYYYReapedKey;
+static volatile int32_t dyyyReapCount = 0;
+static volatile BOOL dyyyReapNoSel = NO;
 
-%end
-%end
-
-// 双保险：SDK 显式 setProcessPool: 设自己的池时，也强制改成共享池
-%group DYYYWebViewConfigGroup
-%hook WKWebViewConfiguration
-
-- (void)setProcessPool:(id)pool {
-    if (DYYYNoWebViewOn() && dyyySharedProcessPool && pool != dyyySharedProcessPool) {
-        %orig(dyyySharedProcessPool);
+static void DYYYReapWebContent(id webView) {
+    if (!DYYYNoWebViewOn() || !webView) {
         return;
     }
-    %orig;
+    if (objc_getAssociatedObject(webView, &kDYYYReapedKey)) {
+        return;   // 这个实例已经回收过，绝不再杀第二次
+    }
+    objc_setAssociatedObject(webView, &kDYYYReapedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    int32_t n = __sync_add_and_fetch(&dyyyReapCount, 1);
+    if (n > 24) {
+        if (n == 25) {
+            DYYYSpeedDiag(@"[webview] 回收已达上限 24 次，停止（防止疯狂的建-杀循环）");
+        }
+        return;
+    }
+
+    const char *names[2] = { "_killWebContentProcess", "_killWebContentProcessAndResetState" };
+    for (int i = 0; i < 2; i++) {
+        SEL sel = sel_registerName(names[i]);
+        if ([webView respondsToSelector:sel]) {
+            ((void (*)(id, SEL))objc_msgSend)(webView, sel);
+            DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 回收#%d 已杀 WebContent 进程（%s）",
+                                                     (int)n, names[i]]);
+            return;
+        }
+    }
+    if (!dyyyReapNoSel) {
+        dyyyReapNoSel = YES;
+        DYYYSpeedDiag(@"[webview] 本系统 WKWebView 没有进程回收 SEL，回收层跳过（进程仍会常驻）");
+    }
 }
 
-%end
-%end
+// 诊断：把 WKProcessPool 自身方法表里带 Cache/Process 的私有 SEL 打出来。
+//   WebKit 的 WebProcessCache 会缓存空闲 WebContent 进程（默认 3~6 个），这是
+//   「空壳进程一直挂着不走」的另一半原因；拿到真实 SEL 名后下一版可以精确关掉它，
+//   而不是像 v87 那样去改池对象身份（那条路必崩）。
+static void DYYYDumpProcessPoolSELs(void) {
+    Class cls = objc_getClass("WKProcessPool");
+    if (!cls) {
+        return;
+    }
+    unsigned int cnt = 0;
+    Method *list = class_copyMethodList(cls, &cnt);
+    if (!list) {
+        return;
+    }
+    NSMutableString *hits = [NSMutableString string];
+    for (unsigned int i = 0; i < cnt; i++) {
+        const char *nm = sel_getName(method_getName(list[i]));
+        if (!nm) {
+            continue;
+        }
+        if (strstr(nm, "Cache") || strstr(nm, "Process")) {
+            if (hits.length < 700) {
+                [hits appendFormat:@"%s ", nm];
+            }
+        }
+    }
+    free(list);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[webview] WKProcessPool 私有 SEL：%@", hits]);
+}
 
 
 // ============ v86：把「预加载器」整体废掉（省内存的第二层） ============
@@ -16064,18 +16113,38 @@ static void DYYYNoWebViewKillPreloadersRetry(void) {
 
 // ⚠️ 这里绝对不能 return nil（v85 实测必崩）。只记录「谁在建」，然后老老实实给真对象。
 - (instancetype)initWithFrame:(CGRect)frame configuration:(id)configuration {
-    if (DYYYNoWebViewOn()) {
+    id ret = %orig;
+    if (DYYYNoWebViewOn() && ret) {
         DYYYNoWebViewLog(@"initWithFrame:configuration:");
         DYYYNoWebViewLogStack(@"initWithFrame:configuration:");
+        // 【v88】3 秒后把这条 WebContent 连接回收掉：抖音建的都是池化空壳，不会用到；
+        //   load 已全拦，回收后也不会重建。用 weak 避免拖住对象生命周期。
+        __weak id weakWV = ret;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+                         id wv = weakWV;
+                         if (wv) {
+                             DYYYReapWebContent(wv);
+                         }
+                       });
     }
-    return %orig;
+    return ret;
 }
 
 - (instancetype)initWithCoder:(NSCoder *)coder {
-    if (DYYYNoWebViewOn()) {
+    id ret = %orig;
+    if (DYYYNoWebViewOn() && ret) {
         DYYYNoWebViewLog(@"initWithCoder:");
+        __weak id weakWV = ret;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+                         id wv = weakWV;
+                         if (wv) {
+                             DYYYReapWebContent(wv);
+                         }
+                       });
     }
-    return %orig;
+    return ret;
 }
 
 // 放行创建，但一律不允许加载/执行任何内容：进程即使起来也永远是一张白纸，无页面内存。
@@ -16187,14 +16256,9 @@ static void DYYYNoWebViewKillPreloadersRetry(void) {
         Class wkCls = objc_getClass("WKWebView");
         if (wkCls) {
             %init(DYYYNoWebViewGroup);
-            // 【v87】进程池收敛：5 个 config ⇒ 5 个 WebContent 进程的根因
-            if (objc_getClass("WKProcessPool")) {
-                %init(DYYYWebViewPoolGroup);
-            }
-            if (objc_getClass("WKWebViewConfiguration")) {
-                %init(DYYYWebViewConfigGroup);
-            }
+            // 【v88】进程池对象一律不碰（v87 的单例化 = 必崩，见上方崩溃栈注释）
             DYYYNoWebViewKillPreloadersRetry();
+            DYYYDumpProcessPoolSELs();
             // 预加载类多在 AwemeCore 里、注册时间晚于 %ctor ⇒ 分档重试（命中即停）
             for (NSNumber *delay in @[ @0.5, @2.0, @5.0, @10.0, @20.0 ]) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
@@ -16203,7 +16267,7 @@ static void DYYYNoWebViewKillPreloadersRetry(void) {
                                  DYYYNoWebViewKillPreloadersRetry();
                                });
             }
-            DYYYSpeedDiag(@"[webview] 已挂 v87 WebView 治理钩子（放行创建/禁加载/废预加载/合并进程池）");
+            DYYYSpeedDiag(@"[webview] 已挂 v88 WebView 治理钩子（放行创建/禁加载/废预加载/回收WebContent进程）");
         } else {
             DYYYSpeedDiag(@"[webview] WKWebView 类不存在，跳过");
         }
