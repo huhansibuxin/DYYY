@@ -15756,6 +15756,34 @@ static void DYYYNoWebViewLog(NSString *what) {
     DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 拦截#%d %@ 调用方=%@", (int)n, what, caller]);
 }
 
+// 补齐 WKWebView 自己的其它 init（Apple 文档写明「想要默认配置可以直接用继承来的
+// init(frame:)」—— 说明 WKWebView 自己重写了 initWithFrame:，这条路也能起进程）。
+// ⚠️ 只能用 class_copyMethodList 取「WKWebView 自己的方法表」再逐个换 IMP：
+//   如果直接 %hook -initWithFrame: 而 WKWebView 并没有自己实现它，Logos 可能改到
+//   UIView 的那个 Method 上 —— 那会把全 App 所有 UIView 的 initWithFrame: 变成返回 nil，必崩。
+//   这里按自己的方法表对比名字，命中才换，碰不到父类。
+static void DYYYNoWebViewSwizzleOwnInits(void) {
+    Class cls = objc_getClass("WKWebView");
+    if (!cls) {
+        return;
+    }
+    unsigned int cnt = 0;
+    Method *list = class_copyMethodList(cls, &cnt);
+    if (!list) {
+        return;
+    }
+    for (unsigned int i = 0; i < cnt; i++) {
+        const char *n = sel_getName(method_getName(list[i]));
+        if (strcmp(n, "initWithFrame:") == 0 || strcmp(n, "init") == 0) {
+            IMP imp = imp_implementationWithBlock(^id(id obj) {
+              return nil;
+            });
+            method_setImplementation(list[i], imp);
+        }
+    }
+    free(list);
+}
+
 %group DYYYNoWebViewGroup
 %hook WKWebView
 
@@ -15886,6 +15914,7 @@ static void DYYYNoWebViewLog(NSString *what) {
         if (wkCls) {
             %init(DYYYNoWebViewGroup);
             %init(DYYYNilSubviewGuardGroup);
+            DYYYNoWebViewSwizzleOwnInits();   // 补 initWithFrame: / init 两条路
             DYYYSpeedDiag(@"[webview] 已挂 WKWebView 禁用钩子");
         } else {
             DYYYSpeedDiag(@"[webview] WKWebView 类不存在，跳过");
