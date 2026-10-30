@@ -15658,8 +15658,16 @@ static void DYYYDiagDumpImageCache(NSString *tag) {
 //   memoryCountLimit           = UINT_MAX   （对象数完全不限）
 //   singleImageMemorySizeLimit = ULONG_MAX  （单图不限，原图直接进内存）
 // 这里统一压到保守值：总上限 96MB、单图上限 8MB、对象数 3000。
-// 真正决定淘汰的是 BDImageCache 内部 memoryCache（BDMemoryCache，与 YYMemoryCache 同源）
-// 的 totalCostLimit —— config 只是配置源，两条路径都改，防抖。
+//
+// 【v83】v81/v82 的兜底路径其实压在空处，v82 日志给了铁证：
+//   [imgcache] 限制已应用 ... totalCost=0.0MB totalCostLimit=0.0MB mcCls=BDImageCompositedMemoryCache
+//   [imgcache] memoryCache 属性表 enableLRUFlag=0 defaultCache=<BDImageNSCache> largeImageCache=nil ...
+//   => memoryCache 的真实类是 BDImageCompositedMemoryCache，它只是"组合壳"，本身没有
+//      totalCostLimit 这个属性（读回来恒为 0），设了也不管用。
+//      真正的缓存在壳里的三个子缓存：defaultCache / largeImageCache / animatedImageCache，
+//      都是 BDImageNSCache（NSCache 子类），淘汰只认它们自己的 totalCostLimit / countLimit。
+//   另外 config 里 enableLRU=0 —— 抖音根本没启用 LRU 那套，所以 memorySizeLimit 也未必参与淘汰。
+//   => v83 三层一起压：config（配置源）+ 壳（有就设）+ 三个子缓存（真正生效的那层）。
 #define DYYY_IMG_MEM_LIMIT_BYTES ((NSUInteger)96 * 1024ULL * 1024ULL)
 #define DYYY_IMG_SINGLE_LIMIT_BYTES ((NSUInteger)8 * 1024ULL * 1024ULL)
 #define DYYY_IMG_COUNT_LIMIT ((NSUInteger)3000)
@@ -15668,7 +15676,53 @@ static BOOL DYYYImgCacheLimitOn(void) {
     return DYYYGetBool(@"DYYYLimitImageCache");
 }
 
-// 兜底路径：把限制直接写到 memoryCache 上（config 改完不一定会同步到它）
+// 把上限写到「某一个」缓存对象上。
+// NSCache 子类（BDImageNSCache）一定有 totalCostLimit / countLimit 两个属性，
+// 先走 respondsToSelector，不行再走 KVC，两条都不成就返回 NO（绝不强设，避免崩）。
+static BOOL DYYYImgCacheClampOne(id cache) {
+    if (!cache || !DYYYImgCacheLimitOn()) {
+        return NO;
+    }
+    BOOL ok = NO;
+    SEL costSel = NSSelectorFromString(@"setTotalCostLimit:");
+    if ([cache respondsToSelector:costSel]) {
+        ((void(*)(id, SEL, NSUInteger))objc_msgSend)(cache, costSel, DYYY_IMG_MEM_LIMIT_BYTES);
+        ok = YES;
+    }
+    SEL cntSel = NSSelectorFromString(@"setCountLimit:");
+    if ([cache respondsToSelector:cntSel]) {
+        ((void(*)(id, SEL, NSUInteger))objc_msgSend)(cache, cntSel, DYYY_IMG_COUNT_LIMIT);
+        ok = YES;
+    }
+    if (!ok) {
+        @try {
+            [cache setValue:@(DYYY_IMG_MEM_LIMIT_BYTES) forKey:@"totalCostLimit"];
+            [cache setValue:@(DYYY_IMG_COUNT_LIMIT) forKey:@"countLimit"];
+            ok = YES;
+        } @catch (__unused NSException *e) {
+            ok = NO;
+        }
+    }
+    return ok;
+}
+
+// 读回校验：类名 + 当前占用 + 当前上限（读不到就显示 ?，不猜）
+static NSString *DYYYImgCacheDescribe(id cache) {
+    if (!cache) {
+        return @"nil";
+    }
+    unsigned long long cost = 0, limit = 0, cntLimit = 0;
+    BOOL hasCost = DYYYDiagCallULL(cache, @"totalCost", &cost);
+    BOOL hasLimit = DYYYDiagCallULL(cache, @"totalCostLimit", &limit);
+    DYYYDiagCallULL(cache, @"countLimit", &cntLimit);
+    return [NSString stringWithFormat:@"<%@ cost=%@ limit=%@ cntLimit=%llu>",
+                                      NSStringFromClass([cache class]),
+                                      hasCost ? [NSString stringWithFormat:@"%.1fMB", (double)cost / 1048576.0] : @"?",
+                                      hasLimit ? [NSString stringWithFormat:@"%.1fMB", (double)limit / 1048576.0] : @"?",
+                                      cntLimit];
+}
+
+// 兜底路径（v83 起是真正生效的那条）：把上限写到 memoryCache 壳里的三个子缓存上
 static void DYYYImgCacheApplyLimit(void) {
     if (!DYYYImgCacheLimitOn()) {
         return;
@@ -15694,43 +15748,54 @@ static void DYYYImgCacheApplyLimit(void) {
     if (!mc) {
         return;
     }
-    SEL costSel = NSSelectorFromString(@"setTotalCostLimit:");
-    if ([mc respondsToSelector:costSel]) {
-        ((void(*)(id, SEL, NSUInteger))objc_msgSend)(mc, costSel, DYYY_IMG_MEM_LIMIT_BYTES);
-    }
-    SEL cntSel = NSSelectorFromString(@"setCountLimit:");
-    if ([mc respondsToSelector:cntSel]) {
-        ((void(*)(id, SEL, NSUInteger))objc_msgSend)(mc, cntSel, DYYY_IMG_COUNT_LIMIT);
-    }
-    // 【v82】上面两条 respondsToSelector 在 v81 实测里没设上（打出来 totalCostLimit=0）。
-    //   再加一层 KVC 兜底：NSCache 系的 totalCostLimit/countLimit 是标准属性，KVC 一定能找到 setter 或 ivar。
-    @try {
-        [mc setValue:@(DYYY_IMG_MEM_LIMIT_BYTES) forKey:@"totalCostLimit"];
-        [mc setValue:@(DYYY_IMG_COUNT_LIMIT) forKey:@"countLimit"];
-    } @catch (__unused NSException *e) {
-        // 取不到就保持原样，绝不因为压缓存把 App 搞崩
+
+    // ① 壳本身：BDImageCompositedMemoryCache 通常没有这两个属性，设不上也无所谓（返回 NO）
+    DYYYImgCacheClampOne(mc);
+
+    // ② 真正管淘汰的三个子缓存。大图/动图缓存是懒建的，现在是 nil 也照常记录，
+    //    下次 tick 复查时会补上（见 DYYYDiagScheduleTick 里的重复调用）。
+    NSArray<NSString *> *subKeys = @[ @"defaultCache", @"largeImageCache", @"animatedImageCache" ];
+    NSMutableArray<id> *subs = [NSMutableArray arrayWithCapacity:subKeys.count];
+    for (NSString *key in subKeys) {
+        id sub = nil;
+        @try {
+            sub = [mc valueForKey:key];
+        } @catch (__unused NSException *e) {
+            sub = nil;
+        }
+        if (sub) {
+            DYYYImgCacheClampOne(sub);
+        }
+        [subs addObject:sub ?: [NSNull null]];
     }
 
-    // 只在真正生效后的第一轮打一行，方便核对；之后静默
-    static BOOL logged = NO;
-    if (!logged) {
-        logged = YES;
-        if (DYYYDiagOn()) {
-            unsigned long long cost = 0, costLimit = 0;
-            DYYYDiagCallULL(mc, @"totalCost", &cost);
-            DYYYDiagCallULL(mc, @"totalCostLimit", &costLimit);
-            DYYYSpeedDiag([NSString stringWithFormat:
-                                          @"[imgcache] 限制已应用 总上限=%lluMB 单图上限=%lluMB 对象数=%llu "
-                                          @"| 当前 totalCost=%.1fMB totalCostLimit=%.1fMB mcCls=%@",
-                                          (unsigned long long)(DYYY_IMG_MEM_LIMIT_BYTES / 1048576ULL),
-                                          (unsigned long long)(DYYY_IMG_SINGLE_LIMIT_BYTES / 1048576ULL),
-                                          (unsigned long long)DYYY_IMG_COUNT_LIMIT,
-                                          (double)cost / 1048576.0, (double)costLimit / 1048576.0,
-                                          NSStringFromClass([mc class])]);
-            DYYYSpeedDiag([NSString stringWithFormat:@"[imgcache] memoryCache 属性表 %@",
-                                                     DYYYDiagPropsOf(mc, 900)]);
+    // 只在首次应用、以及子缓存个数发生变化时（懒建出来了）打一行，避免刷屏
+    static NSUInteger lastCount = (NSUInteger)-1;
+    NSUInteger nowCount = 0;
+    for (id s in subs) {
+        if (s != [NSNull null]) {
+            nowCount++;
         }
     }
+    if (nowCount == lastCount) {
+        return;
+    }
+    lastCount = nowCount;
+    if (!DYYYDiagOn()) {
+        return;
+    }
+    NSMutableString *line = [NSMutableString stringWithFormat:
+                             @"[imgcache] 限制已应用 总上限=%luMB 单图上限=%luMB 对象数=%lu 生效子缓存=%lu",
+                             (unsigned long)(DYYY_IMG_MEM_LIMIT_BYTES / 1048576ULL),
+                             (unsigned long)(DYYY_IMG_SINGLE_LIMIT_BYTES / 1048576ULL),
+                             (unsigned long)DYYY_IMG_COUNT_LIMIT, (unsigned long)nowCount];
+    [line appendFormat:@" | memoryCache=%@", DYYYImgCacheDescribe(mc)];
+    for (NSUInteger i = 0; i < subKeys.count; i++) {
+        id s = subs[i];
+        [line appendFormat:@" | %@=%@", subKeys[i],
+                          (s == [NSNull null]) ? @"nil" : DYYYImgCacheDescribe(s)];
+    }
+    DYYYSpeedDiag(line);
 }
 
 // 主路径：抖音每次给 config 赋值都在这里被压住。之后谁重建 config 都跑不掉。
@@ -15766,6 +15831,78 @@ static void DYYYImgCacheApplyLimit(void) {
 
 %end
 %end
+
+// 【v83】真正生效的那层：抖音直接给子缓存（NSCache 子类）设上限时也压住。
+// BDImageNSCache 是 defaultCache 的真实类；BDMemoryCache 是 BDWebImage 里同源的另一个名字。
+// 两个类各一个判断，存在才挂，避免某一版没有某个类把 import 连累崩掉。
+@interface BDImageNSCache : NSObject
+- (void)setTotalCostLimit:(NSUInteger)v;
+- (void)setCountLimit:(NSUInteger)v;
+@end
+
+@interface BDMemoryCache : NSObject
+- (void)setTotalCostLimit:(NSUInteger)v;
+- (void)setCountLimit:(NSUInteger)v;
+@end
+
+%group DYYYImgCacheNSCacheLimitGroup
+%hook BDImageNSCache
+
+// 事件驱动：这个缓存实例一被创建就把上限压上（大图/动图缓存是懒建的，
+// 靠定时复查有可能错过，建的时候直接压最稳，也不增加任何轮询开销）
+- (instancetype)init {
+    self = %orig;
+    if (self) {
+        DYYYImgCacheClampOne(self);
+    }
+    return self;
+}
+
+- (instancetype)initWithName:(NSString *)name {
+    self = %orig;
+    if (self) {
+        DYYYImgCacheClampOne(self);
+    }
+    return self;
+}
+
+- (void)setTotalCostLimit:(NSUInteger)v {
+    if (DYYYImgCacheLimitOn() && v > DYYY_IMG_MEM_LIMIT_BYTES) {
+        v = DYYY_IMG_MEM_LIMIT_BYTES;
+    }
+    %orig(v);
+}
+
+- (void)setCountLimit:(NSUInteger)v {
+    if (DYYYImgCacheLimitOn() && v > DYYY_IMG_COUNT_LIMIT) {
+        v = DYYY_IMG_COUNT_LIMIT;
+    }
+    %orig(v);
+}
+
+%end
+%end
+
+%group DYYYImgCacheBDMemoryLimitGroup
+%hook BDMemoryCache
+
+- (void)setTotalCostLimit:(NSUInteger)v {
+    if (DYYYImgCacheLimitOn() && v > DYYY_IMG_MEM_LIMIT_BYTES) {
+        v = DYYY_IMG_MEM_LIMIT_BYTES;
+    }
+    %orig(v);
+}
+
+- (void)setCountLimit:(NSUInteger)v {
+    if (DYYYImgCacheLimitOn() && v > DYYY_IMG_COUNT_LIMIT) {
+        v = DYYY_IMG_COUNT_LIMIT;
+    }
+    %orig(v);
+}
+
+%end
+%end
+
 
 // ---- Lynx 实例计数：只加/减，不做任何干预 ----
 static volatile int32_t dyyyLynxViewLive = 0;
@@ -15940,6 +16077,15 @@ static void DYYYDiagScheduleTick(int round) {
     Class imgCfgCls = objc_getClass("BDImageCacheConfig");
     if (imgCfgCls && class_getInstanceMethod(imgCfgCls, @selector(setMemorySizeLimit:))) {
         %init(DYYYImgCacheLimitGroup);
+    }
+    // 【v83】真正生效的那一层：子缓存自己的 setter + 初始化
+    Class imgNSCacheCls = objc_getClass("BDImageNSCache");
+    if (imgNSCacheCls && class_getInstanceMethod(imgNSCacheCls, @selector(setTotalCostLimit:))) {
+        %init(DYYYImgCacheNSCacheLimitGroup);
+    }
+    Class imgMemCacheCls = objc_getClass("BDMemoryCache");
+    if (imgMemCacheCls && class_getInstanceMethod(imgMemCacheCls, @selector(setTotalCostLimit:))) {
+        %init(DYYYImgCacheBDMemoryLimitGroup);
     }
     if (DYYYImgCacheLimitOn()) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
