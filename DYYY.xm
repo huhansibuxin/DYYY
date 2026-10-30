@@ -15896,12 +15896,11 @@ static BOOL DYYYNeuterOwnMethod(Class cls, const char *selName, const char **hit
 
 static __weak id dyyyAnyPool = nil;
 static volatile int32_t dyyyPoolSeen = 0;
-static volatile int32_t dyyyCreateDump = 0;
 
-// 用私有 SEL 直接读 WebKit 的进程计数 —— 注意这**只是单个池**的数字，
-// 真实验收看 DYYYCountWebContentProcs() 数出来的全系统 WebContent 进程数。
-static int DYYYCountWebContentProcs(void);   // 定义在下方 v92 段，前置声明
-
+// 用私有 SEL 直接读 WebKit 的进程计数 —— 注意这**只是单个池**的数字。
+// 【v93】删掉 v92 那个 sysctl(KERN_PROC_ALL) 的「全系统 WebContent 数」：
+//   实机返回 -1，App 沙盒根本不允许遍历系统进程表，那行诊断永远是废数。
+//   现在改成读「每个 WKWebView 自己的 WebContent pid」——这才是能对得上 CocoaTop 的证据。
 static void DYYYDumpWebProcessCount(NSString *tag) {
     id pool = dyyyAnyPool;
     if (!pool) {
@@ -15929,9 +15928,8 @@ static void DYYYDumpWebProcessCount(NSString *tag) {
         prewarmed = ((int32_t(*)(id, SEL))objc_msgSend)(pool, sPre);
     }
     DYYYSpeedDiag([NSString stringWithFormat:
-        @"[webview] 进程数(%@)：全系统WebContent=%d | 本池 WebProcess=%lu 页面=%lu 缓存=%lu 预热pid=%d",
-        tag, DYYYCountWebContentProcs(),
-        (unsigned long)total, (unsigned long)pages, (unsigned long)cache, (int)prewarmed]);
+        @"[webview] 进程数(%@)：本池 WebProcess=%lu 页面=%lu 缓存=%lu 预热pid=%d",
+        tag, (unsigned long)total, (unsigned long)pages, (unsigned long)cache, (int)prewarmed]);
 }
 
 // ============ v90 核心：把 5~6 个 WKProcessPool 合成 1 个（安全做法） ============
@@ -16099,40 +16097,12 @@ static void DYYYInstallConfigInitHook(void) {
     DYYYSpeedDiag(@"[webview] 已在 WKWebViewConfiguration init 处归并池（启动峰值也应为 1）");
 }
 
-// 【v92】真实全局进程数：遍历系统进程表，数名字含 WebContent 的进程。
-//
-// 为什么必须要有这个：`-[WKProcessPool _webProcessCount]` 是**单个池**的实例方法，
-//   只数「这个池自己」管的进程。v90/v91 归并之后，新 webview 全挂到池 A，
-//   池 A 自报 WebProcess=1 —— 但旧池 B/C/D/E 的进程只要有 webview 还连着就一个都不退，
-//   于是日志笑眯眯地写「1 个」，CocoaTop 里老老实实摆着 5 个。
-//   ⇒ 只有这张真实进程表才能作为验收标准，池自报的数字一律不可信。
-#include <sys/sysctl.h>
-
-static int DYYYCountWebContentProcs(void) {
-    int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
-    size_t size = 0;
-    if (sysctl(mib, 3, NULL, &size, NULL, 0) != 0 || size == 0) {
-        return -1;
-    }
-    struct kinfo_proc *buf = (struct kinfo_proc *)malloc(size);
-    if (!buf) {
-        return -1;
-    }
-    if (sysctl(mib, 3, buf, &size, NULL, 0) != 0) {
-        free(buf);
-        return -1;
-    }
-    int total = (int)(size / sizeof(struct kinfo_proc));
-    int hits = 0;
-    for (int i = 0; i < total; i++) {
-        const char *nm = buf[i].kp_proc.p_comm;
-        if (nm && strstr(nm, "WebContent")) {
-            hits++;
-        }
-    }
-    free(buf);
-    return hits;
-}
+// 【v93】`-[WKProcessPool _webProcessCount]` 只说「这个池自己」管几个进程，
+//   v90/v91 归并后它自报 1、CocoaTop 里却摆着 5 个 —— 所以验收口径改成
+//   **逐个 WKWebView 读它自己的 WebContent pid**（DYYYWebViewPID）。
+//   pid 是硬证据：同一个 pid 出现在两个 webview 上 = 真的共用了一个进程；
+//   建完就杀、几秒后再读 pid 变了 = 进程被重建（循环）；读回 0 = 进程已退。
+static int DYYYWebViewPID(id wv);
 
 // 【v92】copy 才是真正的拦截点。
 //
@@ -16441,6 +16411,278 @@ static void DYYYNoWebViewKillPreloadersRetry(void) {
 //   Logos 会把钩子挂到 NSObject 的 init 上，全 App 所有对象的 init 都受影响（v85 同款雷）。
 //   改成从 configuration 的只读 processPool 属性取实例 —— 零风险，也不需要 hook 池的任何方法。
 
+// ============ v93：吞掉「进程已死」通知 + 建完回收一次 + 反查真凶 ============
+//
+// 老板的问题（4 个空壳：3 WebContent + 1 Networking）：
+//   ① 再 kill 会不会又回到 15 秒循环？
+//   ② 为什么拦不住创建？到底系统建的还是抖音建的？
+//
+// ② 的答案（已核实）：抖音不在前台时 launchctl 里一个 WebContent/Networking 都没有
+//   ⇒ 不是系统常驻，是**抖音进程里的 WebKit 发起 XPC、launchd 执行 fork**。
+//   抖音建 5 个 config（各带一个新池），而我们改的 `_processPool` 只是 ObjC 缓存字段，
+//   WebKit 真正建 page 用的是 `_pageConfiguration` 那一层，所以"归并 8 次"只部分生效
+//   （5 个进程 → 3 个）。要彻底不建，只能掐抖音那个**调用点**。
+//
+// ① 的答案：上次 15 秒循环的根因是 WebProcessCache 回填（v89 已压 0 + 禁预热，实测循环消失）。
+//   剩下的唯一回填路径是「WebKit 把进程退出通知转给 delegate → 抖音收到后主动重建」。
+//   ⇒ 本版把这层通知**全部吞掉**，让抖音根本不知道进程已经不在了，它就不会重建。
+//
+// 安全边界：只碰 WKWebView **自身方法表**，只置空「通知转发器」（返回 void），
+//   不改任何对象状态、不碰池生命周期、不改 init 返回值。
+
+static int DYYYWebViewPID(id wv) {
+    if (!wv) {
+        return 0;
+    }
+    // 不同系统版本命名不同，按可信度从高到低试
+    const char *names[] = { "_processIdentifier", "_webProcessIdentifier", "_processIdentifierForTesting" };
+    for (int i = 0; i < 3; i++) {
+        SEL s = sel_registerName(names[i]);
+        if ([wv respondsToSelector:s]) {
+            int pid = ((int (*)(id, SEL))objc_msgSend)(wv, s);
+            if (pid > 0) {
+                return pid;
+            }
+        }
+    }
+    return 0;
+}
+
+// 吞掉所有「WebContent 进程已死 / 已退出 / 要重启」的通知转发方法。
+// 为什么这样做是安全的：这些方法只有一个作用 —— 通知 delegate（抖音）。
+//   把它们置空只是让抖音收不到"你的 webview 进程挂了"这条消息，
+//   不会让 WebKit 内部状态错乱（我们自己已经在回收，本来就不需要它上报）。
+static volatile BOOL dyyyDeathSwallowed = NO;
+
+static void DYYYSwallowProcessDeathNotifications(void) {
+    if (dyyyDeathSwallowed) {
+        return;
+    }
+    Class cls = objc_getClass("WKWebView");
+    if (!cls) {
+        return;
+    }
+    dyyyDeathSwallowed = YES;
+    unsigned int cnt = 0;
+    Method *list = class_copyMethodList(cls, &cnt);
+    if (!list) {
+        return;
+    }
+    NSMutableString *hits = [NSMutableString string];
+    int n = 0;
+    for (unsigned int i = 0; i < cnt; i++) {
+        const char *nm = sel_getName(method_getName(list[i]));
+        if (!nm) {
+            continue;
+        }
+        BOOL match = NO;
+        if (DYYYNameHasKeyword(nm, "ProcessDidTerminate")) {
+            match = YES;
+        } else if (DYYYNameHasKeyword(nm, "ProcessDidExit")) {
+            match = YES;
+        } else if (DYYYNameHasKeyword(nm, "ContentProcessDidTerminate")) {
+            match = YES;
+        } else if (DYYYNameHasKeyword(nm, "ProcessRelaunch")) {
+            match = YES;
+        }
+        if (!match) {
+            continue;
+        }
+        IMP imp = DYYYEmptyIMPForReturnType(method_getTypeEncoding(list[i]));
+        if (imp) {
+            method_setImplementation(list[i], imp);
+            n++;
+            if (hits.length < 420) {
+                [hits appendFormat:@"%s ", nm];
+            }
+        }
+    }
+    free(list);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 已吞掉 %d 个进程死亡通知：%@", n, hits]);
+    if (n == 0) {
+        DYYYSpeedDiag(@"[webview] 没找到进程死亡通知方法（名字对不上，抖音可能仍会被通知）");
+    }
+}
+
+// 把「会触发 WebKit 为 webview 实体化 page」的配置入口空转。
+// 依据：v85 崩溃栈证明 -[WKWebView setCustomUserAgent:] 会直接摸 WebPageProxy（+0x170 野指针），
+//   说明这条 setter 就会把 page 建起来。抖音建完 webview 必设 UA / inspectable，
+//   这是「没 load 也会起进程」的常见触发器。空转它不返回 nil、不改对象，安全。
+static void DYYYNeuterPageTouchingSetters(void) {
+    Class cls = objc_getClass("WKWebView");
+    if (!cls) {
+        return;
+    }
+    const char *setters[] = { "setCustomUserAgent:", "setInspectable:", "_setPageLoadStateObserver:" };
+    NSMutableString *hit = [NSMutableString string];
+    for (size_t i = 0; i < sizeof(setters) / sizeof(char *); i++) {
+        if (DYYYNeuterOwnMethod(cls, setters[i], NULL)) {
+            if (hit.length < 200) {
+                [hit appendFormat:@"%s ", setters[i]];
+            }
+        }
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 已空转 page 触发器：%@", hit.length ? hit : @"(无)"]);
+}
+
+static char kDYYYKilledKey;
+static volatile int32_t dyyyKillCount = 0;
+static volatile BOOL dyyyKillNoSel = NO;
+
+// 对本实例回收一次 WebContent 进程。
+// 每实例只做一次（关联对象打标），全局上限 12 次 —— 万一抖音还是重建，
+// 也不会变成「建→杀→建」的死循环，日志里能直接看出来。
+static void DYYYKillWebContentOnce(id wv) {
+    if (!DYYYNoWebViewOn() || !wv) {
+        return;
+    }
+    if (objc_getAssociatedObject(wv, &kDYYYKilledKey)) {
+        return;
+    }
+    int pidBefore = DYYYWebViewPID(wv);
+    if (pidBefore <= 0) {
+        // 这个 webview 压根没把 WebContent 拉起来（正是我们想要的结果）。
+        // 不打「已回收」标记，万一它后面真起了进程还能补一刀。
+        static volatile int32_t noPidLog = 0;
+        if (__sync_add_and_fetch(&noPidLog, 1) <= 8) {
+            DYYYSpeedDiag(@"[webview] 本实例没有 WebContent 进程（未起进程，无需回收）");
+        }
+        return;
+    }
+    objc_setAssociatedObject(wv, &kDYYYKilledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    int32_t n = __sync_add_and_fetch(&dyyyKillCount, 1);
+    if (n > 12) {
+        if (n == 13) {
+            DYYYSpeedDiag(@"[webview] 回收已达上限 12 次，停手（防建-杀死循环）");
+        }
+        return;
+    }
+
+    const char *names[2] = { "_killWebContentProcess", "_killWebContentProcessAndResetState" };
+    for (int i = 0; i < 2; i++) {
+        SEL sel = sel_registerName(names[i]);
+        if (![wv respondsToSelector:sel]) {
+            continue;
+        }
+        ((void (*)(id, SEL))objc_msgSend)(wv, sel);
+        // 顺手清一次进程缓存，确保被杀的位置不会被缓存立刻回填
+        if (dyyyAnyPool) {
+            SEL sClear = sel_registerName("_clearWebProcessCache");
+            if ([dyyyAnyPool respondsToSelector:sClear]) {
+                ((void (*)(id, SEL))objc_msgSend)(dyyyAnyPool, sClear);
+            }
+        }
+        DYYYSpeedDiag([NSString stringWithFormat:
+            @"[webview] 回收#%d pid=%d → 已 kill（%s），缓存已清", (int)n, pidBefore, names[i]]);
+
+        // pid 时间线：杀掉之后 4s / 18s / 38s 各读一次。
+        //   读完是 0 ⇒ 进程真退了、没回来；
+        //   读到新 pid ⇒ 被重建（说明通知没吞干净或还有别的路径）；
+        //   还是原 pid ⇒ kill 根本没生效。
+        __weak id weakWV = wv;
+        int32_t tag = n;
+        int basePid = pidBefore;
+        for (NSNumber *dtN in @[ @4.0, @18.0, @38.0 ]) {
+            double dtv = dtN.doubleValue;   // 捕获 double 值，不捕获循环变量
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(dtv * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                             int now = DYYYWebViewPID(weakWV);
+                             DYYYSpeedDiag([NSString stringWithFormat:
+                                 @"[webview] 回收#%d 后 %.0fs：pid %d → %d %@",
+                                 (int)tag, dtv, basePid, now,
+                                 now == 0 ? @"(已退出)" : (now == basePid ? @"(仍是原进程)" : @"(已重建!)")]);
+                           });
+        }
+        return;
+    }
+    if (!dyyyKillNoSel) {
+        dyyyKillNoSel = YES;
+        DYYYSpeedDiag(@"[webview] 本系统没有进程回收 SEL，回收层跳过");
+    }
+}
+
+// 【v93】地址反查真实方法名 —— 为「让抖音别调 WebKit」找出真正的调用点。
+// 背景：AwemeCore 是 698MB 的大家伙且符号被剥，callStackSymbols 里给的是伪符号
+//   （`AELogSystem::SetLogFileFuncCaller + 369208` 这种明显挂到了无关的导出符号上）。
+// 做法：把当前栈里的返回地址全收进来，遍历所有已注册类（含元类，覆盖类方法）的方法表，
+//   谁的 IMP 落在「候选地址 - 8KB ~ 候选地址」区间内，谁就是真正的调用者。
+// 只跑一次、放后台线程，慢几秒无所谓，换来的是**能直接点杀的类名 + 方法名**。
+static volatile BOOL dyyyResolvedCaller = NO;
+
+static void DYYYResolveCallerFromStack(void) {
+    if (dyyyResolvedCaller) {
+        return;
+    }
+    dyyyResolvedCaller = YES;
+
+    NSArray *addrs = [NSThread callStackReturnAddresses];
+    uintptr_t cand[8];
+    int nc = 0;
+    // 跳过第 0 帧（就是我们自己），其余取前 8 个落在 App 代码段（>4GB）的地址
+    for (NSUInteger i = 1; i < addrs.count && nc < 8; i++) {
+        uintptr_t a = (uintptr_t)[addrs[i] unsignedLongLongValue];
+        if (a > 0x100000000ULL) {
+            cand[nc++] = a;
+        }
+    }
+    if (nc == 0) {
+        DYYYSpeedDiag(@"[webview] 创建点反查：栈里没有可用地址");
+        return;
+    }
+
+    int count = objc_getClassList(NULL, 0);
+    if (count <= 0) {
+        return;
+    }
+    Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
+    if (!classes) {
+        return;
+    }
+    count = objc_getClassList(classes, count);
+
+    NSMutableString *found = [NSMutableString string];
+    for (int pass = 0; pass < 2 && found.length < 500; pass++) {
+        for (int i = 0; i < count && found.length < 500; i++) {
+            Class cls = (pass == 0) ? classes[i] : object_getClass(classes[i]);   // 第二遍查类方法
+            if (!cls) {
+                continue;
+            }
+            unsigned int mc = 0;
+            Method *mlist = class_copyMethodList(cls, &mc);
+            if (!mlist) {
+                continue;
+            }
+            for (unsigned int j = 0; j < mc; j++) {
+                uintptr_t imp = (uintptr_t)method_getImplementation(mlist[j]);
+                if (imp == 0) {
+                    continue;
+                }
+                for (int k = 0; k < nc; k++) {
+                    if (cand[k] >= imp && cand[k] - imp < 0x2000) {
+                        const char *sign = (pass == 0) ? "-" : "+";
+                        [found appendFormat:@"\n    → %s%s[%s %s] (+%lu)",
+                                            sign, sign, class_getName(classes[i]),
+                                            sel_getName(method_getName(mlist[j])),
+                                            (unsigned long)(cand[k] - imp)];
+                        if (found.length >= 500) {
+                            break;
+                        }
+                    }
+                }
+                if (found.length >= 500) {
+                    break;
+                }
+            }
+            free(mlist);
+        }
+    }
+    free(classes);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 创建点反查（%d 个候选地址）：%@",
+                                             nc, found.length ? found : @"(落在 C/C++ 函数里，非 ObjC 方法)"]);
+}
+
+
 %group DYYYNoWebViewGroup
 %hook WKWebView
 
@@ -16466,13 +16708,29 @@ static void DYYYNoWebViewKillPreloadersRetry(void) {
     if (DYYYNoWebViewOn() && ret) {
         DYYYNoWebViewLog(@"initWithFrame:configuration:");
         DYYYNoWebViewLogStack(@"initWithFrame:configuration:");
-        // 【v89】不 kill，只观察：建完 3 秒打一次真实进程数，用数据判断预热/缓存有没有被压住
-        if (__sync_add_and_fetch(&dyyyCreateDump, 1) <= 4) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                             DYYYDumpWebProcessCount(@"创建后3s");
-                           });
+        // 【v93】反查真正的创建点：callStackReturnAddresses 里拿返回地址，
+        //   再反查是哪个 ObjC 方法（不能用 callStackSymbols —— AwemeCore 698MB 且符号被剥，
+        //   那些 `AELogSystem...+369208` 全是假符号，偏移落到了完全无关的导出符号上）。
+        if (!dyyyResolvedCaller) {
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+              DYYYResolveCallerFromStack();
+            });
         }
+        // 【v93】2 秒后报本实例的 WebContent pid，然后回收它。
+        //   2 秒足够抖音做完它那套配置（load 已全拦、UA setter 也已空转），
+        //   这时它还没被真正用起来，回收安全；回收前先记 pid，作为「有没有被重建」的基准。
+        __weak id weakWV = ret;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+                         id wv = weakWV;
+                         if (!wv) {
+                             return;
+                         }
+                         int pid = DYYYWebViewPID(wv);
+                         DYYYSpeedDiag([NSString stringWithFormat:
+                             @"[webview] 建成 2s：本实例 WebContent pid=%d", pid]);
+                         DYYYKillWebContentOnce(wv);
+                       });
     }
     return ret;
 }
@@ -16605,6 +16863,14 @@ static void DYYYNoWebViewKillPreloadersRetry(void) {
             // 【v92】copy 是真正的拦截点：WKWebView 内部会用 copy 出来的 config，
             //   copy 过程中池会被重新处理，不在这里补一刀，前面的归并等于白做
             DYYYInstallConfigCopyHook();
+            // 【v93】两件必须做的事：
+            //   ① 吞掉「WebContent 进程已死」的全部通知转发 —— 抖音收不到就不会重建，
+            //      这是「kill 之后会不会又 15 秒循环」的根治点；
+            //   ② 空转会实体化 page 的配置入口（setCustomUserAgent: 等）——
+            //      v85 崩溃栈证明 setCustomUserAgent: 会直接摸 WebPageProxy，
+            //      它是「没 load 也起进程」的常见触发器。
+            DYYYSwallowProcessDeathNotifications();
+            DYYYNeuterPageTouchingSetters();
             DYYYNoWebViewKillPreloadersRetry();
             DYYYDumpProcessPoolSELs();
             // 【v89】定时打真实进程数：日志里直接看 WebProcess 数量，
@@ -16625,7 +16891,7 @@ static void DYYYNoWebViewKillPreloadersRetry(void) {
                                  DYYYNoWebViewKillPreloadersRetry();
                                });
             }
-            DYYYSpeedDiag(@"[webview] 已挂 v92 WebView 治理钩子（放行创建/禁加载/废预加载/禁预热/禁缓存/池归并含copy）");
+            DYYYSpeedDiag(@"[webview] 已挂 v93 WebView 治理钩子（禁加载/废预加载/禁预热/禁缓存/池归并/吞死通知/回收进程）");
         } else {
             DYYYSpeedDiag(@"[webview] WKWebView 类不存在，跳过");
         }
