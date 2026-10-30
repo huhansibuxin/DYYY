@@ -16026,11 +16026,25 @@ static void DYYYAdoptSharedPool(id configuration) {
     if (cur == dyyySharedPoolRef) {
         return;
     }
-    // object_setIvar 不做 ARC 内存管理，但 shared 池是 strong 静态引用、永不释放，安全。
-    object_setIvar(configuration, iv, dyyySharedPoolRef);
+    // 【v95 ⚠️ 这里绝对不能写 object_setIvar —— v94 就是死在这一行】
+    //
+    // v94 崩溃（Aweme-2026-10-30-182326.ips，EXC_BAD_ACCESS / KERN_INVALID_ADDRESS at 0x0，
+    //   崩在 objc_msgSend → lookUpImpOrForward，即「往一个 isa 已经被清掉的对象发消息」）：
+    //   `_processPool` 在 WKWebViewConfiguration 里是 **ARC/CF 托管的强引用 ivar**。
+    //   object_setIvar 只写指针、**不做 retain**，于是：
+    //     ① 被换下来的旧池永远拿不到那个 release（泄漏，无害）；
+    //     ② 新写进去的共享池**凭空多背了一次 release**（config dealloc 时会减引用）。
+    //   归并第 2 次之后共享池的引用计数就被减穿了 → 池被提前 dealloc
+    //   → 我们的 static 强引用变成野指针 → 下一次 WebKit 访问它就是 KERN_INVALID_ADDRESS。
+    //   ⇒ 只要往别人的托管 ivar 里写指针，就必须自己补一次 retain；但即便补上去，
+    //     v92 实机也早已证明**改 `_processPool` 对进程数毫无影响**（WebKit 建 page 用的是
+    //     私有 `_pageConfiguration`），所以这条路「有害且无用」，直接废弃。
+    //
+    // 现在这里只做只读观察，真正的「不创建」交给大家庭池容量钳制（DYYYClampPoolCapacities）。
     int32_t n = __sync_add_and_fetch(&dyyyPoolAdoptCount, 1);
-    if (n <= 8) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 池归并#%d（config 的池 → 共享池）", (int)n]);
+    if (n <= 4) {
+        DYYYSpeedDiag([NSString stringWithFormat:
+            @"[webview] 观察到第 %d 个独立池（只记录，不再改写 config）", (int)n]);
     }
 }
 
@@ -16761,6 +16775,18 @@ static void DYYYDumpPageConfiguration(id configuration) {
         DYYYSpeedDiag(@"[webview] 没有 _pageConfiguration 这个 ivar");
         return;
     }
+    // 【v95 ⚠️ 必须先看类型编码】v94 崩溃（Aweme-2026-10-30-182326.ips）的真凶就是下面这行：
+    //   `_pageConfiguration` 不是 ObjC 对象 ivar（类型是 `^{WKPageConfiguration=}` 之类的
+    //   C++ 指针，不是 `@`）。object_getIvar 对**强引用 ivar** 会做 retain，也就是对那个
+    //   C++ 指针当 ObjC 对象发消息 → objc_msgSend 打在野 isa 上 → lookUpImpOrForward 崩。
+    //   ⇒ 只有编码确实是 '@' 才敢读。
+    const char *pcEnc = ivar_getTypeEncoding(pcIvar);
+    if (!pcEnc || pcEnc[0] != '@') {
+        DYYYSpeedDiag([NSString stringWithFormat:
+            @"[webview] _pageConfiguration 不是 ObjC 对象（编码 %s），跳过读取（v94 就是崩在这）",
+            pcEnc ? pcEnc : "?"]);
+        return;
+    }
     id pc = object_getIvar(configuration, pcIvar);
     if (!pc) {
         DYYYSpeedDiag(@"[webview] _pageConfiguration 还是 nil（page 尚未建立）");
@@ -16826,6 +16852,128 @@ static void DYYYDumpPoolClassMethods(void) {
             free(mlist);
         }
         DYYYSpeedDiag(s);
+    }
+}
+
+
+// ============ v95：把抖音自己那几个 WebView 池的「容量」钳成 1 ============
+//
+// 为什么换到这一层（前面 v86~v94 全部打偏的原因）：
+//   · 拦 load / 废预加载 / 禁预热 / 禁缓存 —— 都拦不住「init 就要拉起 WebContent 进程」；
+//   · 合并进程池（改 config 的 _processPool）—— v92 实机证明无效（WebKit 建 page 用的是
+//     私有 _pageConfiguration），v94 证明还有害（写托管 ivar 不 retain → 池被减穿 → 闪退）。
+//   ⇒ 唯一既有效又不碰 WebKit 内部结构的办法：**别让它建那么多个**。
+//
+// v94 日志 dump 出来的池本体方法表给了现成的旋钮（这些是抖音自己的属性，改它们
+//   不会触犯任何 WebKit 不变量，也不会给业务返回 nil —— 池照样能建，只是最多 1 个）：
+//     AWEWebViewPool         : maxNumberOfInstances / setMaxNumberOfInstances: / needAddInstance
+//     IESLiveWebViewPool     : poolSize / setPoolSize:
+//     CSJWebViewPoolManager  : maxCount
+//   把 getter 钉成 1、setter 一律改成设 1 ⇒ 池最多持有 1 个 webview ⇒ 最多 1 个空壳进程。
+//
+// 刻意**不动** needAddInstance（把它置 NO 会让池永远不建新的，取货时可能拿到 nil，
+//   那就退回 v85 那种「拿到 nil 继续用」的崩溃路径）。池留 1 个是最安全的折中。
+
+static long DYYYImpReturnOne(id self, SEL _cmd) {
+    return 1;
+}
+
+typedef struct {
+    const char *sel;
+    IMP orig;
+} DYYYCapSetEntry;
+
+static DYYYCapSetEntry dyyyCapSetOrig[8];
+static volatile int dyyyCapSetCount = 0;
+
+// 所有被接管的 setter 共用一个实现：不管调用方传几，统统按 1 转给原实现。
+static void DYYYImpClampSet(id self, SEL _cmd, long ignored) {
+    const char *n = sel_getName(_cmd);
+    int cnt = dyyyCapSetCount;
+    for (int i = 0; i < cnt; i++) {
+        if (dyyyCapSetOrig[i].sel && strcmp(dyyyCapSetOrig[i].sel, n) == 0) {
+            if (dyyyCapSetOrig[i].orig) {
+                ((void (*)(id, SEL, long))dyyyCapSetOrig[i].orig)(self, _cmd, 1);
+            }
+            return;
+        }
+    }
+}
+
+// 在 cls 自身方法表里找 name（只找自己的，避免挂到父类 —— v85/v87 同款陷阱）
+static Method DYYYOwnMethod(Class cls, const char *name) {
+    unsigned int cnt = 0;
+    Method *list = class_copyMethodList(cls, &cnt);
+    if (!list) {
+        return NULL;
+    }
+    Method hit = NULL;
+    for (unsigned int i = 0; i < cnt; i++) {
+        const char *n = sel_getName(method_getName(list[i]));
+        if (n && strcmp(n, name) == 0) {
+            hit = list[i];
+            break;
+        }
+    }
+    free(list);
+    return hit;
+}
+
+static void DYYYClampOneCapacity(Class cls, const char *getter, const char *setter) {
+    int done = 0;
+    Method g = DYYYOwnMethod(cls, getter);
+    if (g) {
+        const char *enc = method_getTypeEncoding(g);
+        if (enc && enc[0] != '@' && enc[0] != '{' && enc[0] != 'v') {
+            method_setImplementation(g, (IMP)DYYYImpReturnOne);
+            done = 1;
+        }
+    }
+    if (setter) {
+        Method s = DYYYOwnMethod(cls, setter);
+        if (s) {
+            const char *enc = method_getTypeEncoding(s);
+            // 形如 v24@0:8q16 —— 确认返回值 void 且只有一个整型参数
+            if (enc && enc[0] == 'v') {
+                IMP prev = method_getImplementation(s);
+                if (dyyyCapSetCount < 8) {
+                    dyyyCapSetOrig[dyyyCapSetCount].sel = setter;
+                    dyyyCapSetOrig[dyyyCapSetCount].orig = prev;
+                    dyyyCapSetCount++;
+                }
+                method_setImplementation(s, (IMP)DYYYImpClampSet);
+                done = 1;
+            }
+        }
+    }
+    if (done) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 已钳 %s 的 %s = 1",
+                                                 class_getName(cls), getter]);
+    }
+}
+
+static volatile BOOL dyyyCapClamped = NO;
+
+// 幂等：池类可能晚于 %ctor 注册，多个时间点重复调是安全的（只装一次的靠 dyyyCapClamped 不是必须的，
+//   因为 method_setImplementation 重复装同一实现是幂等的）。
+static void DYYYClampPoolCapacities(void) {
+    struct { const char *cls; const char *getter; const char *setter; } items[] = {
+        { "AWEWebViewPool",        "maxNumberOfInstances", "setMaxNumberOfInstances:" },
+        { "IESLiveWebViewPool",    "poolSize",             "setPoolSize:" },
+        { "CSJWebViewPoolManager", "maxCount",             "setMaxCount:" },
+    };
+    int hit = 0;
+    for (size_t i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
+        Class cls = objc_getClass(items[i].cls);
+        if (!cls) {
+            continue;
+        }
+        DYYYClampOneCapacity(cls, items[i].getter, items[i].setter);
+        hit++;
+    }
+    if (!dyyyCapClamped) {
+        dyyyCapClamped = YES;
+        DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 池容量钳制完成：见到 %d 个池类（容量一律 1）", hit]);
     }
 }
 
@@ -17029,6 +17177,9 @@ static void DYYYDumpPoolClassMethods(void) {
             DYYYNoWebViewKillPreloadersRetry();
             DYYYDumpProcessPoolSELs();
             DYYYDumpPoolClassMethods();   // 【v94】池本体真实方法名（下版点杀取货入口）
+            // 【v95】真正的「不创建」：把抖音自己的 WebView 池容量钳成 1。
+            //   池类注册晚于 %ctor，所以和预加载一样分档重试（幂等，重复装无害）。
+            DYYYClampPoolCapacities();
             // 【v89】定时打真实进程数：日志里直接看 WebProcess 数量，
             //   不用再靠 CocoaTop 数进程。v91 加了 3s/10s，专门盯启动峰值。
             for (NSNumber *dt in @[ @3.0, @10.0, @30.0, @90.0 ]) {
@@ -17045,9 +17196,10 @@ static void DYYYDumpPoolClassMethods(void) {
                                              (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), ^{
                                  DYYYNoWebViewKillPreloadersRetry();
+                                 DYYYClampPoolCapacities();   // 【v95】池类可能是之后才注册的
                                });
             }
-            DYYYSpeedDiag(@"[webview] 已挂 v94 WebView 治理钩子（禁加载/废预加载/禁预热/禁缓存/吞死通知/只回收启动批/摊开_pageConfiguration）");
+            DYYYSpeedDiag(@"[webview] 已挂 v95 WebView 治理钩子（禁加载/废预加载/禁预热/禁缓存/吞死通知/只回收启动批/池容量钳到1，已废弃改 config 池）");
         } else {
             DYYYSpeedDiag(@"[webview] WKWebView 类不存在，跳过");
         }
