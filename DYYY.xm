@@ -15692,11 +15692,153 @@ static void DYYYImgCacheApplyLimit(void) {
 
 
 
+// ================= 【v85】彻底禁用 WebView =================
+// 实测依据（AwemeCore 二进制 + CocoaTop）：
+//   `WKProcessPool` 命中 4 次 ⇒ 抖音显式分了 4 个渲染进程池，于是常驻 4 个
+//   com.apple.WebKit.WebContent 进程（69.4 + 19.8 + 19.5 + 19.7 MB ≈ 130MB）。
+// 谁在建：AWEWebViewPool / AWEWebViewPreloadManager / AWEWebViewPrefetchManager /
+//   AWEAdWebViewPreloadAdapter（_feedAdWebViewPreloadDict、_searchAdWebViewPreloadDict、
+//   _liveAdWebViewPreloadDict 三套广告落地页预加载）/ CSJWebViewPoolManager（穿山甲）/
+//   BDWebViewPreloadManager / IESLiveWebViewPool / BDPWKGameWebviewPreloadManager。
+//   ⇒ 不是用户点网页，是**提前把广告落地页渲染进程起好**，防白屏掉转化。
+//
+// 本机用途只是看视频、付款走极速版 ⇒ 这些 WebView 一律没用，直接掐死。
+// 做法：WKWebView 的所有 init 直接返回 nil（连进程都不给它起），
+//   再补一层 load* 拦截（万一有绕过 init 的实例，也绝不加载内容）。
+// 附带保险：DK 容器常见写法 `[view addSubview:webView]`，webView 为 nil 会抛
+//   NSInvalidArgumentException，所以给 UIView 的 addSubview/insertSubview 加 nil 兜底。
+
+@interface WKWebView : UIView
+- (instancetype)initWithFrame:(CGRect)frame configuration:(id)configuration;
+- (instancetype)initWithCoder:(NSCoder *)coder;
+- (id)loadRequest:(id)request;
+- (id)loadHTMLString:(NSString *)string baseURL:(NSURL *)baseURL;
+- (id)loadFileURL:(NSURL *)URL allowingReadAccessToURL:(NSURL *)readAccessURL;
+- (id)loadData:(NSData *)data MIMEType:(NSString *)MIMEType
+    characterEncodingName:(NSString *)characterEncodingName baseURL:(NSURL *)baseURL;
+@end
+
+static BOOL DYYYNoWebViewOn(void) {
+    return DYYYGetBool(@"DYYYDisableWebView");
+}
+
+static volatile int32_t dyyyWebViewBlocked = 0;
+
+// 只记前 12 次（callStackSymbols 不便宜），带调用方类名，方便核对是哪个 manager 在建
+static void DYYYNoWebViewLog(NSString *what) {
+    if (!DYYYDiagOn()) {
+        return;
+    }
+    int32_t n = __sync_add_and_fetch(&dyyyWebViewBlocked, 1);
+    if (n > 12) {
+        return;
+    }
+    NSString *caller = @"?";
+    for (NSString *line in [NSThread callStackSymbols]) {
+        if ([line containsString:@"DYYY"]) {
+            continue;
+        }
+        if ([line containsString:@"WKWebView"] || [line containsString:@"WebKit"]) {
+            continue;
+        }
+        BOOL hit = NO;
+        for (NSString *kw in @[ @"AWE", @"CSJ", @"BDP", @"IES", @"Puzzle", @"Aweme", @"BDWebView" ]) {
+            if ([line containsString:kw]) {
+                hit = YES;
+                break;
+            }
+        }
+        if (hit) {
+            caller = line;
+            break;
+        }
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 拦截#%d %@ 调用方=%@", (int)n, what, caller]);
+}
+
+%group DYYYNoWebViewGroup
+%hook WKWebView
+
+- (instancetype)initWithFrame:(CGRect)frame configuration:(id)configuration {
+    if (DYYYNoWebViewOn()) {
+        DYYYNoWebViewLog(@"initWithFrame:configuration:");
+        return nil;
+    }
+    return %orig;
+}
+
+- (instancetype)initWithCoder:(NSCoder *)coder {
+    if (DYYYNoWebViewOn()) {
+        DYYYNoWebViewLog(@"initWithCoder:");
+        return nil;
+    }
+    return %orig;
+}
+
+// 双保险：即使有实例漏网，也不让它加载任何内容
+- (id)loadRequest:(id)request {
+    if (DYYYNoWebViewOn()) {
+        return nil;
+    }
+    return %orig;
+}
+
+- (id)loadHTMLString:(NSString *)string baseURL:(NSURL *)baseURL {
+    if (DYYYNoWebViewOn()) {
+        return nil;
+    }
+    return %orig;
+}
+
+- (id)loadFileURL:(NSURL *)URL allowingReadAccessToURL:(NSURL *)readAccessURL {
+    if (DYYYNoWebViewOn()) {
+        return nil;
+    }
+    return %orig;
+}
+
+- (id)loadData:(NSData *)data
+        MIMEType:(NSString *)MIMEType
+    characterEncodingName:(NSString *)characterEncodingName
+           baseURL:(NSURL *)baseURL {
+    if (DYYYNoWebViewOn()) {
+        return nil;
+    }
+    return %orig;
+}
+
+%end
+%end
+
+// nil 兜底：容器把 nil 的 webView 塞进视图层级时不要抛异常
+%group DYYYNilSubviewGuardGroup
+%hook UIView
+
+- (void)addSubview:(UIView *)view {
+    if (!view) {
+        DYYYNoWebViewLog(@"addSubview:nil 已忽略");
+        return;
+    }
+    %orig;
+}
+
+- (void)insertSubview:(UIView *)view atIndex:(NSInteger)index {
+    if (!view) {
+        DYYYNoWebViewLog(@"insertSubview:nil 已忽略");
+        return;
+    }
+    %orig;
+}
+
+%end
+%end
+
 %ctor {
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
         @"DYYYKeepNowPlayingInBackground" : @YES,
         @"DYYYDiagLog" : @YES,
-        @"DYYYLimitImageCache" : @YES
+        @"DYYYLimitImageCache" : @YES,
+        @"DYYYDisableWebView" : @YES
     }];
     // 老版本遗留开关值清掉（该功能已移除，留着只会在设置页/调试时造成困惑）
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"DYYYDisableFeedNowPlayingInfo"];
@@ -15734,6 +15876,20 @@ static void DYYYImgCacheApplyLimit(void) {
                        dispatch_get_main_queue(), ^{
                          DYYYImgCacheApplyLimit();
                        });
+    }
+
+    // 【v85】彻底禁用 WebView：先把 WebKit 逼出来（抖音若还没用上它，类就不存在，
+    // 钩子会落空；这里是系统共享缓存，dlopen 代价极低），再挂钩子。
+    if (DYYYNoWebViewOn()) {
+        dlopen("/System/Library/Frameworks/WebKit.framework/WebKit", RTLD_NOW | RTLD_GLOBAL);
+        Class wkCls = objc_getClass("WKWebView");
+        if (wkCls) {
+            %init(DYYYNoWebViewGroup);
+            %init(DYYYNilSubviewGuardGroup);
+            DYYYSpeedDiag(@"[webview] 已挂 WKWebView 禁用钩子");
+        } else {
+            DYYYSpeedDiag(@"[webview] WKWebView 类不存在，跳过");
+        }
     }
 
     Class interactionBaseLabelClass = objc_getClass("AWECommentSwiftBizUI.CommentInteractionBaseLabel");
