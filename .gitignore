@@ -5,3 +5,14 @@ Aweme
 Makefile.local
 headers
 .vscode/
+
+# 编译产物下载目录（每版一个，体积大，不进仓库）
+ci-v*/
+# 从设备拉下来的 plist / 二进制（个人数据，不进仓库）
+_prefs/
+aweme_prefs.plist
+device_dyyy.dylib
+# 临时脚本与片段
+_check.py
+_verify_bin.py
+_v7*.txt

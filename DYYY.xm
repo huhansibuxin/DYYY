@@ -15447,6 +15447,7 @@ static void findTargetViewInView(UIView *view) {
 // 看日志：搜 [mem] / [imgcache] / [lynx] / [card] 四个前缀。
 // ============================================================================
 #include <mach/mach.h>
+#include <malloc/malloc.h>
 #include <mach/task_info.h>
 
 static unsigned long long DYYYDiagPhysFootprint(void) {
@@ -15457,6 +15458,70 @@ static unsigned long long DYYYDiagPhysFootprint(void) {
         return 0;
     }
     return (unsigned long long)info.phys_footprint;
+}
+
+// 【v82】把 phys_footprint 拆成机器口径的四个桶，直接看出增长落在哪：
+//   internal   = malloc 堆（App 自己 new 出来的对象/缓冲）
+//   iokit      = IOSurface（视频解码帧、GPU 纹理）
+//   external   = vm_allocate/Graphics（图片解码后的像素、大块匿名映射）
+//   compressed = 已被系统压缩的部分（越大说明越吃紧，压缩/解压本身耗 CPU）
+#define DYYY_MB(x) ((double)(x) / 1048576.0)
+static NSString *DYYYDiagVMBuckets(void) {
+    task_vm_info_data_t info;
+    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    kern_return_t kr = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &cnt);
+    if (kr != KERN_SUCCESS) {
+        return @"(task_info 失败)";
+    }
+    return [NSString stringWithFormat:@"fp=%.1f internal=%.1f iokit=%.1f external=%.1f comp=%.1f altComp=%.1f",
+                                      DYYY_MB(info.phys_footprint), DYYY_MB(info.internal),
+                                      DYYY_MB(info.iokit_mapped), DYYY_MB(info.external),
+                                      DYYY_MB(info.compressed), DYYY_MB(info.alternate_accounting_compressed)];
+}
+
+// 【v82】malloc zone 逐个统计：internal 那几百 MB 到底在哪个 zone 里。
+// 抖音塞了很多三方库，各自可能注册独立 zone（Gigacage/JS/视频/图片…），只有列出来才知道该动谁。
+// 全部走 dlsym，符号不存在的系统上只返回 nil，不崩。
+static NSString *DYYYDiagMallocZones(void) {
+    typedef void (*DYYYGetAllZonesFn)(task_t, void *, vm_address_t **, unsigned *);
+    typedef void (*DYYYZoneStatFn)(malloc_zone_t *, malloc_statistics_t *);
+    static DYYYGetAllZonesFn getZones = NULL;
+    static DYYYZoneStatFn zoneStat = NULL;
+    static BOOL looked = NO;
+    if (!looked) {
+        looked = YES;
+        getZones = (DYYYGetAllZonesFn)dlsym(RTLD_DEFAULT, "malloc_get_all_zones");
+        zoneStat = (DYYYZoneStatFn)dlsym(RTLD_DEFAULT, "malloc_zone_statistics");
+    }
+    if (!getZones || !zoneStat) {
+        return @"(设备不支持 zone 统计)";
+    }
+    vm_address_t *zones = NULL;
+    unsigned int count = 0;
+    getZones(mach_task_self(), NULL, &zones, &count);
+    if (!zones || count == 0) {
+        return @"(取不到 zone 表)";
+    }
+    NSMutableString *out = [NSMutableString string];
+    double total = 0;
+    for (unsigned int i = 0; i < count; i++) {
+        malloc_zone_t *z = (malloc_zone_t *)zones[i];
+        if (!z) {
+            continue;
+        }
+        malloc_statistics_t st;
+        memset(&st, 0, sizeof(st));
+        zoneStat(z, &st);
+        double mb = DYYY_MB(st.size_in_use);
+        total += mb;
+        if (mb < 2.0) {   // 小于 2MB 的不列，免得一行刷屏
+            continue;
+        }
+        const char *name = z->zone_name ? z->zone_name : "(无名)";
+        [out appendFormat:@"%s=%.1fM ", name, mb];
+    }
+    [out appendFormat:@"| 合计=%.1fM zones=%u", total, count];
+    return out;
 }
 
 // 把任意对象的属性表 + 当前值拼成一行（只读，全部 @try 兜住）。
@@ -15563,6 +15628,7 @@ static void DYYYDiagDumpImageCache(NSString *tag) {
         mc = nil;
     }
     if (mc) {
+        [stat appendFormat:@"mcCls=%@ ", NSStringFromClass([mc class])];
         for (NSString *s in @[ @"totalCost", @"totalCount", @"totalCostLimit", @"countLimit", @"ageLimit" ]) {
             unsigned long long v = 0;
             if (DYYYDiagCallULL(mc, s, &v)) {
@@ -15631,6 +15697,14 @@ static void DYYYImgCacheApplyLimit(void) {
     if ([mc respondsToSelector:cntSel]) {
         ((void(*)(id, SEL, NSUInteger))objc_msgSend)(mc, cntSel, DYYY_IMG_COUNT_LIMIT);
     }
+    // 【v82】上面两条 respondsToSelector 在 v81 实测里没设上（打出来 totalCostLimit=0）。
+    //   再加一层 KVC 兜底：NSCache 系的 totalCostLimit/countLimit 是标准属性，KVC 一定能找到 setter 或 ivar。
+    @try {
+        [mc setValue:@(DYYY_IMG_MEM_LIMIT_BYTES) forKey:@"totalCostLimit"];
+        [mc setValue:@(DYYY_IMG_COUNT_LIMIT) forKey:@"countLimit"];
+    } @catch (__unused NSException *e) {
+        // 取不到就保持原样，绝不因为压缓存把 App 搞崩
+    }
 
     // 只在真正生效后的第一轮打一行，方便核对；之后静默
     static BOOL logged = NO;
@@ -15642,11 +15716,14 @@ static void DYYYImgCacheApplyLimit(void) {
             DYYYDiagCallULL(mc, @"totalCostLimit", &costLimit);
             DYYYSpeedDiag([NSString stringWithFormat:
                                           @"[imgcache] 限制已应用 总上限=%lluMB 单图上限=%lluMB 对象数=%llu "
-                                          @"| 当前 totalCost=%.1fMB totalCostLimit=%.1fMB",
+                                          @"| 当前 totalCost=%.1fMB totalCostLimit=%.1fMB mcCls=%@",
                                           (unsigned long long)(DYYY_IMG_MEM_LIMIT_BYTES / 1048576ULL),
                                           (unsigned long long)(DYYY_IMG_SINGLE_LIMIT_BYTES / 1048576ULL),
                                           (unsigned long long)DYYY_IMG_COUNT_LIMIT,
-                                          (double)cost / 1048576.0, (double)costLimit / 1048576.0]);
+                                          (double)cost / 1048576.0, (double)costLimit / 1048576.0,
+                                          NSStringFromClass([mc class])]);
+            DYYYSpeedDiag([NSString stringWithFormat:@"[imgcache] memoryCache 属性表 %@",
+                                                     DYYYDiagPropsOf(mc, 900)]);
         }
     }
 }
@@ -15806,11 +15883,10 @@ static void DYYYDiagTick(int round) {
         return;
     }
     unsigned long long fp = DYYYDiagPhysFootprint();
-    DYYYSpeedDiag([NSString stringWithFormat:@"[mem] #%d footprint=%.1fMB lynxLive=%d lynxTotal=%d bgLive=%d bgTotal=%d 样本=%d",
-                   round, (double)fp / 1048576.0,
-                   (int)dyyyLynxViewLive, (int)dyyyLynxViewTotal,
-                   (int)dyyyLynxBgLive, (int)dyyyLynxBgTotal,
-                   (int)dyyyCardSamples]);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[mem] #%d footprint=%.1fMB 样本=%d", round,
+                                             (double)fp / 1048576.0, (int)dyyyCardSamples]);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[mem] #%d %@", round, DYYYDiagVMBuckets()]);
+    DYYYSpeedDiag([NSString stringWithFormat:@"[zone] #%d %@", round, DYYYDiagMallocZones()]);
     // 图片缓存：首采必测，之后每 2 分钟测一次（属性表较长，别刷屏）
     if (round == 1 || (round % 4) == 1) {
         DYYYDiagDumpImageCache([NSString stringWithFormat:@"#%d", round]);
