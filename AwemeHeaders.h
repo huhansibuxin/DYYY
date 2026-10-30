@@ -194,25 +194,6 @@ typedef NS_ENUM(NSUInteger, DYEdgeMode) {
 @property(nonatomic, strong) id storyGroup;       // 所属日常分组（非 nil 即属于日常）
 @property(nonatomic, strong) id story25Group;     // 2.5 版日常分组
 @property(nonatomic, strong) id storyCreationID;  // 创建日常时带的 id（非 nil）
-// 【v80】Lynx 卡片类字段 —— 同样来自实机 dump 的属性表（1316 个属性里逐个确认存在）。
-// 这些就是推荐流里「不是视频、而是 Lynx 渲染出来的卡片」的入口：非 nil / 为 YES 即代表这条内容
-// 要走 Lynx 渲染管线（每个 LynxView 自带一个 JS 运行时，单个实例常驻十几到几十 MB）。
-// v80 只做命中统计，不参与任何过滤决策。
-@property(nonatomic, strong) id ecFeedGoodsCardModel;   // 电商商品卡
-@property(nonatomic, assign) BOOL hasEcomGoodsCard;     // 电商卡标记
-@property(nonatomic, strong) id dCardModel;             // 商业化/活动卡
-@property(nonatomic, strong) id guideTipCardModel;      // 引导卡
-@property(nonatomic, strong) id nicolCardModel;         // 推荐引导卡
-@property(nonatomic, strong) id nearbyCardModel;        // 同城卡
-@property(nonatomic, strong) id nearbyLynxCardSchema;   // 同城 Lynx 卡 schema
-@property(nonatomic, strong) id grouponLargeCard;       // 团购大卡
-@property(nonatomic, strong) id poiMallCard;            // POI 商城卡
-@property(nonatomic, strong) id poiShopCard;            // POI 店铺卡
-@property(nonatomic, strong) id fallCardModel;          // 兜底卡
-@property(nonatomic, strong) id hangoutCard;            // 休闲/娱乐卡
-@property(nonatomic, assign) BOOL isInsertCard;         // 插入卡
-@property(nonatomic, assign) BOOL isDeepQACard;         // 问答卡
-@property(nonatomic, assign) BOOL isRecommendUserCard;  // 推荐用户卡
 @property(nonatomic, assign) BOOL isShowLandscapeEntryView;
 - (BOOL)isLive;
 - (BOOL)contentFilter;

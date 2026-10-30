@@ -10946,7 +10946,6 @@ static NSHashTable *processedParentViews = nil;
 
 %new
 - (BOOL)contentFilter {
-    DYYYDiagCardProbe(self);   // 【v80】只做卡片字段命中统计，不参与下面任何判断
     BOOL noAds = DYYYGetBool(@"DYYYNoAds");
     BOOL skipAllLive = DYYYGetBool(@"DYYYSkipAllLive");
     BOOL skipHotSpot = DYYYGetBool(@"DYYYSkipHotSpot");
@@ -15434,224 +15433,6 @@ static void findTargetViewInView(UIView *view) {
 // 另注：崩溃栈恰好说明 beginReceivingRemoteControlEvents 内部会调它 —— 那是系统【启用】
 //   远程控制（传 1），并不是撤身份，本来就不是我们要拦的目标。
 
-// ============================================================================
-// 【v80】内存诊断（只测量，零行为改动）
-// 起因：老板要省内存，但「Lynx 卡片」和「图片内存缓存」各占多少是未知数，先测再动。
-// 本区块【不拦截、不过滤、不清理、不改任何既有行为】，只输出四类测量值，
-// 全部走 DYYYSpeedDiag（同一个日志开关，开关一关连拼接都不求值）：
-//   ① [mem]      进程 phys_footprint（与 ltop 的 phys_footprint 同口径，单位 MB）
-//   ② [imgcache] BDImageCache 单例统计 + BDImageCacheConfig 属性表（看内存上限到底设了多少）
-//   ③ [lynx]     LynxView / LynxBackgroundRuntime 存活数 + 累计创建数
-//   ④ [card]     推荐流里 18 项卡片字段的命中计数（每 40 条模型汇总一行）
-// 采样节奏：启动 10s 后第一发，之后每 30s 一发，最多 20 发（约 10 分钟）自动停，不常驻。
-// 看日志：搜 [mem] / [imgcache] / [lynx] / [card] 四个前缀。
-// ============================================================================
-#include <mach/mach.h>
-#include <malloc/malloc.h>
-#include <mach/task_info.h>
-
-static unsigned long long DYYYDiagPhysFootprint(void) {
-    task_vm_info_data_t info;
-    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
-    kern_return_t kr = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &cnt);
-    if (kr != KERN_SUCCESS) {
-        return 0;
-    }
-    return (unsigned long long)info.phys_footprint;
-}
-
-// 【v82】把 phys_footprint 拆成机器口径的四个桶，直接看出增长落在哪：
-//   internal   = malloc 堆（App 自己 new 出来的对象/缓冲）
-//   iokit      = IOSurface（视频解码帧、GPU 纹理）
-//   external   = vm_allocate/Graphics（图片解码后的像素、大块匿名映射）
-//   compressed = 已被系统压缩的部分（越大说明越吃紧，压缩/解压本身耗 CPU）
-#define DYYY_MB(x) ((double)(x) / 1048576.0)
-static NSString *DYYYDiagVMBuckets(void) {
-    task_vm_info_data_t info;
-    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
-    kern_return_t kr = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &cnt);
-    if (kr != KERN_SUCCESS) {
-        return @"(task_info 失败)";
-    }
-    // ⚠️ 只能用 TASK_VM_INFO_REV0 的字段：Theos 自带 SDK 的 task_vm_info 是老的，
-    //    iokit_mapped / alternate_accounting_compressed（REV3/REV4）编译期就不存在。
-    //    差值法代替：fp - internal - external - compressed ≈ iokit(IOSurface) + 其他
-    double fp = DYYY_MB(info.phys_footprint);
-    double in = DYYY_MB(info.internal);
-    double ex = DYYY_MB(info.external);
-    double cp = DYYY_MB(info.compressed);
-    return [NSString stringWithFormat:@"fp=%.1f internal=%.1f external=%.1f comp=%.1f 其余≈%.1f",
-                                      fp, in, ex, cp, fp - in - ex - cp];
-}
-
-// 【v82】malloc zone 逐个统计：internal 那几百 MB 到底在哪个 zone 里。
-// 抖音塞了很多三方库，各自可能注册独立 zone（Gigacage/JS/视频/图片…），只有列出来才知道该动谁。
-// 全部走 dlsym，符号不存在的系统上只返回 nil，不崩。
-static NSString *DYYYDiagMallocZones(void) {
-    typedef void (*DYYYGetAllZonesFn)(task_t, void *, vm_address_t **, unsigned *);
-    typedef void (*DYYYZoneStatFn)(malloc_zone_t *, malloc_statistics_t *);
-    static DYYYGetAllZonesFn getZones = NULL;
-    static DYYYZoneStatFn zoneStat = NULL;
-    static BOOL looked = NO;
-    if (!looked) {
-        looked = YES;
-        getZones = (DYYYGetAllZonesFn)dlsym(RTLD_DEFAULT, "malloc_get_all_zones");
-        zoneStat = (DYYYZoneStatFn)dlsym(RTLD_DEFAULT, "malloc_zone_statistics");
-    }
-    if (!getZones || !zoneStat) {
-        return @"(设备不支持 zone 统计)";
-    }
-    vm_address_t *zones = NULL;
-    unsigned int count = 0;
-    getZones(mach_task_self(), NULL, &zones, &count);
-    if (!zones || count == 0) {
-        return @"(取不到 zone 表)";
-    }
-    NSMutableString *out = [NSMutableString string];
-    double total = 0;
-    for (unsigned int i = 0; i < count; i++) {
-        malloc_zone_t *z = (malloc_zone_t *)zones[i];
-        if (!z) {
-            continue;
-        }
-        malloc_statistics_t st;
-        memset(&st, 0, sizeof(st));
-        zoneStat(z, &st);
-        double mb = DYYY_MB(st.size_in_use);
-        total += mb;
-        if (mb < 2.0) {   // 小于 2MB 的不列，免得一行刷屏
-            continue;
-        }
-        const char *name = z->zone_name ? z->zone_name : "(无名)";
-        [out appendFormat:@"%s=%.1fM ", name, mb];
-    }
-    [out appendFormat:@"| 合计=%.1fM zones=%u", total, count];
-    return out;
-}
-
-// 把任意对象的属性表 + 当前值拼成一行（只读，全部 @try 兜住）。
-// 用途：BDImageCacheConfig 这类 SDK 对象的属性名不同版本会变，静态分析拿不到，只能运行时反射。
-static NSString *DYYYDiagPropsOf(id obj, NSUInteger maxLen) {
-    if (!obj) {
-        return @"(nil)";
-    }
-    NSMutableString *out = [NSMutableString string];
-    Class cls = [obj class];
-    int depth = 0;
-    while (cls && cls != [NSObject class] && depth < 4) {
-        unsigned int count = 0;
-        objc_property_t *props = class_copyPropertyList(cls, &count);
-        for (unsigned int i = 0; i < count; i++) {
-            const char *name = property_getName(props[i]);
-            if (!name) {
-                continue;
-            }
-            NSString *key = [NSString stringWithUTF8String:name];
-            id val = nil;
-            @try {
-                val = [obj valueForKey:key];
-            } @catch (__unused NSException *e) {
-                val = @"<抛异常>";
-            }
-            if ([val isKindOfClass:[NSNumber class]] || [val isKindOfClass:[NSString class]]) {
-                [out appendFormat:@"%@=%@ ", key, val];
-            } else if (val) {
-                [out appendFormat:@"%@=<%@> ", key, NSStringFromClass([val class])];
-            } else {
-                [out appendFormat:@"%@=nil ", key];
-            }
-            if (out.length > maxLen) {
-                [out appendString:@"...(已截断)"];
-                free(props);
-                return out;
-            }
-        }
-        free(props);
-        cls = class_getSuperclass(cls);
-        depth++;
-    }
-    return out.length ? out : @"(无属性)";
-}
-
-static id DYYYDiagCallObj(id obj, NSString *selName) {
-    if (!obj || selName.length == 0) {
-        return nil;
-    }
-    SEL sel = NSSelectorFromString(selName);
-    if (!sel || ![obj respondsToSelector:sel]) {
-        return nil;
-    }
-    id (*fn)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
-    return fn(obj, sel);
-}
-
-static BOOL DYYYDiagCallULL(id obj, NSString *selName, unsigned long long *out) {
-    if (!obj || selName.length == 0) {
-        return NO;
-    }
-    SEL sel = NSSelectorFromString(selName);
-    if (!sel || ![obj respondsToSelector:sel]) {
-        return NO;
-    }
-    unsigned long long (*fn)(id, SEL) = (unsigned long long (*)(id, SEL))objc_msgSend;
-    unsigned long long v = fn(obj, sel);
-    if (out) {
-        *out = v;
-    }
-    return YES;
-}
-
-static void DYYYDiagDumpImageCache(NSString *tag) {
-    Class cacheCls = NSClassFromString(@"BDImageCache");
-    if (!cacheCls) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[imgcache] %@ BDImageCache 类不存在", tag]);
-        return;
-    }
-    id cache = DYYYDiagCallObj(cacheCls, @"sharedImageCache");
-    if (!cache) {
-        DYYYSpeedDiag([NSString stringWithFormat:@"[imgcache] %@ sharedImageCache 返回 nil（可能不是单例模式）", tag]);
-        return;
-    }
-    // 统计口径未知，把常见方法名全试一遍，命中的才打（未命中说明这一版 SDK 用了别的名字）
-    NSMutableString *stat = [NSMutableString string];
-    NSArray<NSString *> *sels = @[
-        @"totalMemorySize", @"totalMemoryCost", @"totalMemoryCount", @"totalCount",
-        @"totalDiskSize", @"totalDiskCost", @"totalDiskCount"
-    ];
-    for (NSString *s in sels) {
-        unsigned long long v = 0;
-        if (DYYYDiagCallULL(cache, s, &v)) {
-            [stat appendFormat:@"%@=%llu ", s, v];
-        }
-    }
-    // 【v81】内存侧真实占用：BDImageCache 内部真正管内存淘汰的是 memoryCache(BDMemoryCache，
-    //   与 YYMemoryCache 同源)。config 只是配置源，totalCost 才是当前吃掉的字节数。
-    id mc = nil;
-    @try {
-        mc = [cache valueForKey:@"memoryCache"];
-    } @catch (__unused NSException *e) {
-        mc = nil;
-    }
-    if (mc) {
-        [stat appendFormat:@"mcCls=%@ ", NSStringFromClass([mc class])];
-        for (NSString *s in @[ @"totalCost", @"totalCount", @"totalCostLimit", @"countLimit", @"ageLimit" ]) {
-            unsigned long long v = 0;
-            if (DYYYDiagCallULL(mc, s, &v)) {
-                [stat appendFormat:@"mem.%@=%.1fMB(%llu) ", s, (double)v / 1048576.0, v];
-            }
-        }
-    } else {
-        [stat appendString:@"memCache=取不到 "];
-    }
-    DYYYSpeedDiag([NSString stringWithFormat:@"[imgcache] %@ 单例统计 %@", tag,
-                   stat.length ? stat : @"(未命中任何统计方法)"]);
-
-    id cfg = DYYYDiagCallObj(cache, @"config");
-    DYYYSpeedDiag([NSString stringWithFormat:@"[imgcache] %@ config(%@) %@", tag,
-                   cfg ? NSStringFromClass([cfg class]) : @"nil",
-                   DYYYDiagPropsOf(cfg, 1200)]);
-}
-
 // ================= 【v81】图片内存缓存上限 =================
 // 实测抖音自己设的 BDImageCacheConfig（v80 运行时读到的真实值）：
 //   memorySizeLimit            = 328MB
@@ -15706,20 +15487,26 @@ static BOOL DYYYImgCacheClampOne(id cache) {
     return ok;
 }
 
-// 读回校验：类名 + 当前占用 + 当前上限（读不到就显示 ?，不猜）
+// 读回校验：类名 + 当前上限（NSCache 的 totalCostLimit / countLimit 是标准属性，KVC 直读）
 static NSString *DYYYImgCacheDescribe(id cache) {
     if (!cache) {
         return @"nil";
     }
-    unsigned long long cost = 0, limit = 0, cntLimit = 0;
-    BOOL hasCost = DYYYDiagCallULL(cache, @"totalCost", &cost);
-    BOOL hasLimit = DYYYDiagCallULL(cache, @"totalCostLimit", &limit);
-    DYYYDiagCallULL(cache, @"countLimit", &cntLimit);
-    return [NSString stringWithFormat:@"<%@ cost=%@ limit=%@ cntLimit=%llu>",
+    id limit = nil, cntLimit = nil;
+    @try {
+        limit = [cache valueForKey:@"totalCostLimit"];
+    } @catch (__unused NSException *e) {
+        limit = nil;
+    }
+    @try {
+        cntLimit = [cache valueForKey:@"countLimit"];
+    } @catch (__unused NSException *e) {
+        cntLimit = nil;
+    }
+    return [NSString stringWithFormat:@"<%@ limit=%@ cnt=%@>",
                                       NSStringFromClass([cache class]),
-                                      hasCost ? [NSString stringWithFormat:@"%.1fMB", (double)cost / 1048576.0] : @"?",
-                                      hasLimit ? [NSString stringWithFormat:@"%.1fMB", (double)limit / 1048576.0] : @"?",
-                                      cntLimit];
+                                      limit ?: @"?",
+                                      cntLimit ?: @"?"];
 }
 
 // 兜底路径（v83 起是真正生效的那条）：把上限写到 memoryCache 壳里的三个子缓存上
@@ -15752,8 +15539,8 @@ static void DYYYImgCacheApplyLimit(void) {
     // ① 壳本身：BDImageCompositedMemoryCache 通常没有这两个属性，设不上也无所谓（返回 NO）
     DYYYImgCacheClampOne(mc);
 
-    // ② 真正管淘汰的三个子缓存。大图/动图缓存是懒建的，现在是 nil 也照常记录，
-    //    下次 tick 复查时会补上（见 DYYYDiagScheduleTick 里的重复调用）。
+    // ② 真正管淘汰的三个子缓存。大图/动图缓存是懒建的，现在是 nil 也照常记录；
+    //    之后建出来的实例由 BDImageNSCache 的 init hook 直接压上（事件驱动，不靠复查）。
     NSArray<NSString *> *subKeys = @[ @"defaultCache", @"largeImageCache", @"animatedImageCache" ];
     NSMutableArray<id> *subs = [NSMutableArray arrayWithCapacity:subKeys.count];
     for (NSString *key in subKeys) {
@@ -15904,148 +15691,6 @@ static void DYYYImgCacheApplyLimit(void) {
 %end
 
 
-// ---- Lynx 实例计数：只加/减，不做任何干预 ----
-static volatile int32_t dyyyLynxViewLive = 0;
-static volatile int32_t dyyyLynxViewTotal = 0;
-static volatile int32_t dyyyLynxBgLive = 0;
-static volatile int32_t dyyyLynxBgTotal = 0;
-
-@interface LynxView : UIView
-@end
-
-@interface LynxBackgroundRuntime : NSObject
-@end
-
-// ⚠️ 两个类各用一个 group：万一某一版抖音没有这个类，只跳过它自己，不连累另一个。
-%group DYYYLynxViewDiagGroup
-%hook LynxView
-
-- (instancetype)init {
-    id r = %orig;
-    if (r) {
-        __sync_fetch_and_add(&dyyyLynxViewLive, 1);
-        __sync_fetch_and_add(&dyyyLynxViewTotal, 1);
-    }
-    return r;
-}
-
-- (instancetype)initWithFrame:(CGRect)frame {
-    id r = %orig;
-    if (r) {
-        __sync_fetch_and_add(&dyyyLynxViewLive, 1);
-        __sync_fetch_and_add(&dyyyLynxViewTotal, 1);
-    }
-    return r;
-}
-
-- (void)dealloc {
-    __sync_fetch_and_sub(&dyyyLynxViewLive, 1);
-    %orig;
-}
-
-%end
-%end
-
-%group DYYYLynxBgDiagGroup
-%hook LynxBackgroundRuntime
-
-- (instancetype)init {
-    id r = %orig;
-    if (r) {
-        __sync_fetch_and_add(&dyyyLynxBgLive, 1);
-        __sync_fetch_and_add(&dyyyLynxBgTotal, 1);
-    }
-    return r;
-}
-
-- (void)dealloc {
-    __sync_fetch_and_sub(&dyyyLynxBgLive, 1);
-    %orig;
-}
-
-%end
-%end
-
-// ---- 卡片字段命中统计：contentFilter 每喂一条记一次，每 40 条汇总 ----
-#define DYYY_CARD_FIELD_COUNT 18
-
-static volatile int32_t dyyyCardSamples = 0;
-static volatile int32_t dyyyCardHit[DYYY_CARD_FIELD_COUNT] = {0};
-
-static const char *kDYYYCardFieldNames[DYYY_CARD_FIELD_COUNT] = {
-    "ec商品卡", "ec卡标记", "d卡", "引导卡", "推荐引导卡", "同城卡", "同城schema",
-    "团购大卡", "POI商城卡", "POI店铺卡", "兜底卡", "休闲卡", "插入卡", "问答卡",
-    "推荐用户卡", "热榜卡(已拦)", "音乐卡(已拦)", "含任一卡"
-};
-
-void DYYYDiagCardProbe(AWEAwemeModel *model) {
-    if (!model || !DYYYDiagOn()) {
-        return;
-    }
-    int32_t n = __sync_add_and_fetch(&dyyyCardSamples, 1);
-    BOOL any = NO;
-
-    if (model.ecFeedGoodsCardModel) { __sync_fetch_and_add(&dyyyCardHit[0], 1); any = YES; }
-    if (model.hasEcomGoodsCard)     { __sync_fetch_and_add(&dyyyCardHit[1], 1); any = YES; }
-    if (model.dCardModel)           { __sync_fetch_and_add(&dyyyCardHit[2], 1); any = YES; }
-    if (model.guideTipCardModel)    { __sync_fetch_and_add(&dyyyCardHit[3], 1); any = YES; }
-    if (model.nicolCardModel)       { __sync_fetch_and_add(&dyyyCardHit[4], 1); any = YES; }
-    if (model.nearbyCardModel)      { __sync_fetch_and_add(&dyyyCardHit[5], 1); any = YES; }
-    if (model.nearbyLynxCardSchema) { __sync_fetch_and_add(&dyyyCardHit[6], 1); any = YES; }
-    if (model.grouponLargeCard)     { __sync_fetch_and_add(&dyyyCardHit[7], 1); any = YES; }
-    if (model.poiMallCard)          { __sync_fetch_and_add(&dyyyCardHit[8], 1); any = YES; }
-    if (model.poiShopCard)          { __sync_fetch_and_add(&dyyyCardHit[9], 1); any = YES; }
-    if (model.fallCardModel)        { __sync_fetch_and_add(&dyyyCardHit[10], 1); any = YES; }
-    if (model.hangoutCard)          { __sync_fetch_and_add(&dyyyCardHit[11], 1); any = YES; }
-    if (model.isInsertCard)         { __sync_fetch_and_add(&dyyyCardHit[12], 1); any = YES; }
-    if (model.isDeepQACard)         { __sync_fetch_and_add(&dyyyCardHit[13], 1); any = YES; }
-    if (model.isRecommendUserCard)  { __sync_fetch_and_add(&dyyyCardHit[14], 1); any = YES; }
-    if (model.hotSpotLynxCardModel) { __sync_fetch_and_add(&dyyyCardHit[15], 1); any = YES; }
-    if (model.musicCard)            { __sync_fetch_and_add(&dyyyCardHit[16], 1); any = YES; }
-    if (any)                        { __sync_fetch_and_add(&dyyyCardHit[17], 1); }
-
-    if ((n % 40) == 0) {
-        NSMutableString *s = [NSMutableString string];
-        for (int i = 0; i < DYYY_CARD_FIELD_COUNT; i++) {
-            if (dyyyCardHit[i] > 0) {
-                [s appendFormat:@"%s=%d ", kDYYYCardFieldNames[i], (int)dyyyCardHit[i]];
-            }
-        }
-        DYYYSpeedDiag([NSString stringWithFormat:@"[card] 样本=%d 命中(仅列非零): %@", (int)n, s.length ? s : @"全零"]);
-    }
-}
-
-// ---- 定时采样（最多 20 发，约 10 分钟，之后彻底静默）----
-static void DYYYDiagScheduleTick(int round);
-
-static void DYYYDiagTick(int round) {
-    // 【v81】限制复查放在日志门控之前：日志关掉也要继续压上限，否则用户关日志后限制就丢了。
-    DYYYImgCacheApplyLimit();
-    if (!DYYYDiagOn()) {
-        return;
-    }
-    unsigned long long fp = DYYYDiagPhysFootprint();
-    DYYYSpeedDiag([NSString stringWithFormat:@"[mem] #%d footprint=%.1fMB 样本=%d", round,
-                                             (double)fp / 1048576.0, (int)dyyyCardSamples]);
-    DYYYSpeedDiag([NSString stringWithFormat:@"[mem] #%d %@", round, DYYYDiagVMBuckets()]);
-    DYYYSpeedDiag([NSString stringWithFormat:@"[zone] #%d %@", round, DYYYDiagMallocZones()]);
-    // 图片缓存：首采必测，之后每 2 分钟测一次（属性表较长，别刷屏）
-    if (round == 1 || (round % 4) == 1) {
-        DYYYDiagDumpImageCache([NSString stringWithFormat:@"#%d", round]);
-    }
-}
-
-static void DYYYDiagScheduleTick(int round) {
-    if (round > 20) {
-        return;
-    }
-    int64_t delaySec = (round == 1) ? 10 : 30;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delaySec * NSEC_PER_SEC),
-                   dispatch_get_main_queue(), ^{
-                     DYYYDiagTick(round);
-                     DYYYDiagScheduleTick(round + 1);
-                   });
-}
 
 %ctor {
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
@@ -16066,19 +15711,12 @@ static void DYYYDiagScheduleTick(int round) {
 
     DYYYMigrateCombinedHDRModeIfNeeded();
 
-    // 【v80】内存诊断：只有类真的存在才挂（Logos 的 %init 不能对不存在的类调用）
-    if (objc_getClass("LynxView")) {
-        %init(DYYYLynxViewDiagGroup);
-    }
-    if (objc_getClass("LynxBackgroundRuntime")) {
-        %init(DYYYLynxBgDiagGroup);
-    }
-    // 【v81】图片缓存上限：类与 setter 都在才挂，然后立刻补一次（抖音可能在我们之前就设过了）
+    // 【v81/v83】图片内存缓存上限：类与 setter 都在才挂，然后立刻补一次（抖音可能在我们之前就设过了）
     Class imgCfgCls = objc_getClass("BDImageCacheConfig");
     if (imgCfgCls && class_getInstanceMethod(imgCfgCls, @selector(setMemorySizeLimit:))) {
         %init(DYYYImgCacheLimitGroup);
     }
-    // 【v83】真正生效的那一层：子缓存自己的 setter + 初始化
+    // 真正生效的那一层：子缓存自己的 setter + 初始化
     Class imgNSCacheCls = objc_getClass("BDImageNSCache");
     if (imgNSCacheCls && class_getInstanceMethod(imgNSCacheCls, @selector(setTotalCostLimit:))) {
         %init(DYYYImgCacheNSCacheLimitGroup);
@@ -16097,7 +15735,6 @@ static void DYYYDiagScheduleTick(int round) {
                          DYYYImgCacheApplyLimit();
                        });
     }
-    DYYYDiagScheduleTick(1);
 
     Class interactionBaseLabelClass = objc_getClass("AWECommentSwiftBizUI.CommentInteractionBaseLabel");
     if (interactionBaseLabelClass) {
