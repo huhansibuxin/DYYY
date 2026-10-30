@@ -15832,63 +15832,138 @@ static void DYYYNoWebViewLogStack(NSString *what) {
 //   v88 起彻底移除这两处 hook，改走下面「创建后回收进程」的方案。
 
 
-// ============ v88 核心：不碰对象身份，改成「建完就把 WebContent 进程回收掉」 ============
+// ============ v89 核心：掐掉「预热」和「进程缓存」，不再 kill ============
 //
-// 为什么 load 全拦了进程还在（老板的原问题）：
-//   WKWebView 的渲染不在本进程 —— 只要 init 成功，WebKit 就必须为它建立一条到
-//   com.apple.WebKit.WebContent 的 XPC 连接并拉起那个进程（WebCore/渲染/JS 全在里面）。
-//   所以「拦 load」只能保证不渲染页面、不占网页内容内存，但那 20MB 的**进程骨架**
-//   是 init 的必然产物，拦 load 消不掉。
-//   而抖音启动时在后台队列一口气 new 3~5 个这种 webview 当池子（同一调用点），
-//   全部空壳常驻 ⇒ 5 × 20MB。
+// v88 实机数据（2026-10-30 17:30，p35770）把机制彻底暴露了：
+//   · 09:30:45~48 建 #1~#5，09:30:48~53 杀了 #1~#5  → 老板看到「建 5 个，杀到剩 1 个」
+//   · 09:31:21 起变成**每 15 秒稳定回收一次**（#6→#15，全部同一节奏），
+//     而这段时间里 initWithFrame: 只打到 #12 就不再新增
+//     ⇒ 不是抖音在重建，是**同一个 webview 的 WebContent 进程被 WebKit 反复回填**。
 //
-// 唯一不崩的消除路径：
-//   对象照建（不返回 nil，抖音拿到的永远是合法对象，不会崩）→
-//   3 秒后（确认它没被真的用起来；load 已全拦）调用 WebKit 自己的进程回收私有方法
-//   `-_killWebContentProcess`（找不到就退到 `-_killWebContentProcessAndResetState`）→
-//   WebContent 进程退出，20MB 释放。WKWebView 对象本身还在、仍然合法，
-//   万一后面真被使用，WebKit 会自动重新拉起进程（我们 load 全拦，所以实际不会重建）。
+// 情报来自同一次日志里 dump 出来的 WKProcessPool 私有 SEL：
+//   _warmInitialProcess / _hasPrewarmedWebProcess / _prewarmedProcessIdentifier
+//   _processCacheSize / _processCacheCapacity / _clearWebProcessCache
+//   _webProcessCount / _webPageContentProcessCount / _terminateAllWebContentProcesses
 //
-// 防循环：每个实例只回收一次（关联对象打标），全局上限 24 次；超限停手并记日志，
-//   这样万一抖音监听 `webViewWebContentProcessDidTerminate:` 后疯狂重建，
-//   也不会变成「建→杀→建」的死循环，日志里能直接看出来。
+// 结论：
+//   ① 每个 WKProcessPool 初始化时会 _warmInitialProcess —— 预热一个 WebContent 进程。
+//      抖音建了 5 个池（5 个 config），于是白拿 5 个空壳进程。**这才是「没 load 也有进程」的真凶**，
+//      跟拦不拦 load 一点关系都没有。
+//   ② 我们 kill 掉之后，WebKit 的 WebProcessCache（容量默认 3~6）会立刻再回填一个，
+//      这就是「每 15 秒新建-杀掉」循环的成因 —— **kill 是错的，它只是在跟缓存搏斗**。
+//
+// v89 对策：
+//   ① 不再 kill（把 v88 的回收整段删掉）
+//   ② _warmInitialProcess 直接空转 ⇒ 池初始化不再预热进程
+//   ③ _processCacheCapacity 压成 0 ⇒ 空闲进程不缓存，用完即退
+//   ④ 定时打 _webProcessCount / _prewarmedProcessIdentifier，直接在日志里看进程数，
+//      不用再靠 CocoaTop 数
+//   全程不改任何对象身份（不碰 init 返回值、不碰 setProcessPool:），所以不会出现 v87 那种崩。
 
-static char kDYYYReapedKey;
-static volatile int32_t dyyyReapCount = 0;
-static volatile BOOL dyyyReapNoSel = NO;
+// 把某个类**自己方法表里**指定名字的方法换成空实现（按 typeEncoding 生成返回值，
+// 不硬编码签名）。只翻自身方法表，绝不碰父类 —— 和 v86 预加载器那套同一原则。
+static IMP DYYYEmptyIMPForReturnType(const char *encoding);   // 定义在 v86 段，前置声明
 
-static void DYYYReapWebContent(id webView) {
-    if (!DYYYNoWebViewOn() || !webView) {
+static BOOL DYYYNeuterOwnMethod(Class cls, const char *selName, const char **hitEncoding) {
+    if (!cls || !selName) {
+        return NO;
+    }
+    unsigned int cnt = 0;
+    Method *list = class_copyMethodList(cls, &cnt);
+    if (!list) {
+        return NO;
+    }
+    BOOL ok = NO;
+    for (unsigned int i = 0; i < cnt; i++) {
+        const char *n = sel_getName(method_getName(list[i]));
+        if (!n || strcmp(n, selName) != 0) {
+            continue;
+        }
+        const char *enc = method_getTypeEncoding(list[i]);
+        IMP imp = DYYYEmptyIMPForReturnType(enc);
+        if (imp) {
+            method_setImplementation(list[i], imp);
+            if (hitEncoding) {
+                *hitEncoding = enc;
+            }
+            ok = YES;
+        }
+        break;
+    }
+    free(list);
+    return ok;
+}
+
+static __weak id dyyyAnyPool = nil;
+static volatile int32_t dyyyPoolSeen = 0;
+static volatile int32_t dyyyCreateDump = 0;
+
+// 用私有 SEL 直接读 WebKit 的进程计数 —— 这是唯一能在不看 CocoaTop 的情况下
+// 证明「到底还剩几个 WebContent」的手段。
+static void DYYYDumpWebProcessCount(NSString *tag) {
+    id pool = dyyyAnyPool;
+    if (!pool) {
+        DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 进程数(%@)：还没有 pool 实例", tag]);
         return;
     }
-    if (objc_getAssociatedObject(webView, &kDYYYReapedKey)) {
-        return;   // 这个实例已经回收过，绝不再杀第二次
+    NSUInteger total = 0;
+    NSUInteger pages = 0;
+    NSUInteger cache = 0;
+    int32_t prewarmed = 0;
+    SEL sTotal = sel_registerName("_webProcessCount");
+    SEL sPages = sel_registerName("_webPageContentProcessCount");
+    SEL sCache = sel_registerName("_processCacheSize");
+    SEL sPre = sel_registerName("_prewarmedProcessIdentifier");
+    if ([pool respondsToSelector:sTotal]) {
+        total = ((NSUInteger(*)(id, SEL))objc_msgSend)(pool, sTotal);
     }
-    objc_setAssociatedObject(webView, &kDYYYReapedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if ([pool respondsToSelector:sPages]) {
+        pages = ((NSUInteger(*)(id, SEL))objc_msgSend)(pool, sPages);
+    }
+    if ([pool respondsToSelector:sCache]) {
+        cache = ((NSUInteger(*)(id, SEL))objc_msgSend)(pool, sCache);
+    }
+    if ([pool respondsToSelector:sPre]) {
+        prewarmed = ((int32_t(*)(id, SEL))objc_msgSend)(pool, sPre);
+    }
+    DYYYSpeedDiag([NSString stringWithFormat:
+        @"[webview] 进程数(%@)：WebProcess=%lu 其中页面=%lu 缓存=%lu 预热pid=%d",
+        tag, (unsigned long)total, (unsigned long)pages, (unsigned long)cache, (int)prewarmed]);
+}
 
-    int32_t n = __sync_add_and_fetch(&dyyyReapCount, 1);
-    if (n > 24) {
-        if (n == 25) {
-            DYYYSpeedDiag(@"[webview] 回收已达上限 24 次，停止（防止疯狂的建-杀循环）");
-        }
+// 装 v89 的两把刀：禁预热 + 缓存容量 0。用一个标志保证只装一次，
+// 之后每次新建 pool 只顺手清一次缓存（method_setImplementation 反复设会不断生成 block）。
+static volatile BOOL dyyyPoolTuned = NO;
+static volatile BOOL dyyyPoolCacheCleared = NO;
+
+static void DYYYWebViewPoolTune(void) {
+    Class poolCls = objc_getClass("WKProcessPool");
+    if (!poolCls) {
         return;
     }
-
-    const char *names[2] = { "_killWebContentProcess", "_killWebContentProcessAndResetState" };
-    for (int i = 0; i < 2; i++) {
-        SEL sel = sel_registerName(names[i]);
-        if ([webView respondsToSelector:sel]) {
-            ((void (*)(id, SEL))objc_msgSend)(webView, sel);
-            DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 回收#%d 已杀 WebContent 进程（%s）",
-                                                     (int)n, names[i]]);
-            return;
+    if (!dyyyPoolTuned) {
+        // ① 禁掉「池初始化时预热一个 WebContent」—— 这是 5 个空壳进程的直接来源
+        BOOL noWarm = DYYYNeuterOwnMethod(poolCls, "_warmInitialProcess", NULL);
+        // ② 进程缓存容量压 0 —— 空闲进程不再被缓存回填，消除「kill 完又冒出来」的循环
+        BOOL noCache = DYYYNeuterOwnMethod(poolCls, "_processCacheCapacity", NULL);
+        if (noWarm || noCache) {
+            dyyyPoolTuned = YES;
+            DYYYSpeedDiag([NSString stringWithFormat:
+                @"[webview] 池压制已生效：禁预热=%@ 缓存容量0=%@",
+                noWarm ? @"是" : @"否(无此SEL)", noCache ? @"是" : @"否(无此SEL)"]);
         }
     }
-    if (!dyyyReapNoSel) {
-        dyyyReapNoSel = YES;
-        DYYYSpeedDiag(@"[webview] 本系统 WKWebView 没有进程回收 SEL，回收层跳过（进程仍会常驻）");
+    // ③ 拿到 pool 实例后清一次已存在的缓存（%ctor 阶段还没有实例，所以单独门控）
+    if (!dyyyPoolCacheCleared && dyyyAnyPool) {
+        SEL sClear = sel_registerName("_clearWebProcessCache");
+        if ([dyyyAnyPool respondsToSelector:sClear]) {
+            dyyyPoolCacheCleared = YES;
+            ((void (*)(id, SEL))objc_msgSend)(dyyyAnyPool, sClear);
+            DYYYSpeedDiag(@"[webview] 已清一次 WebProcessCache");
+        }
     }
 }
+
 
 // 诊断：把 WKProcessPool 自身方法表里带 Cache/Process 的私有 SEL 打出来。
 //   WebKit 的 WebProcessCache 会缓存空闲 WebContent 进程（默认 3~6 个），这是
@@ -16108,25 +16183,43 @@ static void DYYYNoWebViewKillPreloadersRetry(void) {
     }
 }
 
+// 【v89】⚠️ 绝对不要 %hook -[WKProcessPool init]：万一它没自己实现 init，
+//   Logos 会把钩子挂到 NSObject 的 init 上，全 App 所有对象的 init 都受影响（v85 同款雷）。
+//   改成从 configuration 的只读 processPool 属性取实例 —— 零风险，也不需要 hook 池的任何方法。
+
 %group DYYYNoWebViewGroup
 %hook WKWebView
 
-// ⚠️ 这里绝对不能 return nil（v85 实测必崩）。只记录「谁在建」，然后老老实实给真对象。
+// ⚠️ 这里绝对不能 return nil（v85 实测崩在 -[WKWebView setCustomUserAgent:]：
+//   nil/半初始化对象进去后 WebPageProxy 指针是野的，+0x170 直接 EXC_BAD_ACCESS）。
+//   只记录「谁在建」，然后老老实实给真对象。
 - (instancetype)initWithFrame:(CGRect)frame configuration:(id)configuration {
+    // 【v89】趁 configuration 还在手上，取它的 processPool 实例（只读属性，安全）
+    if (DYYYNoWebViewOn() && !dyyyAnyPool && configuration) {
+        SEL sPool = sel_registerName("processPool");
+        if ([configuration respondsToSelector:sPool]) {
+            id p = ((id(*)(id, SEL))objc_msgSend)(configuration, sPool);
+            if (p) {
+                dyyyAnyPool = p;
+                int32_t n = __sync_add_and_fetch(&dyyyPoolSeen, 1);
+                if (n <= 6) {
+                    DYYYSpeedDiag([NSString stringWithFormat:@"[webview] 取到 WKProcessPool #%d", (int)n]);
+                }
+                DYYYWebViewPoolTune();
+            }
+        }
+    }
     id ret = %orig;
     if (DYYYNoWebViewOn() && ret) {
         DYYYNoWebViewLog(@"initWithFrame:configuration:");
         DYYYNoWebViewLogStack(@"initWithFrame:configuration:");
-        // 【v88】3 秒后把这条 WebContent 连接回收掉：抖音建的都是池化空壳，不会用到；
-        //   load 已全拦，回收后也不会重建。用 weak 避免拖住对象生命周期。
-        __weak id weakWV = ret;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-                         id wv = weakWV;
-                         if (wv) {
-                             DYYYReapWebContent(wv);
-                         }
-                       });
+        // 【v89】不 kill，只观察：建完 3 秒打一次真实进程数，用数据判断预热/缓存有没有被压住
+        if (__sync_add_and_fetch(&dyyyCreateDump, 1) <= 4) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                             DYYYDumpWebProcessCount(@"创建后3s");
+                           });
+        }
     }
     return ret;
 }
@@ -16135,14 +16228,6 @@ static void DYYYNoWebViewKillPreloadersRetry(void) {
     id ret = %orig;
     if (DYYYNoWebViewOn() && ret) {
         DYYYNoWebViewLog(@"initWithCoder:");
-        __weak id weakWV = ret;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-                         id wv = weakWV;
-                         if (wv) {
-                             DYYYReapWebContent(wv);
-                         }
-                       });
     }
     return ret;
 }
@@ -16256,9 +16341,23 @@ static void DYYYNoWebViewKillPreloadersRetry(void) {
         Class wkCls = objc_getClass("WKWebView");
         if (wkCls) {
             %init(DYYYNoWebViewGroup);
-            // 【v88】进程池对象一律不碰（v87 的单例化 = 必崩，见上方崩溃栈注释）
+            // 【v89】不 hook 池的任何方法（避免 %hook init 误挂到 NSObject），
+            //   只在 ctor 阶段先把「禁预热 + 禁缓存」两把刀装好。
+            if (objc_getClass("WKProcessPool")) {
+                DYYYWebViewPoolTune();
+            }
             DYYYNoWebViewKillPreloadersRetry();
             DYYYDumpProcessPoolSELs();
+            // 【v89】定时打真实进程数：5s / 30s / 90s 各一次，日志里直接看
+            //   WebProcess 数量，不用再靠 CocoaTop 数进程。
+            for (NSNumber *dt in @[ @5.0, @30.0, @90.0 ]) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                             (int64_t)(dt.doubleValue * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                                 DYYYDumpWebProcessCount(
+                                     [NSString stringWithFormat:@"启动后%.0fs", dt.doubleValue]);
+                               });
+            }
             // 预加载类多在 AwemeCore 里、注册时间晚于 %ctor ⇒ 分档重试（命中即停）
             for (NSNumber *delay in @[ @0.5, @2.0, @5.0, @10.0, @20.0 ]) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
@@ -16267,7 +16366,7 @@ static void DYYYNoWebViewKillPreloadersRetry(void) {
                                  DYYYNoWebViewKillPreloadersRetry();
                                });
             }
-            DYYYSpeedDiag(@"[webview] 已挂 v88 WebView 治理钩子（放行创建/禁加载/废预加载/回收WebContent进程）");
+            DYYYSpeedDiag(@"[webview] 已挂 v89 WebView 治理钩子（放行创建/禁加载/废预加载/禁预热/禁进程缓存）");
         } else {
             DYYYSpeedDiag(@"[webview] WKWebView 类不存在，跳过");
         }
