@@ -11930,29 +11930,46 @@ static NSHashTable *processedParentViews = nil;
 //   改 model 字段那条路（旧实现）从一开始就不可能对。
 //
 // 【为什么不用 %hook 写死类名】类名未定（AWENewMusicModel / AWERepoMusicModel /
-//   AWEMusicStreamingImpl 都可能，也可能是 Swift 私有类）⇒ 运行时遍历全部已注册类，
-//   谁实现了返回 BOOL 的 `canBackgroundPlay` 就替换谁。
-//   安全闸：返回类型不是 'B'/'c' 的一律跳过 —— 否则 YES(1) 会被当成对象指针传出去 → 必崩。
+//   AWEMusicStreamingImpl 都可能，也可能是 Swift 私有类）⇒ 运行时遍历全部已注册类。
+//   安全闸一：返回类型不是 'B'/'c' 的一律跳过 —— 否则 YES(1) 会被当成对象指针传出去 → 必崩。
+//
+// ⛔ 【v103 崩溃教训：绝对不能用 class_getInstanceMethod 扫全类】
+//   2026-11-09 02:15/02:18/02:30 连崩三次，IPS 触发线程栈 511 帧，其中 170 次是同一个三帧循环：
+//     class_respondsToSelector_inst → resolveMethod_locked → AWESearchFramework+14868676 → 回到第一帧
+//   = AWESearchFramework 里有个类的 `+resolveInstanceMethod:` 内部又对同一 selector 做 respondsToSelector，
+//     自己递归自己。**平时没人去查这个 selector 它就永远不会跑**，而 class_getInstanceMethod 会
+//     触发方法决议（resolveMethod_locked），于是在 1 万多个类上轮一遍 = 主线程无限递归 → 栈打穿
+//     （EXC_BAD_ACCESS / KERN_PROTECTION_FAILURE at STACK GUARD）+ 10s 看门狗 0x8BADF00D。
+//   ⇒ 改成 class_copyMethodList：只遍历类**自己**的方法表，属于纯数据读取，
+//     不发消息、不触发 resolveInstanceMethod、不触发任何 +initialize 副作用。
+//   ⇒ 并且整轮扫描挪到后台串行队列，主线程一帧都不占。
 static NSMutableArray *dyyyCanBGClassNames = nil;
 
 static BOOL DYYYImpCanBackgroundPlay(id self, SEL _cmd) {
     return YES;
 }
 
+// 只扫本类自身方法表（不含继承），找到名字为 canBackgroundPlay 且返回 BOOL/char 的 Method 就换实现。
 static void DYYYHookCanBGClass(Class cls) {
     if (!cls) return;
-    SEL sel = sel_registerName("canBackgroundPlay");
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return;
-    char rt[16] = {0};
-    method_getReturnType(m, rt, sizeof(rt));
-    if (rt[0] != 'B' && rt[0] != 'c') return;
-    if (method_getImplementation(m) == (IMP)DYYYImpCanBackgroundPlay) return;
-    method_setImplementation(m, (IMP)DYYYImpCanBackgroundPlay);
-    if (!dyyyCanBGClassNames) dyyyCanBGClassNames = [NSMutableArray array];
-    @synchronized (dyyyCanBGClassNames) {
-        [dyyyCanBGClassNames addObject:NSStringFromClass(cls)];
+    unsigned int mcount = 0;
+    Method *methods = class_copyMethodList(cls, &mcount);
+    if (!methods) return;
+    for (unsigned int i = 0; i < mcount; i++) {
+        Method m = methods[i];
+        const char *name = sel_getName(method_getName(m));
+        if (!name || strcmp(name, "canBackgroundPlay") != 0) continue;
+        char rt[16] = {0};
+        method_getReturnType(m, rt, sizeof(rt));
+        if (rt[0] != 'B' && rt[0] != 'c') continue;
+        if (method_getImplementation(m) == (IMP)DYYYImpCanBackgroundPlay) continue;
+        method_setImplementation(m, (IMP)DYYYImpCanBackgroundPlay);
+        if (!dyyyCanBGClassNames) dyyyCanBGClassNames = [NSMutableArray array];
+        @synchronized (dyyyCanBGClassNames) {
+            [dyyyCanBGClassNames addObject:NSStringFromClass(cls)];
+        }
     }
+    free(methods);
 }
 
 // 分档重试：抖音的模型类可能晚于插件加载才注册，跑三轮足够（1s / 5s / 15s）。
@@ -11960,7 +11977,7 @@ static void DYYYInstallBackgroundPlayHooks(void) {
     if (!DYYYGetBool(@"DYYYEnableBackgroundListen")) {
         return;
     }
-    // 兜底：先把几个最可能的类按名字试一遍（Swift 类不会出现在 ObjC 方法表里，但仍可 NSClassFromString）
+    // 兜底：先把几个最可能的类按名字试一遍（NSClassFromString 本身不触发 resolveInstanceMethod）
     NSArray *guess = @[ @"AWENewMusicModel", @"AWERepoMusicModel", @"AWEMusicModel",
                         @"AWEMusicPlayerModel", @"AWEStudioMusicModel" ];
     for (NSString *n in guess) {
@@ -11981,11 +11998,20 @@ static void DYYYInstallBackgroundPlayHooks(void) {
     }
 
     static volatile int32_t dyyyBGLog = 0;
-    if (dyyyCanBGClassNames.count > 0 && __sync_add_and_fetch(&dyyyBGLog, 1) <= 3) {
-        DYYYSpeedDiag([NSString stringWithFormat:
-            @"[bgplay] 已强制 canBackgroundPlay=YES，命中 %lu 个类：%@",
-            (unsigned long)dyyyCanBGClassNames.count,
-            [dyyyCanBGClassNames componentsJoinedByString:@", "]]);
+    NSUInteger hit = 0;
+    @synchronized (dyyyCanBGClassNames) { hit = dyyyCanBGClassNames.count; }
+    if (__sync_add_and_fetch(&dyyyBGLog, 1) <= 3) {
+        if (hit > 0) {
+            NSString *names = nil;
+            @synchronized (dyyyCanBGClassNames) {
+                names = [dyyyCanBGClassNames componentsJoinedByString:@", "];
+            }
+            DYYYSpeedDiag([NSString stringWithFormat:
+                @"[bgplay] 已强制 canBackgroundPlay=YES，命中 %lu 个类：%@",
+                (unsigned long)hit, names]);
+        } else {
+            DYYYSpeedDiag(@"[bgplay] 本轮未命中 canBackgroundPlay（继续等下一档）");
+        }
     }
 }
 
@@ -12012,10 +12038,17 @@ static void DYYYInstallBackgroundPlayHooks(void) {
 
 __attribute__((constructor))
 static void DYYYBackgroundPlayCtor(void) {
-    // %ctor 里直接跑会早于 NSUserDefaults 就绪，且抖音模型类未注册齐全 ⇒ 交给 main queue 分档。
+    // %ctor 里直接跑会早于 NSUserDefaults 就绪，且抖音模型类未注册齐全 ⇒ 分档延后。
+    // 【v103】整轮扫描放后台串行队列：objc_getClassList + class_copyMethodList 要过 1 万多个类，
+    //   在主线程跑会顶到 10s 看门狗（v102 就是在这里被 FRONTBOARD 0x8BADF00D 干掉过）。
+    static dispatch_queue_t bgQueue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        bgQueue = dispatch_queue_create("com.huami.dyyy.bgplay", DISPATCH_QUEUE_SERIAL);
+    });
     for (NSNumber *d in @[ @1.0, @5.0, @15.0 ]) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
+                       bgQueue, ^{
                            DYYYInstallBackgroundPlayHooks();
                        });
     }
