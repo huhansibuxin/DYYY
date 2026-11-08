@@ -2261,6 +2261,16 @@ static BOOL DYYYIsAmbientCategory(NSString *c) {
            [c isEqualToString:AVAudioSessionCategorySoloAmbient];
 }
 
+// 【v102】后台播放（听视频）也要求音频会话保持 Playback：
+//   抖音把类别从 Playback 降到 Ambient/SoloAmbient、或挂上 MixWithOthers 时，
+//   退后台立刻没声。「后台播放」开关打开时同样要托管这一层。
+static BOOL DYYYShouldKeepAudioAlive(void) {
+    if (DYYYGetBool(@"DYYYEnableBackgroundListen")) {
+        return YES;
+    }
+    return DYYYShouldHoldNowPlaying();
+}
+
 %hook AVAudioSession
 
 // ===== 【v5 定位+保护】audio session 类别层 =====
@@ -2274,7 +2284,7 @@ static BOOL DYYYIsAmbientCategory(NSString *c) {
 - (BOOL)setCategory:(AVAudioSessionCategory)category error:(NSError **)outError {
     NSString *cur = [self category];
     BOOL downgrade = [cur isEqualToString:AVAudioSessionCategoryPlayback] && DYYYIsAmbientCategory(category);
-    if (downgrade && DYYYShouldHoldNowPlaying()) {
+    if (downgrade && DYYYShouldKeepAudioAlive()) {
         return %orig(AVAudioSessionCategoryPlayback, outError);
     }
     return %orig;
@@ -2284,7 +2294,7 @@ static BOOL DYYYIsAmbientCategory(NSString *c) {
     NSString *cur = [self category];
     BOOL downgrade = [cur isEqualToString:AVAudioSessionCategoryPlayback] && DYYYIsAmbientCategory(category);
     AVAudioSessionCategoryOptions clean = options & ~AVAudioSessionCategoryOptionMixWithOthers;
-    if (DYYYShouldHoldNowPlaying() && (downgrade || clean != options)) {
+    if (DYYYShouldKeepAudioAlive() && (downgrade || clean != options)) {
         return %orig(downgrade ? AVAudioSessionCategoryPlayback : category, clean, outError);
     }
     return %orig;
@@ -2294,7 +2304,7 @@ static BOOL DYYYIsAmbientCategory(NSString *c) {
     NSString *cur = [self category];
     BOOL downgrade = [cur isEqualToString:AVAudioSessionCategoryPlayback] && DYYYIsAmbientCategory(category);
     AVAudioSessionCategoryOptions clean = options & ~AVAudioSessionCategoryOptionMixWithOthers;
-    if (DYYYShouldHoldNowPlaying() && (downgrade || clean != options)) {
+    if (DYYYShouldKeepAudioAlive() && (downgrade || clean != options)) {
         return %orig(downgrade ? AVAudioSessionCategoryPlayback : category, mode, clean, outError);
     }
     return %orig;
@@ -11905,14 +11915,111 @@ static NSHashTable *processedParentViews = nil;
 }
 %end
 
-%hook AWEAwemeStatusModel
-- (void)setListenVideoStatus:(NSInteger)status {
-    if (status == 1 && DYYYGetBool(@"DYYYEnableBackgroundListen")) {
-        status = 2;
-    }
-    %orig(status);
+// ============ v102：后台播放（听视频）强制放行 ============
+// 【旧实现是死的】此前这一段只有一句 %hook AWEAwemeStatusModel -setListenVideoStatus:（1 改 2）。
+//   2026-11-09 实测：`listenVideoStatus` 在整个 Aweme.app（主二进制 + 全部 Frameworks 逐个 grep）
+//   **0 命中** ⇒ 抖音里没有这个方法名，这条 hook 从来没生效过。
+//   老板「有时能后台播、有时不能」的手感，能播的那些是抖音自己允许的，跟插件无关。
+//
+// 【真限制在哪】音乐模型的属性簇（二进制邻居字段铁证，前后各 180 字节）：
+//   isAudioUrlWithCookie / externalSongSubtitle / matchedPgcSoundModel / matchedSongModel /
+//   musicChartRanksModelArray / **canBackgroundPlay** / climaxModel / musicStatus / videoDuration /
+//   originalMusicianDisplayName / authorStatus / meta / **permission**
+//   ⇒ canBackgroundPlay 紧挨 permission，是**音乐版权许可**派生出来的只读计算属性：
+//   有 getter、没有 setter、没有 `_canBackgroundPlay` ivar。所以只能 hook getter 强制 YES，
+//   改 model 字段那条路（旧实现）从一开始就不可能对。
+//
+// 【为什么不用 %hook 写死类名】类名未定（AWENewMusicModel / AWERepoMusicModel /
+//   AWEMusicStreamingImpl 都可能，也可能是 Swift 私有类）⇒ 运行时遍历全部已注册类，
+//   谁实现了返回 BOOL 的 `canBackgroundPlay` 就替换谁。
+//   安全闸：返回类型不是 'B'/'c' 的一律跳过 —— 否则 YES(1) 会被当成对象指针传出去 → 必崩。
+static NSMutableArray *dyyyCanBGClassNames = nil;
+
+static BOOL DYYYImpCanBackgroundPlay(id self, SEL _cmd) {
+    return YES;
 }
+
+static void DYYYHookCanBGClass(Class cls) {
+    if (!cls) return;
+    SEL sel = sel_registerName("canBackgroundPlay");
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    char rt[16] = {0};
+    method_getReturnType(m, rt, sizeof(rt));
+    if (rt[0] != 'B' && rt[0] != 'c') return;
+    if (method_getImplementation(m) == (IMP)DYYYImpCanBackgroundPlay) return;
+    method_setImplementation(m, (IMP)DYYYImpCanBackgroundPlay);
+    if (!dyyyCanBGClassNames) dyyyCanBGClassNames = [NSMutableArray array];
+    @synchronized (dyyyCanBGClassNames) {
+        [dyyyCanBGClassNames addObject:NSStringFromClass(cls)];
+    }
+}
+
+// 分档重试：抖音的模型类可能晚于插件加载才注册，跑三轮足够（1s / 5s / 15s）。
+static void DYYYInstallBackgroundPlayHooks(void) {
+    if (!DYYYGetBool(@"DYYYEnableBackgroundListen")) {
+        return;
+    }
+    // 兜底：先把几个最可能的类按名字试一遍（Swift 类不会出现在 ObjC 方法表里，但仍可 NSClassFromString）
+    NSArray *guess = @[ @"AWENewMusicModel", @"AWERepoMusicModel", @"AWEMusicModel",
+                        @"AWEMusicPlayerModel", @"AWEStudioMusicModel" ];
+    for (NSString *n in guess) {
+        Class c = NSClassFromString(n);
+        if (c) DYYYHookCanBGClass(c);
+    }
+
+    int count = objc_getClassList(NULL, 0);
+    if (count > 0) {
+        Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
+        if (classes) {
+            int real = objc_getClassList(classes, count);
+            for (int i = 0; i < real; i++) {
+                DYYYHookCanBGClass(classes[i]);
+            }
+            free(classes);
+        }
+    }
+
+    static volatile int32_t dyyyBGLog = 0;
+    if (dyyyCanBGClassNames.count > 0 && __sync_add_and_fetch(&dyyyBGLog, 1) <= 3) {
+        DYYYSpeedDiag([NSString stringWithFormat:
+            @"[bgplay] 已强制 canBackgroundPlay=YES，命中 %lu 个类：%@",
+            (unsigned long)dyyyCanBGClassNames.count,
+            [dyyyCanBGClassNames componentsJoinedByString:@", "]]);
+    }
+}
+
+// 【兜底层】版权限制（音乐 + 视频内的音频内容）最终表现在"退后台就 pause"。
+//   抖音的视频解码是 C++ TTVideoEngine（二进制里 0 个 ObjC 类符号 ⇒ hook 不到），
+//   但音频轨走 AVPlayer（有 `_OBJC_CLASS_$_AVPlayer`，60 处引用）。
+//   所以后台期间拦下 AVPlayer 的 pause：版权判定的那些视频，声音靠这一步续上。
+//   只在 AppState == Background(2) 时拦 —— 前台暂停、切视频一律放行，
+//   避免把抖音自己的播放器交接打断（那是 v7~v10 在 Now Playing 上踩过的坑）。
+%hook AVPlayer
+
+- (void)pause {
+    if (DYYYGetBool(@"DYYYEnableBackgroundListen") && DYYYAppStateRaw() == 2) {
+        static volatile int32_t dyyyBGPauseBlocked = 0;
+        if (__sync_add_and_fetch(&dyyyBGPauseBlocked, 1) <= 8) {
+            DYYYSpeedDiag(@"[bgplay] 后台拦下 AVPlayer pause（版权限制视频续播）");
+        }
+        return;
+    }
+    %orig;
+}
+
 %end
+
+__attribute__((constructor))
+static void DYYYBackgroundPlayCtor(void) {
+    // %ctor 里直接跑会早于 NSUserDefaults 就绪，且抖音模型类未注册齐全 ⇒ 交给 main queue 分档。
+    for (NSNumber *d in @[ @1.0, @5.0, @15.0 ]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+                           DYYYInstallBackgroundPlayHooks();
+                       });
+    }
+}
 
 %hook MTKView
 
@@ -17348,7 +17455,7 @@ static void DYYYClampPoolCapacities(void) {
                                  DYYYClampPoolCapacities();   // 【v95】池类可能是之后才注册的
                                });
             }
-            DYYYSpeedDiag(@"[webview] 已挂 v101 WebView 治理钩子（毒丸拦创建+禁加载+废预加载+禁预热+禁缓存+吞死通知+_close断relaunch+池容量1）");
+            DYYYSpeedDiag(@"[webview] 已挂 v102 WebView 治理钩子（毒丸拦创建+禁加载+废预加载+禁预热+禁缓存+吞死通知+_close断relaunch+池容量1）");
         } else {
             DYYYSpeedDiag(@"[webview] WKWebView 类不存在，跳过");
         }
