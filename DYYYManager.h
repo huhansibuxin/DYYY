@@ -61,6 +61,13 @@
                    completion:(void (^)(BOOL success))completion;
 
 /**
+ * 把抖音的 originURLList（NSString 数组，通常是多个 CDN 候选）转成 NSURL 数组，
+ * 过滤空值/非法项并去重。配合 downloadMediaFromURLs: 使用：
+ * 首个 CDN 下载失败会自动换下一个，不再只赌 firstObject。
+ */
++ (NSArray<NSURL *> *)candidateURLsFromList:(NSArray *)urlList;
+
+/**
  * 带进度的媒体下载
  * @param url 媒体URL
  * @param mediaType 媒体类型

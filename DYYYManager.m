@@ -507,6 +507,38 @@ extern BOOL DYYYDiagOn(void);
 // 多候选 URL 下载：依次尝试 originURLList 中的全部地址，首个成功即返回，
 // 全部失败才回调 NO。底层仍复用 downloadMedia: 的完整管线
 // （进度条 / 音频合并 / 保存到相册 / 分享面板），无需改动下载核心。
+// 【v99】originURLList（NSString 数组）→ NSURL 数组：过滤空串/非法项 + 去重。
+// 抖音一个视频通常给 3~5 个同内容 CDN 地址，原来调用侧只取 firstObject，
+// 那条 CDN 抽风就整次下载失败；现在把全部候选传下去自动切换。
++ (NSArray<NSURL *> *)candidateURLsFromList:(NSArray *)urlList {
+    NSMutableArray<NSURL *> *result = [NSMutableArray array];
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
+    if (![urlList isKindOfClass:[NSArray class]]) {
+        return result;
+    }
+    for (id item in urlList) {
+        NSString *urlString = nil;
+        if ([item isKindOfClass:[NSString class]]) {
+            urlString = item;
+        } else if ([item isKindOfClass:[NSURL class]]) {
+            urlString = [(NSURL *)item absoluteString];
+        }
+        if (urlString.length == 0) {
+            continue;
+        }
+        if ([seen containsObject:urlString]) {
+            continue;
+        }
+        NSURL *url = [NSURL URLWithString:urlString];
+        if (!url) {
+            continue;
+        }
+        [seen addObject:urlString];
+        [result addObject:url];
+    }
+    return result;
+}
+
 + (void)downloadMediaFromURLs:(NSArray<NSURL *> *)urls
                     mediaType:(MediaType)mediaType
                         audio:(NSURL *)audioURL

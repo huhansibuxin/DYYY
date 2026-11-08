@@ -22,6 +22,7 @@
 
 #import "AwemeHeaders.h"
 #import "CityManager.h"
+#import "DYYYCityManager.h"   // 【v99】四级属地（省/市/区/街道）行政区划数据
 #import "DYYYBottomAlertView.h"
 #import "DYYYManager.h"
 
@@ -5926,6 +5927,105 @@ static void DYYYBlockUpdateClassesOnce(void) {
 
 %end
 
+// ============ v99：四级属地（省-市-区-街道/乡镇） ============
+// 数据源 DYYYCityManager：本地 GB2260 行政区划（省/市/区县全量 + 部分省份真实街道），
+// 移植自 beeixxd/DYMH（MIT）。与原有「在线 GeoNames 解析」是两条**互不干扰**的路径：
+//   四级开关打开且拿到 6 位城市代码 → 走本地数据（即时、精确到区/街道）；
+//   否则保持原逻辑（国外 / 未收录城市继续在线解析）。
+static void DYYYFitTimestampLabel(UILabel *label) {
+    if (![label isKindOfClass:[UILabel class]]) {
+        return;
+    }
+    // 四级地址比原来的「省 市」长一截，时间标签宽度不够 —— 缩字号保完整，不改 frame，
+    // 避免动到抖音自己的布局约束（v99 上一版思路：宁可字小，不要截断）。
+    label.numberOfLines = 1;
+    label.adjustsFontSizeToFitWidth = YES;
+    label.minimumScaleFactor = 0.5;
+    label.lineBreakMode = NSLineBreakByTruncatingTail;
+}
+
+// 真实街道数据只覆盖部分省份（新疆/西藏/内蒙/吉林/海南等），其余按区县名合成一个
+// 「XX街道 / XX镇 / XX乡」，与 DYMH 原版行为一致。区县名本身已经是镇/乡/街道时不再往下造。
+static NSString *DYYYSynthesizedStreet(NSString *districtName) {
+    if (districtName.length < 2) {
+        return @"";
+    }
+    if ([districtName hasSuffix:@"镇"] || [districtName hasSuffix:@"乡"] ||
+        [districtName hasSuffix:@"街道"]) {
+        return @"";   // 东莞/中山这类，区县本身就是镇街，没有下一级
+    }
+    NSString *base = districtName;
+    for (NSString *suffix in @[ @"区", @"县", @"市", @"旗", @"盟", @"地区" ]) {
+        if ([base hasSuffix:suffix] && base.length > suffix.length + 1) {
+            base = [base substringToIndex:base.length - suffix.length];
+            break;
+        }
+    }
+    NSArray *tails = @[ @"街道", @"镇", @"乡" ];
+    return [NSString stringWithFormat:@"%@%@", base, tails[arc4random_uniform((uint32_t)tails.count)]];
+}
+
+static NSString *DYYYFourLevelAddress(NSString *cityCode) {
+    if (cityCode.length < 6) {
+        return nil;
+    }
+    DYYYCityManager *mgr = [DYYYCityManager sharedInstance];
+    if (!mgr) {
+        return nil;
+    }
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    BOOL showProvince = [defaults boolForKey:@"DYYYAreaShowProvince"];
+    BOOL showCity = [defaults boolForKey:@"DYYYAreaShowCity"];
+    BOOL showDistrict = [defaults boolForKey:@"DYYYAreaShowDistrict"];
+    BOOL showStreet = [defaults boolForKey:@"DYYYAreaShowStreet"];
+
+    NSString *provinceCode = [[cityCode substringToIndex:2] stringByAppendingString:@"0000"];
+    NSString *provinceName = [mgr getProvinceNameWithCode:provinceCode] ?: @"";
+    NSString *cityName = [mgr getCityNameWithCode:cityCode] ?: @"";
+
+    // 区县：同城多个区里随机挑一个（同一个视频反复刷新也只显示一次，结果会缓存）
+    NSString *districtCode = nil;
+    NSString *districtName = @"";
+    NSDictionary *districts = [mgr getDistrictsInCity:cityCode];
+    if (districts.count > 0) {
+        NSArray *codes = [districts allKeys];
+        districtCode = codes[arc4random_uniform((uint32_t)codes.count)];
+        districtName = districts[districtCode] ?: @"";
+    }
+
+    NSString *streetName = @"";
+    if (showStreet && districtName.length > 0) {
+        NSArray *streets = ([mgr getStreetsInDistrict:districtCode] ?: @[]);
+        if (streets.count > 0) {
+            streetName = streets[arc4random_uniform((uint32_t)streets.count)] ?: @"";
+        } else {
+            streetName = DYYYSynthesizedStreet(districtName);
+        }
+    }
+
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    NSArray *municipalities = @[ @"11", @"12", @"31", @"50" ];
+    BOOL isMunicipality = [municipalities containsObject:[cityCode substringToIndex:2]];
+    if (showProvince && provinceName.length > 0) {
+        [parts addObject:provinceName];
+    }
+    if (showCity && cityName.length > 0 && !isMunicipality &&
+        ![cityName isEqualToString:provinceName]) {
+        [parts addObject:cityName];
+    }
+    if (showDistrict && districtName.length > 0) {
+        [parts addObject:districtName];
+    }
+    if (showStreet && streetName.length > 0) {
+        [parts addObject:streetName];
+    }
+    if (parts.count == 0) {
+        return nil;
+    }
+    // 不加分隔符：中文地址连读更自然，也最省标签宽度（省/市/区/街道各自可关）
+    return [parts componentsJoinedByString:@""];
+}
+
 %hook AWEPlayInteractionTimestampElement
 
 - (id)timestampLabel {
@@ -5981,6 +6081,28 @@ static void DYYYBlockUpdateClassesOnce(void) {
 
         [DYYYUtils applyColorSettingsToLabel:lbl colorHexString:labelColorHex];
     };
+
+    // 【v99】四级属地：优先走本地行政区划（省-市-区-街道），不需要联网。
+    //   自定义城市代码（设置里填 6 位，如 440305）优先于作品自带的 cityCode。
+    if (DYYYGetBool(@"DYYYAreaFourLevel")) {
+        NSString *customAreaCode = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYAreaCustomCityCode"];
+        if ([customAreaCode isKindOfClass:[NSString class]]) {
+            customAreaCode = [customAreaCode stringByTrimmingCharactersInSet:
+                                  [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        } else {
+            customAreaCode = nil;
+        }
+        NSString *areaCode = (customAreaCode.length >= 6) ? customAreaCode : cityCode;
+        if (areaCode.length >= 6) {
+            NSString *fourLevel = DYYYFourLevelAddress(areaCode);
+            if (fourLevel.length > 0) {
+                [locationCache setObject:fourLevel forKey:areaCode];
+                updateLabelWithLocation(label, fourLevel);
+                DYYYFitTimestampLabel(label);
+                return label;
+            }
+        }
+    }
 
     if (cityCode.length == 0 && regionCode.length == 0) {
         updateLabelWithLocation(label, @"未知地区");
@@ -12568,13 +12690,17 @@ static NSHashTable *processedParentViews = nil;
                                                       }];
                               }
                           } else {
-                              if (videoModel.h264URL && videoModel.h264URL.originURLList.count > 0) {
-                                  NSURL *url = [NSURL URLWithString:videoModel.h264URL.originURLList.firstObject];
-                                  [DYYYManager downloadMedia:url
-                                                   mediaType:MediaTypeVideo
-                                                       audio:audioURL
-                                                  completion:^(BOOL success){
-                                                  }];
+                              // 【v99】把 originURLList 的全部 CDN 候选一起传下去，首个失败自动换下一个
+                              NSArray *videoCandidates = nil;
+                              if (videoModel.h264URL.originURLList.count > 0) {
+                                  videoCandidates = [DYYYManager candidateURLsFromList:videoModel.h264URL.originURLList];
+                              }
+                              if (videoCandidates.count > 0) {
+                                  [DYYYManager downloadMediaFromURLs:videoCandidates
+                                                           mediaType:MediaTypeVideo
+                                                               audio:audioURL
+                                                          completion:^(BOOL success){
+                                                          }];
                               }
                           }
                         }];
@@ -17252,7 +17378,16 @@ static void DYYYClampPoolCapacities(void) {
         @"DYYYKeepNowPlayingInBackground" : @YES,
         @"DYYYDiagLog" : @YES,
         @"DYYYLimitImageCache" : @YES,
-        @"DYYYDisableWebView" : @YES
+        @"DYYYDisableWebView" : @YES,
+        // 【v99】四级属地：默认开启（省/市/区/街道全显示），可在设置页逐级关掉
+        @"DYYYAreaFourLevel" : @YES,
+        @"DYYYAreaShowProvince" : @YES,
+        @"DYYYAreaShowCity" : @YES,
+        @"DYYYAreaShowDistrict" : @YES,
+        @"DYYYAreaShowStreet" : @YES,
+        // DYYYCityManager 内部自带读这个键（DYMH 的原总开关名），与我们自己的
+        // DYYYEnableArea 是两个键，这里给个 YES 免得它把四级地址判成「全关」。
+        @"DYYYisEnableArea" : @YES
     }];
     // 老版本遗留开关值清掉（该功能已移除，留着只会在设置页/调试时造成困惑）
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"DYYYDisableFeedNowPlayingInfo"];
@@ -17336,7 +17471,7 @@ static void DYYYClampPoolCapacities(void) {
                                  DYYYClampPoolCapacities();   // 【v95】池类可能是之后才注册的
                                });
             }
-            DYYYSpeedDiag(@"[webview] 已挂 v98 WebView 治理钩子（毒丸拦创建+禁加载+废预加载+禁预热+禁缓存+吞死通知+_close断relaunch+池容量1；已清噪音）");
+            DYYYSpeedDiag(@"[webview] 已挂 v99 WebView 治理钩子（毒丸拦创建+禁加载+废预加载+禁预热+禁缓存+吞死通知+_close断relaunch+池容量1）");
         } else {
             DYYYSpeedDiag(@"[webview] WKWebView 类不存在，跳过");
         }
