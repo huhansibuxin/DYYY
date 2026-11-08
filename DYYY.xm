@@ -5965,7 +5965,15 @@ static NSString *DYYYSynthesizedStreet(NSString *districtName) {
     return [NSString stringWithFormat:@"%@%@", base, tails[arc4random_uniform((uint32_t)tails.count)]];
 }
 
-static NSString *DYYYFourLevelAddress(NSString *cityCode) {
+// 确定性伪随机：同一个视频 id 永远得到同一个区/街道，不同视频不同。
+// 抖音下发的 cityCode 只到「市」，区县/街道源头没有 ⇒ 只能推测，
+// 但至少不能同一条视频滚动两次就换个区（v99 用 arc4random + 缓存，反而更假）。
+static uint32_t DYYYAreaRand(uint32_t *state) {
+    *state = (*state * 1103515245u + 12345u);
+    return (*state >> 16) & 0x7FFFu;
+}
+
+static NSString *DYYYFourLevelAddress(NSString *cityCode, uint32_t seed) {
     if (cityCode.length < 6) {
         return nil;
     }
@@ -5979,17 +5987,19 @@ static NSString *DYYYFourLevelAddress(NSString *cityCode) {
     BOOL showDistrict = [defaults boolForKey:@"DYYYAreaShowDistrict"];
     BOOL showStreet = [defaults boolForKey:@"DYYYAreaShowStreet"];
 
+    uint32_t rng = seed ? seed : (uint32_t)cityCode.hash;
+
     NSString *provinceCode = [[cityCode substringToIndex:2] stringByAppendingString:@"0000"];
     NSString *provinceName = [mgr getProvinceNameWithCode:provinceCode] ?: @"";
     NSString *cityName = [mgr getCityNameWithCode:cityCode] ?: @"";
 
-    // 区县：同城多个区里随机挑一个（同一个视频反复刷新也只显示一次，结果会缓存）
+    // 区县：同城多个区里按视频 id 挑一个（源头没有真实区县，这里是推测）
     NSString *districtCode = nil;
     NSString *districtName = @"";
     NSDictionary *districts = [mgr getDistrictsInCity:cityCode];
-    if (districts.count > 0) {
-        NSArray *codes = [districts allKeys];
-        districtCode = codes[arc4random_uniform((uint32_t)codes.count)];
+    if (districts.count > 0 && (showDistrict || showStreet)) {
+        NSArray *codes = [[districts allKeys] sortedArrayUsingSelector:@selector(compare:)];
+        districtCode = codes[DYYYAreaRand(&rng) % codes.count];
         districtName = districts[districtCode] ?: @"";
     }
 
@@ -5997,7 +6007,7 @@ static NSString *DYYYFourLevelAddress(NSString *cityCode) {
     if (showStreet && districtName.length > 0) {
         NSArray *streets = ([mgr getStreetsInDistrict:districtCode] ?: @[]);
         if (streets.count > 0) {
-            streetName = streets[arc4random_uniform((uint32_t)streets.count)] ?: @"";
+            streetName = streets[DYYYAreaRand(&rng) % streets.count] ?: @"";
         } else {
             streetName = DYYYSynthesizedStreet(districtName);
         }
@@ -6084,6 +6094,8 @@ static NSString *DYYYFourLevelAddress(NSString *cityCode) {
 
     // 【v99】四级属地：优先走本地行政区划（省-市-区-街道），不需要联网。
     //   自定义城市代码（设置里填 6 位，如 440305）优先于作品自带的 cityCode。
+    // 【v100】诊断：抖音下发的 cityCode 到底是不是「发布者城市」，只有日志能证明。
+    //   同一批好友视频里 cityCode 若全一样 ⇒ 是观看者城市，四级属地这条路就根本不成立。
     if (DYYYGetBool(@"DYYYAreaFourLevel")) {
         NSString *customAreaCode = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYAreaCustomCityCode"];
         if ([customAreaCode isKindOfClass:[NSString class]]) {
@@ -6092,11 +6104,46 @@ static NSString *DYYYFourLevelAddress(NSString *cityCode) {
         } else {
             customAreaCode = nil;
         }
-        NSString *areaCode = (customAreaCode.length >= 6) ? customAreaCode : cityCode;
+        BOOL usingCustom = (customAreaCode.length >= 6);
+        NSString *areaCode = usingCustom ? customAreaCode : cityCode;
         if (areaCode.length >= 6) {
-            NSString *fourLevel = DYYYFourLevelAddress(areaCode);
+            NSString *itemID = nil;
+            if ([self.model respondsToSelector:@selector(itemID)]) {
+                id v = [self.model performSelector:@selector(itemID)];
+                if ([v isKindOfClass:[NSString class]]) {
+                    itemID = v;
+                }
+            }
+            uint32_t seed = (uint32_t)(itemID.length > 0 ? itemID.hash : areaCode.hash);
+            NSString *fourLevel = DYYYFourLevelAddress(areaCode, seed);
+            static volatile int32_t dyyyAreaDiagCount = 0;
+            if (__sync_add_and_fetch(&dyyyAreaDiagCount, 1) <= 20) {
+                NSString *ipAttr = @"(无)";
+                if ([self.model respondsToSelector:@selector(ipAttribution)]) {
+                    id v = [self.model performSelector:@selector(ipAttribution)];
+                    if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) {
+                        ipAttr = v;
+                    }
+                }
+                NSString *nick = @"?";
+                id author = nil;
+                if ([self.model respondsToSelector:@selector(author)]) {
+                    author = [self.model performSelector:@selector(author)];
+                }
+                if (author && [author respondsToSelector:@selector(nickname)]) {
+                    id v = [author performSelector:@selector(nickname)];
+                    if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) {
+                        nick = v;
+                    }
+                }
+                DYYYSpeedDiag([NSString stringWithFormat:
+                    @"[area] 作者=%@ 作品=%@ cityCode=%@ 抖音属地=%@ → 显示=%@%@",
+                    nick,
+                    itemID.length > 8 ? [itemID substringToIndex:8] : (itemID ?: @"?"),
+                    areaCode, ipAttr, fourLevel ?: @"(空)",
+                    usingCustom ? @"（自定义代码）" : @""]);
+            }
             if (fourLevel.length > 0) {
-                [locationCache setObject:fourLevel forKey:areaCode];
                 updateLabelWithLocation(label, fourLevel);
                 DYYYFitTimestampLabel(label);
                 return label;
@@ -17379,12 +17426,15 @@ static void DYYYClampPoolCapacities(void) {
         @"DYYYDiagLog" : @YES,
         @"DYYYLimitImageCache" : @YES,
         @"DYYYDisableWebView" : @YES,
-        // 【v99】四级属地：默认开启（省/市/区/街道全显示），可在设置页逐级关掉
+        // 【v99】四级属地：主开关默认开；【v100】区县/街道默认**关** ——
+        //   实测抖音下发的 cityCode 只到「市」，区县/街道源头根本没有，
+        //   打开后显示的是按视频 id 推测出来的地址（看着像真的，其实是编的）。
+        //   要娱乐效果自己开，要准确就只留省/市。
         @"DYYYAreaFourLevel" : @YES,
         @"DYYYAreaShowProvince" : @YES,
         @"DYYYAreaShowCity" : @YES,
-        @"DYYYAreaShowDistrict" : @YES,
-        @"DYYYAreaShowStreet" : @YES,
+        @"DYYYAreaShowDistrict" : @NO,
+        @"DYYYAreaShowStreet" : @NO,
         // DYYYCityManager 内部自带读这个键（DYMH 的原总开关名），与我们自己的
         // DYYYEnableArea 是两个键，这里给个 YES 免得它把四级地址判成「全关」。
         @"DYYYisEnableArea" : @YES
@@ -17471,7 +17521,7 @@ static void DYYYClampPoolCapacities(void) {
                                  DYYYClampPoolCapacities();   // 【v95】池类可能是之后才注册的
                                });
             }
-            DYYYSpeedDiag(@"[webview] 已挂 v99 WebView 治理钩子（毒丸拦创建+禁加载+废预加载+禁预热+禁缓存+吞死通知+_close断relaunch+池容量1）");
+            DYYYSpeedDiag(@"[webview] 已挂 v100 WebView 治理钩子（毒丸拦创建+禁加载+废预加载+禁预热+禁缓存+吞死通知+_close断relaunch+池容量1）");
         } else {
             DYYYSpeedDiag(@"[webview] WKWebView 类不存在，跳过");
         }
